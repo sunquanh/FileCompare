@@ -604,7 +604,10 @@ def undo_manifest(path: Path, on_progress=None, cancel=None):
         except Exception:
             failed += 1
         if on_progress:
-            on_progress(index + 1, total, Path(record.get("dst", "")).name)
+            dst = record.get("dst", "") if isinstance(record, dict) else ""
+            if not isinstance(dst, str):
+                dst = ""
+            on_progress(index + 1, total, Path(dst).name)
     if data.get("kind") == "organize":
         _remove_empty_dir_chains(touched, [root] if root else [])
     return done, failed, skipped
@@ -680,6 +683,9 @@ def _cli_undo(args):
         print("没有可以撤销的操作")
         return
     data = read_manifest(path)
+    if not isinstance(data, dict):
+        print(f"操作记录损坏：{path.name} 不是对象")
+        return 1
     print(f"撤销 {data['time']} 的 {data['kind']} 操作，共 "
           f"{data.get('count', '?')} 条: {path.name}")
     if not args.yes and input("确认? (y/回车=取消) ").strip().lower() != "y":
