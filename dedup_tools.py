@@ -563,7 +563,12 @@ def undo_manifest(path: Path, on_progress=None, cancel=None):
     原位置已有同名文件时跳过（绝不覆盖）。
     """
     data = read_manifest(path)
-    items = list(data.get("items", []))
+    if not isinstance(data, dict):
+        raise ValueError(f"操作记录损坏：{path.name} 不是对象")
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError(f"操作记录损坏：{path.name} 的 items 不是列表")
+    items = list(items)
     items.reverse()
     done, failed, skipped = 0, 0, 0
     total = len(items)
