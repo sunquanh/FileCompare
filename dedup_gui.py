@@ -42,6 +42,7 @@ try:
         CanvasButton,
         Card,
         Chip,
+        Icon,
         PopupMenu,
         ScrollArea,
         Segmented,
@@ -53,6 +54,7 @@ try:
         enable_dark_titlebar,
         make_logo,
         prompt,
+        put_icon,
         round_rect,
     )
 except Exception as _exc:  # pragma: no cover
@@ -78,6 +80,7 @@ LEGACY_SETTINGS = Path(__file__).resolve().with_name("dedup_settings.json")
 
 DEFAULTS = {
     "last_dir": "",
+    "recent_dirs": [],
     "strictness": "standard",
     "min_size": 0,
     "exclude": "",
@@ -194,10 +197,16 @@ class NavItem(tk.Canvas):
         self.hover = False
         self.badge = 0
         super().__init__(master, width=width, height=self.h, bg=theme.SIDEBAR,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2",
+                         takefocus=1)
+        self._focused = False
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonRelease-1>", lambda e: self.command())
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Return>", self._on_key_activate)
+        self.bind("<space>", self._on_key_activate)
         self._draw()
 
     def _on_enter(self, _=None):
@@ -207,6 +216,18 @@ class NavItem(tk.Canvas):
     def _on_leave(self, _=None):
         self.hover = False
         self._draw()
+
+    def _on_focus_in(self, _=None):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _=None):
+        self._focused = False
+        self._draw()
+
+    def _on_key_activate(self, _=None):
+        self.command()
+        return "break"
 
     def restyle(self):
         try:
@@ -226,9 +247,8 @@ class NavItem(tk.Canvas):
         elif self.hover:
             round_rect(self, 0, 1, w, h - 1, t.s(9), fill=t.NAV_ACTIVE, outline="")
         color = t.TEXT if self.active else (t.TEXT_DIM if self.hover else t.MUTED)
-        self.create_text(t.s(18), h / 2 + 0.5, text=ICON.get(self.icon, self.icon),
-                         font=t.icon(15), fill=t.ACCENT if self.active else color,
-                         anchor="center")
+        put_icon(self, t, self.icon, t.s(18), h / 2 + 0.5, 15,
+                 t.ACCENT if self.active else color)
         self.create_text(t.s(38), h / 2 + 0.5, text=self.label, font=t.font(9, "bold" if self.active else "normal"),
                          fill=color, anchor="w")
         if self.badge:
@@ -241,6 +261,9 @@ class NavItem(tk.Canvas):
                        fill=t.ACCENT_DIM, outline="")
             self.create_text((x1 + x2) / 2, h / 2 + 0.5, text=text, font=f,
                              fill=t.ACCENT, anchor="center")
+        if self._focused:
+            round_rect(self, 1.5, 1.5, w - 1.5, h - 1.5, t.s(9),
+                       fill="", outline=t.ACCENT, width=t.s(2))
 
     def set_active(self, value):
         self.active = bool(value)
@@ -264,16 +287,16 @@ class SearchBox(tk.Frame):
                          highlightcolor=theme.ACCENT)
         self.pack_propagate(False)
         self.var = tk.StringVar()
-        icon = tk.Label(self, text=ICON["search"], bg=theme.INPUT, fg=theme.MUTED,
-                        font=theme.icon(12))
+        icon = Icon(self, theme, "search", size=12, color=theme.MUTED,
+                    bg=theme.INPUT)
         icon.pack(side="left", padx=(theme.s(10), theme.s(4)))
         self.entry = tk.Entry(self, textvariable=self.var, bg=theme.INPUT,
                               fg=theme.TEXT, insertbackground=theme.TEXT,
                               relief="flat", bd=0, highlightthickness=0,
                               font=theme.font(9))
         self.entry.pack(side="left", fill="both", expand=True, pady=theme.s(5))
-        self.clear = tk.Label(self, text=ICON["close"], bg=theme.INPUT,
-                              fg=theme.MUTED, font=theme.icon(10), cursor="hand2")
+        self.clear = Icon(self, theme, "close", size=10, color=theme.MUTED,
+                          bg=theme.INPUT, cursor="hand2")
         self.placeholder = tk.Label(self, text="搜索文件名", bg=theme.INPUT,
                                     fg=theme.FAINT, font=theme.font(9))
         self.placeholder.place(x=theme.s(30), rely=0.5, anchor="w")
@@ -490,6 +513,11 @@ class App(tk.Tk):
                                  ("rename", "批量重命名", "edit")):
             self._nav_item(key, label, icon)
 
+        # 最近扫描（有记录时才显示）
+        self._recent_header = None
+        self._recent_box = None
+        self._rebuild_recent()
+
         # 底部
         tk.Label(self.sidebar, text=f"v{VERSION} · 本地离线", bg=t.SIDEBAR,
                  fg=t.FAINT, font=t.font(8), anchor="w").pack(
@@ -527,6 +555,44 @@ class App(tk.Tk):
                        command=lambda k=key: self.show_page(k))
         item.pack(fill="x", padx=t.s(14), pady=(0, t.s(2)))
         self.nav[key] = item
+
+    def _record_recent(self, path):
+        """扫完记一条最近目录：去重、最新在前、最多 5 条。"""
+        recent = [path]
+        for p in self.settings.get("recent_dirs", []):
+            if p != path and len(recent) < 5:
+                recent.append(p)
+        self.settings["recent_dirs"] = recent
+        save_settings(self.settings)
+
+    def _rebuild_recent(self):
+        """侧栏“最近扫描”区：没有记录时不显示。"""
+        t = self.theme
+        for attr in ("_recent_header", "_recent_box"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.destroy()
+                setattr(self, attr, None)
+        recent = [p for p in self.settings.get("recent_dirs", [])
+                  if p][:5]
+        if not recent:
+            return
+        self._recent_header = tk.Label(
+            self.sidebar, text="最 近 扫 描", bg=t.SIDEBAR, fg=t.FAINT,
+            font=t.font(8, "bold"), anchor="w")
+        self._recent_header.pack(fill="x", padx=t.s(24),
+                                 pady=(t.s(15), t.s(7)))
+        self._recent_box = tk.Frame(self.sidebar, bg=t.SIDEBAR)
+        self._recent_box.pack(fill="x")
+        for path in recent:
+            name = Path(path).name or path
+            item = NavItem(self._recent_box, t, name, "folder", t.s(204),
+                           command=lambda p=path: self._open_recent(p))
+            item.pack(fill="x", padx=t.s(14), pady=(0, t.s(2)))
+
+    def _open_recent(self, path):
+        self.scan_page.set_path(path)
+        self.show_page("scan")
 
     def _draw_status(self, text, color, sub):
         self._status = (text, color, sub)
@@ -684,11 +750,11 @@ class App(tk.Tk):
         c = tk.Canvas(self, width=w, height=h, bg=t.BG, highlightthickness=0, bd=0)
         round_rect(c, 0.5, 0.5, w - 0.5, h - 0.5, t.s(11),
                    fill=t.TOAST_BG, outline=t.TOAST_BORDER)
-        c.create_text(t.s(19), h / 2 + 0.5, text=ICON[icons.get(kind, "info")],
-                      font=t.icon(13), fill=color, anchor="center")
+        put_icon(c, t, icons.get(kind, "info"), t.s(19), h / 2 + 0.5, 13,
+                 color)
         c.create_text(t.s(34), h / 2 + 0.5, text=text, font=f, fill=t.TEXT,
                       anchor="w")
-        c.place(relx=0.5, rely=1.0, anchor="s", y=-t.s(86))
+        c.place(relx=1.0, rely=1.0, anchor="se", x=-t.s(24), y=-t.s(86))
         c.tk.call("raise", c._w)
         self._toast = c
         self.after(duration, lambda: self._hide_toast(c))
@@ -793,21 +859,20 @@ class ScanPage(tk.Frame):
                  font=t.font(21, "bold"), anchor="w").pack(fill="x")
         tk.Label(left, text="在本地比对文件内容。先看清楚，再决定清理哪些。",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(10), anchor="w").pack(
-            fill="x", pady=(s(5), 0))
+            fill="x", pady=(s(3), 0))
         Chip(header, t, text="本机离线处理", icon="shield", color=t.GREEN,
              bg=t.BG).pack(side="right", pady=(s(7), 0))
 
         # 文件夹
         folder_card = Card(page, t, padding=16)
-        folder_card.pack(fill="x", pady=(s(20), 0))
+        folder_card.pack(fill="x", pady=(s(16), 0))
         body = folder_card.body
 
         bubble = tk.Canvas(body, width=s(42), height=s(42), bg=t.CARD,
                            highlightthickness=0, bd=0)
         bubble.pack(side="left")
         round_rect(bubble, 0, 0, s(42), s(42), s(11), fill=t.BUBBLE_BG, outline="")
-        bubble.create_text(s(21), s(21) + 1, text=ICON["folder"],
-                           font=t.icon(19), fill=t.ACCENT, anchor="center")
+        put_icon(bubble, t, "folder", s(21), s(21) + 1, 19, t.ACCENT)
 
         text_box = tk.Frame(body, bg=t.CARD)
         text_box.pack(side="left", fill="x", expand=True, padx=(s(13), s(14)))
@@ -815,7 +880,7 @@ class ScanPage(tk.Frame):
                  font=t.font(8), anchor="w").pack(fill="x")
         field = tk.Frame(text_box, bg=t.INPUT, highlightthickness=1,
                          highlightbackground=t.BORDER, highlightcolor=t.ACCENT)
-        field.pack(fill="x", pady=(s(5), 0))
+        field.pack(fill="x", pady=(s(3), 0))
         self.path_var = tk.StringVar()
         self.entry = tk.Entry(field, textvariable=self.path_var, bg=t.INPUT,
                               fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
@@ -824,7 +889,7 @@ class ScanPage(tk.Frame):
         self.entry.bind("<Return>", lambda e: self.start_scan())
         tk.Label(text_box, text="可直接输入或粘贴路径，回车开始扫描",
                  bg=t.CARD, fg=t.FAINT, font=t.font(8), anchor="w").pack(
-            fill="x", pady=(s(4), 0))
+            fill="x", pady=(s(2), 0))
 
         CanvasButton(body, t, "选择文件夹", command=self.browse, kind="secondary",
                      icon="folder", height=38, size=9, padding=14, bg=t.CARD
@@ -832,7 +897,7 @@ class ScanPage(tk.Frame):
 
         # 选项区
         options = tk.Frame(page, bg=t.BG)
-        options.pack(fill="x", pady=(s(16), 0))
+        options.pack(fill="x", pady=(s(12), 0))
         options.grid_columnconfigure(0, weight=1, uniform="opt")
         options.grid_columnconfigure(1, weight=1, uniform="opt")
 
@@ -869,20 +934,20 @@ class ScanPage(tk.Frame):
         tk.Frame(note, bg=t.BORDER_SOFT, height=1).pack(fill="x", pady=(0, s(12)))
         row = tk.Frame(note, bg=t.CARD)
         row.pack(fill="x")
-        tk.Label(row, text=ICON["info"], bg=t.CARD, fg=t.MUTED,
-                 font=t.icon(11)).pack(side="left")
+        Icon(row, t, "info", size=11, color=t.MUTED,
+             bg=t.CARD).pack(side="left")
         tk.Label(row, text="照片检测最常用；视频需要逐帧解码，数量多时会慢一些。",
                  bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w").pack(
             side="left", padx=(s(6), 0))
 
         # 右侧：扫描选项
-        opt_card = Card(options, t, padding=20)
+        opt_card = Card(options, t, padding=16)
         opt_card.grid(row=0, column=1, sticky="n", padx=(s(8), 0))
         o = opt_card.body
         self._section_title(o, "扫描选项", "settings", None)
 
         preset_row = tk.Frame(o, bg=t.CARD)
-        preset_row.pack(fill="x", pady=(s(12), 0))
+        preset_row.pack(fill="x", pady=(s(8), 0))
         tk.Label(preset_row, text="扫描方案", bg=t.CARD, fg=t.TEXT_DIM,
                  font=t.font(9), anchor="w").pack(side="left")
         self.btn_save_preset = CanvasButton(
@@ -895,7 +960,7 @@ class ScanPage(tk.Frame):
         self.btn_load_preset.pack(side="right", padx=(0, s(6)))
 
         tk.Label(o, text="识别严格程度", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(12), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(8), s(6)))
         self.seg_strict = Segmented(
             o, t, [("relaxed", "宽松"), ("standard", "标准"), ("strict", "严格")],
             value=self.settings.get("strictness", "standard"),
@@ -903,11 +968,11 @@ class ScanPage(tk.Frame):
         self.seg_strict.pack(anchor="w")
         self.strict_hint = tk.Label(o, text="", bg=t.CARD, fg=t.MUTED,
                                     font=t.font(8), anchor="w")
-        self.strict_hint.pack(fill="x", pady=(s(5), 0))
+        self.strict_hint.pack(fill="x", pady=(s(4), 0))
         self._strict_changed(self.seg_strict.value)
 
         tk.Label(o, text="最小文件大小", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(14), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
         self.seg_size = Segmented(
             o, t, [(0, "不限"), (1 << 20, "1 MB"), (10 << 20, "10 MB"),
                    (100 << 20, "100 MB")],
@@ -916,7 +981,7 @@ class ScanPage(tk.Frame):
         self.seg_size.pack(anchor="w")
 
         tk.Label(o, text="排除目录", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(14), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
         ex_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
                             highlightbackground=t.BORDER, highlightcolor=t.ACCENT)
         ex_field.pack(fill="x")
@@ -928,7 +993,7 @@ class ScanPage(tk.Frame):
         self._placeholder(ex_entry, self.exclude_var, "例如：缓存, 备份（逗号分隔）")
 
         tk.Label(o, text="保护文件夹（永不清理）", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(14), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
         pr_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
                             highlightbackground=t.BORDER,
                             highlightcolor=t.ACCENT)
@@ -945,7 +1010,7 @@ class ScanPage(tk.Frame):
             fill="x", pady=(s(4), 0))
 
         sub_row = tk.Frame(o, bg=t.CARD)
-        sub_row.pack(fill="x", pady=(s(15), 0))
+        sub_row.pack(fill="x", pady=(s(10), 0))
         sub_text = tk.Frame(sub_row, bg=t.CARD)
         sub_text.pack(side="left", fill="x", expand=True)
         tk.Label(sub_text, text="包含子文件夹", bg=t.CARD, fg=t.TEXT,
@@ -958,7 +1023,7 @@ class ScanPage(tk.Frame):
         self.sw_recursive.pack(side="right", pady=(s(4), 0))
 
         cache_row = tk.Frame(o, bg=t.CARD)
-        cache_row.pack(fill="x", pady=(s(13), 0))
+        cache_row.pack(fill="x", pady=(s(10), 0))
         cache_text = tk.Frame(cache_row, bg=t.CARD)
         cache_text.pack(side="left", fill="x", expand=True)
         tk.Label(cache_text, text="指纹缓存", bg=t.CARD, fg=t.TEXT,
@@ -977,8 +1042,8 @@ class ScanPage(tk.Frame):
                     before=self.content_scroll)
         hint = tk.Frame(footer, bg=t.BG)
         hint.pack(side="left")
-        tk.Label(hint, text=ICON["shield"], bg=t.BG, fg=t.GREEN,
-                 font=t.icon(12)).pack(side="left")
+        Icon(hint, t, "shield", size=12, color=t.GREEN,
+             bg=t.BG).pack(side="left")
         tk.Label(hint, text="扫描只读取文件内容，不会修改或删除任何文件",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(9)).pack(side="left",
                                                                padx=(s(7), 0))
@@ -1010,8 +1075,7 @@ class ScanPage(tk.Frame):
                                highlightthickness=0, bd=0)
             bubble.pack(side="left", pady=(s(1), 0))
             round_rect(bubble, 0, 0, s(30), s(30), s(9), fill=dim, outline="")
-            bubble.create_text(s(15), s(15) + 1, text=ICON[icon],
-                               font=t.icon(13), fill=color, anchor="center")
+            put_icon(bubble, t, icon, s(15), s(15) + 1, 13, color)
             box = tk.Frame(item, bg=t.CARD)
             box.pack(side="left", padx=(s(9), 0))
             tk.Label(box, text=title, bg=t.CARD, fg=t.TEXT,
@@ -1039,8 +1103,8 @@ class ScanPage(tk.Frame):
         t = self.theme
         row = tk.Frame(parent, bg=t.CARD)
         row.pack(fill="x")
-        tk.Label(row, text=ICON.get(icon, icon), bg=t.CARD, fg=t.ACCENT,
-                 font=t.icon(13)).pack(side="left")
+        Icon(row, t, icon, size=13, color=t.ACCENT,
+             bg=t.CARD).pack(side="left")
         tk.Label(row, text=text, bg=t.CARD, fg=t.TEXT, font=t.font(11, "bold"),
                  anchor="w").pack(side="left", padx=(self.theme.s(7), 0))
         if desc:
@@ -1057,8 +1121,7 @@ class ScanPage(tk.Frame):
                            highlightthickness=0, bd=0)
         bubble.pack(side="left", pady=(s(2), 0))
         round_rect(bubble, 0, 0, s(34), s(34), s(9), fill=dim, outline="")
-        bubble.create_text(s(17), s(17) + 1, text=ICON.get(icon, icon),
-                           font=t.icon(15), fill=color, anchor="center")
+        put_icon(bubble, t, icon, s(17), s(17) + 1, 15, color)
         box = tk.Frame(row, bg=t.CARD)
         box.pack(side="left", fill="x", expand=True, padx=(s(10), s(4)))
         tk.Label(box, text=title, bg=t.CARD, fg=t.TEXT, font=t.font(10, "bold"),
@@ -1284,7 +1347,8 @@ class ScanPage(tk.Frame):
             "cache": opts.cache,
             "keep_rule": opts.keep_rule,
         })
-        save_settings(self.settings)
+        self.app._record_recent(str(root))
+        self.app._rebuild_recent()
         self.app.show_page("results")
         self.app.results_page.start_scan(opts)
 
@@ -1521,8 +1585,7 @@ class ResultsPage(tk.Frame):
             art.pack()
             art.create_oval(s(29), s(9), s(171), s(151), fill=t.EMPTY_ART_BG,
                             outline=t.EMPTY_ART_BORDER)
-            art.create_text(s(100), s(78), text=ICON["check"],
-                            font=t.icon(42), fill=t.GREEN)
+            put_icon(art, t, "check", s(100), s(78), 42, t.GREEN)
             tk.Label(center, text="很干净，没有发现重复文件", bg=t.BG, fg=t.TEXT,
                      font=t.font(14, "bold")).pack(pady=(s(4), 0))
             if result is not None:
@@ -1556,8 +1619,7 @@ class ResultsPage(tk.Frame):
                         fill=t.STATUS_BG, outline=t.BORDER_SOFT)
         art.create_oval(cx - s(40), cy - s(40), cx + s(40), cy + s(40),
                         outline=t.RING_TRACK)
-        art.create_text(cx, cy + s(1), text=ICON.get(icon, icon), font=t.icon(38),
-                        fill=color)
+        put_icon(art, t, icon, cx, cy + s(1), 38, color)
         for dx, dy, ic, col in ((-s(76), -s(26), "image", t.AMBER),
                                 (s(76), -s(10), "video", t.VIOLET),
                                 (-s(62), s(44), "document", t.TEXT_DIM),
@@ -1565,8 +1627,7 @@ class ResultsPage(tk.Frame):
             art.create_oval(cx + dx - s(14), cy + dy - s(14),
                             cx + dx + s(14), cy + dy + s(14),
                             fill=t.ART_INNER, outline=t.BORDER_SOFT)
-            art.create_text(cx + dx, cy + dy + 1, text=ICON[ic], font=t.icon(13),
-                            fill=col)
+            put_icon(art, t, ic, cx + dx, cy + dy + 1, 13, col)
 
     def _build_scanning(self):
         t = self.theme
@@ -1620,8 +1681,8 @@ class ResultsPage(tk.Frame):
         tk.Frame(self.actionbar, bg=t.BORDER_SOFT, height=1).pack(fill="x")
         inner = tk.Frame(self.actionbar, bg=t.BG_SOFT)
         inner.pack(fill="x", padx=s(32), pady=s(12))
-        self.sel_icon = tk.Label(inner, text=ICON["trash"], bg=t.BG_SOFT,
-                                 fg=t.MUTED, font=t.icon(14))
+        self.sel_icon = Icon(inner, t, "trash", size=14, color=t.MUTED,
+                             bg=t.BG_SOFT)
         self.sel_icon.pack(side="left")
         self.sel_label = tk.Label(inner, text="尚未选择要清理的文件", bg=t.BG_SOFT,
                                   fg=t.TEXT_DIM, font=t.font(9))
@@ -2006,8 +2067,8 @@ class ResultsPage(tk.Frame):
         if not groups:
             box = tk.Frame(self.scroll.inner, bg=t.BG)
             box.pack(pady=t.s(70))
-            tk.Label(box, text=ICON["filter"], bg=t.BG, fg=t.FAINT,
-                     font=t.icon(30)).pack()
+            Icon(box, t, "filter", size=30, color=t.FAINT,
+                 bg=t.BG).pack()
             tk.Label(box, text="没有匹配的结果", bg=t.BG, fg=t.TEXT_DIM,
                      font=t.font(11, "bold")).pack(pady=(t.s(10), 0))
             tk.Label(box, text="换个分类，或者清空搜索关键词试试。", bg=t.BG,
@@ -2082,12 +2143,12 @@ class ResultsPage(tk.Frame):
         n = len(selected)
         size = sum(self._size_map.get(p, 0) for p in selected)
         if n:
-            self.sel_icon.configure(fg=t.RED)
+            self.sel_icon.set_color(t.RED)
             self.sel_label.configure(text=f"已选 {n} 个文件", fg=t.TEXT)
             self.sel_size.configure(text=f"可释放 {core.human_size(size)}")
             self.hint_label.pack(side="right", padx=(0, t.s(16)))
         else:
-            self.sel_icon.configure(fg=t.MUTED)
+            self.sel_icon.set_color(t.MUTED)
             self.sel_label.configure(text="尚未选择要清理的文件", fg=t.TEXT_DIM)
             self.sel_size.configure(text="")
             self.hint_label.pack_forget()
@@ -2736,7 +2797,7 @@ class GroupCard(tk.Canvas):
         tw = s(148)
         th = s(96)
         label_h = s(42)
-        head_h = s(30)
+        head_h = s(30) + (s(16) if self.group.note else 0)
         n = len(self.group.items)
         per = max(1, (w - pad * 2 + gap) // (tw + gap))
         rows = max(1, math.ceil(n / per))
@@ -2774,9 +2835,8 @@ class GroupCard(tk.Canvas):
         by = pad
         round_rect(self, pad, by, pad + bw, by + s(24), s(8),
                    fill=dim, outline="")
-        self.create_text(pad + s(11), by + s(12) + 0.5,
-                         text=ICON.get(icons.get(g.kind, "document"), ""),
-                         font=t.icon(11), fill=kind_color, anchor="center")
+        put_icon(self, t, icons.get(g.kind, "document"),
+                 pad + s(11), by + s(12) + 0.5, 11, kind_color)
         self.create_text(pad + s(20), by + s(12) + 0.5, text=g.kind,
                          font=f, fill=kind_color, anchor="w")
 
@@ -2819,12 +2879,13 @@ class GroupCard(tk.Canvas):
         right -= t.font(8, "bold").measure(wasted_text) + s(16)
 
         info = f"{len(g.items)} 个版本"
-        if g.note:
-            info += f" · {g.note}"
         avail = max(s(40), right - (pad + bw + s(10)))
         info = ellipsize(t.font(8), info, avail)
         self.create_text(pad + bw + s(10), by + s(12) + 0.5, text=info,
                          font=t.font(8), fill=t.MUTED, anchor="w")
+        if g.note:
+            self.create_text(pad, by + s(12) + s(16) + 0.5, text=g.note,
+                             font=t.font(8), fill=t.MUTED, anchor="w")
 
     def _draw_tile(self, i, item, x, y, tw, th):
         t = self.theme
@@ -2849,9 +2910,9 @@ class GroupCard(tk.Canvas):
             ic, col = "image", t.AMBER
         else:
             ic, col = "document", t.TEXT_DIM
-        self.create_text(x + tw / 2, y + th / 2 - (s(8) if not is_vid else 0),
-                         text=ICON[ic], font=t.icon(22), fill=col,
-                         tags=(ph, tile_tag))
+        put_icon(self, t, ic, x + tw / 2,
+                 y + th / 2 - (s(8) if not is_vid else 0), 22, col,
+                 tags=(ph, tile_tag))
         if not core.is_photo(item.path) and not is_vid:
             ext = item.path.suffix.replace(".", "").upper() or "FILE"
             self.create_text(x + tw / 2, y + th / 2 + s(17), text=ext[:6],
@@ -2864,8 +2925,8 @@ class GroupCard(tk.Canvas):
         if selected:
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=t.RED,
                              outline=t.CHECK_BORDER, width=s(1), tags=(chk_tag, tile_tag))
-            self.create_text(cx, cy + 0.5, text=ICON["check"], font=t.icon(10),
-                             fill="#FFFFFF", tags=(chk_tag, tile_tag))
+            put_icon(self, t, "check", cx, cy + 0.5, 10, "#FFFFFF",
+                     tags=(chk_tag, tile_tag))
         else:
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=t.TILE_CHECK_BG,
                              outline=t.TILE_CHECK_BORDER, width=s(1), tags=(chk_tag, tile_tag))
@@ -3006,8 +3067,8 @@ class ToolPage(tk.Frame):
         t = self.theme
         row = tk.Frame(parent, bg=t.CARD)
         row.pack(fill="x")
-        tk.Label(row, text=ICON.get(icon, icon), bg=t.CARD, fg=t.ACCENT,
-                 font=t.icon(13)).pack(side="left")
+        Icon(row, t, icon, size=13, color=t.ACCENT,
+             bg=t.CARD).pack(side="left")
         tk.Label(row, text=text, bg=t.CARD, fg=t.TEXT,
                  font=t.font(11, "bold"), anchor="w").pack(
             side="left", padx=(t.s(7), 0))
@@ -3023,6 +3084,8 @@ class ToolPage(tk.Frame):
                          highlightcolor=t.ACCENT)
         kw = {"width": width} if width else {}
         entry = tk.Entry(field, textvariable=var, bg=t.INPUT, fg=t.TEXT,
+                         disabledforeground=t.FAINT,
+                         disabledbackground=t.INPUT,
                          insertbackground=t.TEXT, relief="flat", bd=0,
                          highlightthickness=0, font=t.font(font), **kw)
         entry.pack(fill="x", padx=t.s(10), ipady=t.s(5))
@@ -3056,8 +3119,7 @@ class ToolPage(tk.Frame):
         bubble.pack(side="left")
         round_rect(bubble, 0, 0, s(42), s(42), s(11), fill=t.BUBBLE_BG,
                    outline="")
-        bubble.create_text(s(21), s(21) + 1, text=ICON["folder"],
-                           font=t.icon(19), fill=t.ACCENT, anchor="center")
+        put_icon(bubble, t, "folder", s(21), s(21) + 1, 19, t.ACCENT)
         box = tk.Frame(body, bg=t.CARD)
         box.pack(side="left", fill="x", expand=True, padx=(s(13), s(14)))
         tk.Label(box, text=title, bg=t.CARD, fg=t.MUTED, font=t.font(8),
@@ -3262,8 +3324,8 @@ class OrganizePage(ToolPage):
                     pady=(s(12), s(16)), before=self.scroll)
         hint = tk.Frame(footer, bg=t.BG)
         hint.pack(side="left")
-        tk.Label(hint, text=ICON["shield"], bg=t.BG, fg=t.GREEN,
-                 font=t.icon(12)).pack(side="left")
+        Icon(hint, t, "shield", size=12, color=t.GREEN,
+             bg=t.BG).pack(side="left")
         tk.Label(hint, text="预览只读；执行前会再次确认",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(9)).pack(
             side="left", padx=(s(7), 0))
@@ -3623,21 +3685,27 @@ class RenamePage(ToolPage):
         replace_row.pack(fill="x", pady=(s(14), 0))
         self.sw_replace = Switch(
             replace_row, t, value=bool(st.get("ren_use_replace")),
-            command=lambda v: self._changed(), bg=t.CARD)
+            command=lambda v: (self._changed(), self._sync_rule_states()),
+            bg=t.CARD)
         self.sw_replace.pack(side="left", pady=(s(4), 0))
-        tk.Label(replace_row, text="查找替换", bg=t.CARD, fg=t.TEXT,
-                 font=t.font(9), width=7, anchor="w").pack(
-            side="left", padx=(s(8), s(6)))
+        self._lbl_replace = tk.Label(replace_row, text="查找替换", bg=t.CARD,
+                                     fg=t.TEXT, font=t.font(9), width=7,
+                                     anchor="w")
+        self._lbl_replace.pack(side="left", padx=(s(8), s(6)))
         self.var_find = tk.StringVar(value=st.get("ren_find", ""))
         self.var_replace = tk.StringVar(value=st.get("ren_replace", ""))
-        f_find = self._field(replace_row, self.var_find, "要查找的文字")
-        f_find.pack(side="left", fill="x", expand=True)
-        tk.Label(replace_row, text="→", bg=t.CARD, fg=t.MUTED,
-                 font=t.font(9)).pack(side="left", padx=s(6))
-        f_repl = self._field(replace_row, self.var_replace, "替换为")
-        f_repl.pack(side="left", fill="x", expand=True)
-        tk.Label(replace_row, text="忽略大小写", bg=t.CARD, fg=t.MUTED,
-                 font=t.font(8)).pack(side="left", padx=(s(10), s(5)))
+        self._find_field = self._field(replace_row, self.var_find,
+                                       "要查找的文字")
+        self._find_field.pack(side="left", fill="x", expand=True)
+        self._lbl_arrow = tk.Label(replace_row, text="→", bg=t.CARD,
+                                   fg=t.MUTED, font=t.font(9))
+        self._lbl_arrow.pack(side="left", padx=s(6))
+        self._repl_field = self._field(replace_row, self.var_replace,
+                                       "替换为")
+        self._repl_field.pack(side="left", fill="x", expand=True)
+        self._lbl_icase = tk.Label(replace_row, text="忽略大小写",
+                                   bg=t.CARD, fg=t.MUTED, font=t.font(8))
+        self._lbl_icase.pack(side="left", padx=(s(10), s(5)))
         self.sw_icase = Switch(replace_row, t, value=bool(st.get("ren_icase")),
                                command=lambda v: self._changed(), bg=t.CARD)
         self.sw_icase.pack(side="left", pady=(s(4), 0))
@@ -3659,23 +3727,28 @@ class RenamePage(ToolPage):
         tpl_row.pack(fill="x", pady=(s(11), 0))
         self.sw_template = Switch(
             tpl_row, t, value=bool(st.get("ren_use_template")),
-            command=lambda v: self._changed(), bg=t.CARD)
+            command=lambda v: (self._changed(), self._sync_rule_states()),
+            bg=t.CARD)
         self.sw_template.pack(side="left", pady=(s(4), 0))
-        tk.Label(tpl_row, text="命名模板", bg=t.CARD, fg=t.TEXT,
-                 font=t.font(9), width=7, anchor="w").pack(
-            side="left", padx=(s(8), s(6)))
+        self._lbl_template = tk.Label(tpl_row, text="命名模板", bg=t.CARD,
+                                      fg=t.TEXT, font=t.font(9), width=7,
+                                      anchor="w")
+        self._lbl_template.pack(side="left", padx=(s(8), s(6)))
         self.var_template = tk.StringVar(value=st.get("ren_template",
                                                       "{原名}_{n}"))
-        f_tpl = self._field(tpl_row, self.var_template,
-                            "例如 旅行_{n} 或 {日期}_{原名}")
-        f_tpl.pack(side="left", fill="x", expand=True)
-        tk.Label(tpl_row, text="起始", bg=t.CARD, fg=t.MUTED,
-                 font=t.font(8)).pack(side="left", padx=(s(10), s(4)))
+        self._tpl_field = self._field(tpl_row, self.var_template,
+                                      "例如 旅行_{n} 或 {日期}_{原名}")
+        self._tpl_field.pack(side="left", fill="x", expand=True)
+        self._lbl_start = tk.Label(tpl_row, text="起始", bg=t.CARD,
+                                   fg=t.MUTED, font=t.font(8))
+        self._lbl_start.pack(side="left", padx=(s(10), s(4)))
         self.var_start = tk.StringVar(value=str(st.get("ren_start", "1")))
-        f_start = self._field(tpl_row, self.var_start, None, width=4)
-        f_start.pack(side="left")
-        tk.Label(tpl_row, text="位数", bg=t.CARD, fg=t.MUTED,
-                 font=t.font(8)).pack(side="left", padx=(s(10), s(5)))
+        self._start_field = self._field(tpl_row, self.var_start, None,
+                                        width=4)
+        self._start_field.pack(side="left")
+        self._lbl_width = tk.Label(tpl_row, text="位数", bg=t.CARD,
+                                   fg=t.MUTED, font=t.font(8))
+        self._lbl_width.pack(side="left", padx=(s(10), s(5)))
         self.seg_width = Segmented(
             tpl_row, t, [(1, "1"), (2, "2"), (3, "3")],
             value=int(st.get("ren_width", 2)),
@@ -3717,8 +3790,8 @@ class RenamePage(ToolPage):
                     pady=(s(12), s(16)), before=self.scroll)
         hint = tk.Frame(footer, bg=t.BG)
         hint.pack(side="left")
-        tk.Label(hint, text=ICON["warning"], bg=t.BG, fg=t.AMBER,
-                 font=t.icon(12)).pack(side="left")
+        Icon(hint, t, "warning", size=12, color=t.AMBER,
+             bg=t.BG).pack(side="left")
         tk.Label(hint, text="改名有风险，执行前请先确认预览",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(9)).pack(
             side="left", padx=(s(7), 0))
@@ -3728,6 +3801,7 @@ class RenamePage(ToolPage):
                                     size=10, bg=t.BG)
         self.btn_run.pack(side="right")
         self.btn_run.set_enabled(False)
+        self._sync_rule_states()
 
         for var in (self.path_var, self.var_find, self.var_replace,
                     self.var_prefix, self.var_suffix, self.var_template,
@@ -3792,6 +3866,30 @@ class RenamePage(ToolPage):
             except Exception:
                 pass
         self._pending = self.after(350, self._refresh)
+
+    def _sync_rule_states(self):
+        """规则开关关掉时，整行输入框禁用变淡；打开恢复。"""
+        t = self.theme
+        on = bool(self.sw_replace.value)
+        for f in (self._find_field, self._repl_field):
+            f.entry.configure(state="normal" if on else "disabled")
+            f.configure(highlightbackground=t.BORDER if on
+                        else t.BORDER_SOFT)
+        self.sw_icase.set_enabled(on)
+        for lbl, fg in ((self._lbl_replace, t.TEXT),
+                        (self._lbl_icase, t.MUTED),
+                        (self._lbl_arrow, t.MUTED)):
+            lbl.configure(fg=fg if on else t.FAINT)
+        on = bool(self.sw_template.value)
+        for f in (self._tpl_field, self._start_field):
+            f.entry.configure(state="normal" if on else "disabled")
+            f.configure(highlightbackground=t.BORDER if on
+                        else t.BORDER_SOFT)
+        self.seg_width.set_enabled(on)
+        for lbl, fg in ((self._lbl_template, t.TEXT),
+                        (self._lbl_start, t.MUTED),
+                        (self._lbl_width, t.MUTED)):
+            lbl.configure(fg=fg if on else t.FAINT)
 
     def _refresh(self):
         self._pending = None

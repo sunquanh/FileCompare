@@ -219,6 +219,8 @@ class Theme:
                              "Segoe UI", "Arial")
         self.icon_font = self._pick(families, "Segoe Fluent Icons",
                                     "Segoe MDL2 Assets", "Segoe UI Symbol")
+        # 图标字体只在 Windows 上有；没有它时，各处图标改走矢量手绘
+        self.has_icon_font = self.icon_font in families
         self.mono = self._pick(families, "Cascadia Mono", "Consolas", "Courier New")
         self._fonts = {}
 
@@ -307,6 +309,234 @@ ICON = {
     "hardlink": "\uE71B",
 }
 
+# ---------------------------------------------------------------- 矢量图标
+# 图标平时走 Segoe Fluent Icons 字形；那套字体只在 Windows 上有。
+# 字体缺失时（Linux / macOS）改用这里的手绘矢量，保证图标不变成方框。
+def draw_icon(canvas, theme, name, cx, cy, size, color, tags=()):
+    """以 (cx, cy) 为中心，在画布上画一个 size 像素的单色矢量图标。"""
+    s = theme.s
+    u = s(size) / 20.0
+
+    def X(v):
+        return cx + v * u
+
+    def Y(v):
+        return cy + v * u
+
+    def pts(seq):
+        out = []
+        for p in seq:
+            out.extend((X(p[0]), Y(p[1])))
+        return out
+
+    def line(seq, w=1.6):
+        canvas.create_line(*pts(seq), fill=color, width=max(1, s(w)),
+                           capstyle="round", joinstyle="round", tags=tags)
+
+    def oval(x1, y1, x2, y2, fill="", outline=None):
+        canvas.create_oval(X(x1), Y(y1), X(x2), Y(y2), fill=fill,
+                           outline=color if outline is None else outline,
+                           width=max(1, s(1.6)), tags=tags)
+
+    def rect(x1, y1, x2, y2, fill="", outline=None):
+        canvas.create_rectangle(X(x1), Y(y1), X(x2), Y(y2), fill=fill,
+                                outline=color if outline is None else outline,
+                                width=max(1, s(1.6)), tags=tags)
+
+    def poly(seq, fill=""):
+        canvas.create_polygon(*pts(seq), fill=fill, outline=color,
+                              width=max(1, s(1.6)), joinstyle="round", tags=tags)
+
+    def dot(x, y, r=1.7):
+        canvas.create_oval(X(x) - r * u, Y(y) - r * u, X(x) + r * u,
+                           Y(y) + r * u, fill=color, outline="", tags=tags)
+
+    def arc(x1, y1, x2, y2, start, extent):
+        canvas.create_arc(X(x1), Y(y1), X(x2), Y(y2), start=start,
+                          extent=extent, style="arc", outline=color,
+                          width=max(1, s(1.6)), tags=tags)
+
+    name = {"photo": "image", "hardlink": "link",
+            "open": "folder_arrow",
+            "open_folder": "folder_arrow"}.get(name, name)
+    if name == "search":
+        oval(-7, -7, 3, 3)
+        line([(2, 2), (8, 8)])
+    elif name == "folder":
+        poly([(-8, -3), (-4, -7), (2, -7), (4, -3), (8, -3), (8, 8), (-8, 8)])
+    elif name == "folder_arrow":
+        poly([(-8, -2), (-4, -6), (2, -6), (4, -2), (8, -2), (8, 8), (-8, 8)])
+        line([(0, 2), (6, -4)])
+        poly([(6, -4), (2, -4), (6, 0)], fill=color)
+    elif name == "trash":
+        line([(-7, -6), (7, -6)])
+        line([(-3, -6), (-3, -9)])
+        poly([(-6, -4), (6, -4), (5, 8), (-5, 8)])
+        line([(-2, -1), (-2, 5)])
+        line([(2, -1), (2, 5)])
+    elif name == "check":
+        line([(-7, 0), (-2, 6), (8, -6)], w=2.2)
+    elif name == "close":
+        line([(-6, -6), (6, 6)], w=2)
+        line([(6, -6), (-6, 6)], w=2)
+    elif name == "warning":
+        poly([(0, -8), (8, 7), (-8, 7)])
+        line([(0, -3), (0, 2)], w=2)
+        dot(0, 5)
+    elif name == "info":
+        oval(-7, -7, 7, 7)
+        line([(0, -2), (0, 5)], w=2)
+        dot(0, -4.5)
+    elif name == "shield":
+        poly([(0, -8), (7, -5), (7, 2), (0, 8), (-7, 2), (-7, -5)])
+    elif name == "history":
+        oval(-7, -7, 7, 7)
+        line([(0, 0), (0, -4)])
+        line([(0, 0), (4, 2)])
+        poly([(-8, -4), (-4, -8), (-3, -3)], fill=color)
+    elif name == "clock":
+        oval(-7, -7, 7, 7)
+        line([(0, 0), (0, -5)])
+        line([(0, 0), (4, 1)])
+    elif name == "layers":
+        poly([(0, -8), (7, -4), (0, 0), (-7, -4)])
+        poly([(0, -3), (7, 1), (0, 5), (-7, 1)])
+        poly([(0, 2), (7, 6), (0, 9), (-7, 6)])
+    elif name == "list":
+        for y in (-6, 0, 6):
+            dot(-7, y, 1.5)
+            line([(-3, y), (8, y)])
+    elif name == "edit":
+        poly([(-7, 4), (-3, 8), (8, -3), (4, -7)])
+        line([(-7, 4), (-8, 8)])
+        line([(-3, 8), (-8, 8)])
+    elif name == "document":
+        poly([(-6, -8), (4, -8), (8, -4), (8, 8), (-6, 8)])
+        line([(4, -8), (4, -4), (8, -4)])
+        line([(-3, -1), (4, -1)])
+        line([(-3, 3), (4, 3)])
+    elif name == "image":
+        rect(-8, -7, 8, 7)
+        oval(-4.5, -4.5, -1, -1)
+        line([(-8, 7), (-2, -1), (2, 3), (5, 0), (8, 7)])
+    elif name == "video":
+        rect(-8, -6, 8, 6)
+        poly([(-2, -3), (-2, 3), (5, 0)], fill=color)
+    elif name == "audio":
+        oval(-6, 3, -1, 8)
+        line([(-1, 5.5), (-1, -7)])
+        line([(-1, -7), (5, -4)])
+    elif name == "copy":
+        rect(-7, -4, 3, 8)
+        rect(-3, -8, 7, 4)
+    elif name == "filter":
+        poly([(-8, -8), (8, -8), (2, -1), (2, 7), (-2, 7), (-2, -1)])
+    elif name == "refresh":
+        arc(-7, -7, 7, 7, 40, 280)
+        poly([(6, -6), (8, -1), (3, -3)], fill=color)
+    elif name == "save":
+        poly([(-7, -8), (7, -8), (7, 8), (-7, 8)])
+        rect(-4, -8, 4, -2)
+        rect(-4, 1, 4, 8)
+    elif name == "stop":
+        rect(-6, -6, 6, 6, fill=color, outline="")
+    elif name == "sun":
+        oval(-3.5, -3.5, 3.5, 3.5)
+        for x, y in ((0, -8), (0, 8), (-8, 0), (8, 0),
+                     (-5.5, -5.5), (5.5, -5.5), (-5.5, 5.5), (5.5, 5.5)):
+            line([(x * 0.75, y * 0.75), (x, y)])
+    elif name == "moon":
+        poly([(0, -8), (-5, -6), (-7, 0), (-5, 6), (0, 8),
+              (2, 6), (4, 0), (2, -6)], fill=color)
+    elif name == "play":
+        poly([(-5, -7), (-5, 7), (8, 0)], fill=color)
+    elif name == "link":
+        oval(-8, -3, -1, 3)
+        oval(1, -3, 8, 3)
+        line([(-2, 0), (2, 0)])
+    elif name == "chevron_down":
+        line([(-6, -3), (0, 3), (6, -3)], w=2)
+    elif name == "chevron_right":
+        line([(-3, -6), (3, 0), (-3, 6)], w=2)
+    elif name == "compare":
+        line([(-7, 0), (7, 0)], w=2)
+        poly([(-7, 0), (-3, -3), (-3, 3)], fill=color)
+        poly([(7, 0), (3, -3), (3, 3)], fill=color)
+    elif name == "settings":
+        oval(-3, -3, 3, 3)
+        for x, y in ((0, -8), (0, 8), (-8, 0), (8, 0),
+                     (-5.5, -5.5), (5.5, -5.5), (-5.5, 5.5), (5.5, 5.5)):
+            line([(x * 0.6, y * 0.6), (x, y)])
+    elif name == "sparkle":
+        poly([(0, -8), (2, -2), (8, 0), (2, 2), (0, 8),
+              (-2, 2), (-8, 0), (-2, -2)], fill=color)
+    elif name == "arrow_right":
+        line([(-8, 0), (6, 0)], w=2)
+        poly([(6, 0), (2, -4), (2, 4)], fill=color)
+    elif name == "scan":
+        line([(-8, -4), (-8, -8), (-4, -8)])
+        line([(4, -8), (8, -8), (8, -4)])
+        line([(-8, 4), (-8, 8), (-4, 8)])
+        line([(4, 8), (8, 8), (8, 4)])
+        line([(-6, 0), (6, 0)])
+    elif name == "more":
+        dot(-6, 0)
+        dot(0, 0)
+        dot(6, 0)
+    else:
+        rect(-7, -7, 7, 7)
+
+
+def put_icon(canvas, theme, name, cx, cy, size, color, tags=()):
+    """图标统一入口：有图标字体时用字形，否则用矢量手绘。"""
+    if theme.has_icon_font:
+        canvas.create_text(cx, cy, text=ICON.get(name, name),
+                           font=theme.icon(size), fill=color, anchor="center",
+                           tags=tags)
+    else:
+        draw_icon(canvas, theme, name, cx, cy, size, color, tags)
+
+
+class Icon(tk.Canvas):
+    """单色小图标（替代 Label + 字形）：字体在用字形，不在用矢量；换主题重画。"""
+
+    def __init__(self, master, theme, name, size=13, color=None, bg=None,
+                 cursor=None):
+        self.theme = theme
+        self.name = name
+        self.size = size
+        self.color = color or theme.MUTED
+        self._bg = bg or theme.BG
+        self._iw = theme.s(max(size, 12))
+        kw = {"cursor": cursor} if cursor else {}
+        super().__init__(master, width=self._iw, height=self._iw, bg=self._bg,
+                         highlightthickness=0, bd=0, **kw)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        put_icon(self, self.theme, self.name, self._iw / 2, self._iw / 2 + 0.5,
+                 self.size, self.color)
+
+    def set_color(self, color):
+        self.color = color
+        self._draw()
+
+    def restyle(self):
+        try:
+            self.configure(bg=self.master.cget("bg"))
+            self._bg = self.master.cget("bg")
+        except tk.TclError:
+            pass
+        self._draw()
+
+
+def _focus_ring(canvas, theme, w, h, radius, color=None):
+    """键盘焦点描边（画在内容最上层）。"""
+    round_rect(canvas, 1.5, 1.5, w - 1.5, h - 1.5, radius,
+               fill="", outline=color or theme.ACCENT, width=theme.s(2))
+
+
 
 # ---------------------------------------------------------------- 绘图基础
 def round_rect(canvas, x1, y1, x2, y2, r, **kw):
@@ -363,11 +593,17 @@ class CanvasButton(tk.Canvas):
         h = theme.s(height)
         self._btn_w, self._btn_h = w, h
         super().__init__(master, width=w, height=h, bg=self._bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2",
+                         takefocus=1)
+        self._focused = False
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Return>", self._on_key_activate)
+        self.bind("<space>", self._on_key_activate)
         self._draw()
 
     def _draw(self):
@@ -387,15 +623,31 @@ class CanvasButton(tk.Canvas):
         total = text_w + (size_px + self.theme.s(7) if self.icon else 0)
         left = (w - total) / 2
         if self.icon:
-            self.create_text(left + size_px / 2, h / 2 + 0.5,
-                             text=ICON.get(self.icon, self.icon),
-                             font=self.theme.icon(self.icon_size), fill=fg,
-                             anchor="center")
+            put_icon(self, self.theme, self.icon,
+                     left + size_px / 2, h / 2 + 0.5, self.icon_size, fg)
             self.create_text(left + size_px + self.theme.s(7), h / 2 + 0.5,
                              text=self.text, font=self.font, fill=fg, anchor="w")
         else:
             self.create_text(w / 2, h / 2 + 0.5, text=self.text, font=self.font,
                              fill=fg, anchor="center")
+        if self._focused and self.enabled:
+            # 主按钮底色就是强调色，描边用白色才看得见
+            ring = (Theme.ON_ACCENT if self.kind in ("primary", "danger")
+                    else self.theme.ACCENT)
+            _focus_ring(self, self.theme, w, h, self.radius, ring)
+
+    def _on_focus_in(self, _=None):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _=None):
+        self._focused = False
+        self._draw()
+
+    def _on_key_activate(self, _=None):
+        if self.enabled and self.command:
+            self.command()
+        return "break"
 
     def _on_enter(self, _=None):
         if self.enabled:
@@ -430,7 +682,8 @@ class CanvasButton(tk.Canvas):
 
     def set_enabled(self, enabled: bool):
         self.enabled = bool(enabled)
-        self.configure(cursor="hand2" if enabled else "arrow")
+        self.configure(cursor="hand2" if enabled else "arrow",
+                       takefocus=1 if enabled else 0)
         self._draw()
 
     def set_text(self, text, width=None):
@@ -458,16 +711,44 @@ class Switch(tk.Canvas):
         self.h = theme.s(24)
         self._bg = bg or theme.CARD
         super().__init__(master, width=self.w, height=self.h, bg=self._bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2",
+                         takefocus=1)
         self._pos = 1.0 if self.value else 0.0
         self._anim = None
+        self.enabled = True
+        self._focused = False
         self.bind("<Button-1>", self._toggle)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Return>", self._on_key_toggle)
+        self.bind("<space>", self._on_key_toggle)
         self._draw()
 
     def _toggle(self, _=None):
+        if not self.enabled:
+            return
         self.set(not self.value, animate=True)
         if self.command:
             self.command(self.value)
+
+    def _on_focus_in(self, _=None):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _=None):
+        self._focused = False
+        self._draw()
+
+    def _on_key_toggle(self, _=None):
+        if self.enabled:
+            self._toggle()
+        return "break"
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "arrow",
+                       takefocus=1 if enabled else 0)
+        self._draw()
 
     def set(self, value, animate=False):
         target = 1.0 if value else 0.0
@@ -504,8 +785,10 @@ class Switch(tk.Canvas):
         self.delete("all")
         w, h = self.w, self.h
         pad = self.theme.s(2)
-        track_off = Theme.TRACK_OFF
-        track_on = self.theme.ACCENT
+        track_off = (Theme.TRACK_OFF if self.enabled
+                     else Theme.BTN_DISABLED_BG)
+        track_on = (self.theme.ACCENT if self.enabled
+                    else Theme.BTN_DISABLED_BG)
         round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, h / 2,
                    fill=track_on if self.value else track_off,
                    outline=track_on if self.value else track_off)
@@ -514,10 +797,16 @@ class Switch(tk.Canvas):
         right = w - pad - r
         cx = left + (right - left) * self._pos
         # 关闭状态的白滑块在白天主题下会糊在浅色轨道里，给一圈描边
+        knob = (Theme.KNOB_ON if self.value else Theme.KNOB_OFF)
+        if not self.enabled:
+            knob = Theme.FAINT
         self.create_oval(cx - r, h / 2 - r, cx + r, h / 2 + r,
-                         fill=Theme.KNOB_ON if self.value else Theme.KNOB_OFF,
+                         fill=knob,
                          outline="" if self.value else Theme.BORDER,
                          width=self.theme.s(1))
+        if self._focused and self.enabled:
+            # 轨道开着时就是强调色，描边用正文色才看得见
+            _focus_ring(self, self.theme, w, h, h / 2, self.theme.TEXT)
 
 
 # ---------------------------------------------------------------- 分段控件
@@ -541,7 +830,14 @@ class Segmented(tk.Canvas):
         self._widths = widths
         total = sum(widths) + self.pad * 2
         super().__init__(master, width=total, height=self.h, bg=self._bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0, cursor="hand2",
+                         takefocus=1)
+        self.enabled = True
+        self._focused = False
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Left>", self._on_key_move)
+        self.bind("<Right>", self._on_key_move)
         self._draw()
 
     def _seg_bounds(self):
@@ -560,16 +856,25 @@ class Segmented(tk.Canvas):
         for i, ((val, label), (x1, x2)) in enumerate(zip(self.options, self._seg_bounds())):
             active = val == self.value
             if active:
+                fill = (Theme.SCROLL_THUMB if self.enabled
+                        else Theme.BTN_DISABLED_BG)
                 round_rect(self, x1, self.pad, x2, self.h - self.pad,
-                           self.theme.s(8), fill=Theme.SCROLL_THUMB, outline="")
-            color = self.theme.TEXT if active else (
-                self.theme.TEXT_DIM if i == self._hover_idx else self.theme.MUTED)
+                           self.theme.s(8), fill=fill, outline="")
+            if not self.enabled:
+                color = self.theme.FAINT
+            else:
+                color = self.theme.TEXT if active else (
+                    self.theme.TEXT_DIM if i == self._hover_idx else self.theme.MUTED)
             self.create_text((x1 + x2) / 2, self.h / 2 + 0.5, text=label,
                              font=self.font, fill=color,
                              anchor="center", tags=(f"seg{i}",))
             self.tag_bind(f"seg{i}", "<Button-1>", lambda e, v=val: self._choose(v))
             self.tag_bind(f"seg{i}", "<Enter>", lambda e, idx=i: self._hover(idx))
             self.tag_bind(f"seg{i}", "<Leave>", lambda e: self._hover(None))
+        if self._focused and self.enabled:
+            _focus_ring(self, self.theme,
+                        sum(self._widths) + self.pad * 2, self.h,
+                        self.theme.s(10))
 
     def _hover(self, idx):
         if idx != self._hover_idx:
@@ -577,11 +882,36 @@ class Segmented(tk.Canvas):
             self._draw()
 
     def _choose(self, value):
+        if not self.enabled:
+            return
         if value != self.value:
             self.value = value
             self._draw()
             if self.command:
                 self.command(value)
+
+    def _on_focus_in(self, _=None):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _=None):
+        self._focused = False
+        self._draw()
+
+    def _on_key_move(self, event):
+        if not self.enabled:
+            return "break"
+        values = [v for v, _ in self.options]
+        idx = values.index(self.value) if self.value in values else 0
+        step = -1 if event.keysym == "Left" else 1
+        self._choose(values[(idx + step) % len(values)])
+        return "break"
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self.configure(cursor="hand2" if enabled else "arrow",
+                       takefocus=1 if enabled else 0)
+        self._draw()
 
     def set_value(self, value):
         self.value = value
@@ -804,9 +1134,8 @@ class Chip(tk.Canvas):
         x = self.pad
         color = self.color
         if self.icon:
-            self.create_text(x + self.theme.s(6.5), self.h / 2 + 0.5,
-                             text=ICON.get(self.icon, self.icon),
-                             font=self.theme.icon(13), fill=color, anchor="center")
+            put_icon(self, self.theme, self.icon,
+                     x + self.theme.s(6.5), self.h / 2 + 0.5, 13, color)
             x += self.theme.s(13) + self.theme.s(6)
         if self.text:
             self.create_text(x, self.h / 2 + 0.5, text=self.text,
@@ -898,9 +1227,8 @@ def confirm(parent, theme, title, message, ok_text="确定", cancel_text="取消
     bubble.pack(side="left", pady=(1, 0))
     round_rect(bubble, 1, 1, theme.s(39), theme.s(39), theme.s(12),
                fill=theme.RED_DIM if danger else Theme.CHIP_BG, outline="")
-    bubble.create_text(theme.s(20), theme.s(20) + 1, text=ICON.get(icon, icon),
-                       font=theme.icon(18),
-                       fill=theme.RED if danger else theme.ACCENT, anchor="center")
+    put_icon(bubble, theme, icon, theme.s(20), theme.s(20) + 1, 18,
+             theme.RED if danger else theme.ACCENT)
 
     title_box = tk.Frame(head, bg=theme.CARD)
     title_box.pack(side="left", fill="x", expand=True, padx=(theme.s(12), 0))
@@ -913,8 +1241,8 @@ def confirm(parent, theme, title, message, ok_text="确定", cancel_text="取消
     close = tk.Canvas(head, width=theme.s(26), height=theme.s(26), bg=theme.CARD,
                       highlightthickness=0, bd=0, cursor="hand2")
     close.pack(side="right", anchor="n")
-    close.create_text(theme.s(13), theme.s(13), text=ICON["close"],
-                      font=theme.icon(12), fill=theme.MUTED, anchor="center")
+    put_icon(close, theme, "close", theme.s(13), theme.s(13), 12,
+             theme.MUTED)
     close.bind("<Button-1>", lambda e: _close())
 
     body = tk.Label(inner, text=message, bg=theme.CARD, fg=theme.TEXT_DIM,
@@ -1045,8 +1373,8 @@ def prompt(parent, theme, title, message, value="", ok_text="保存",
     bubble.pack(side="left", pady=(1, 0))
     round_rect(bubble, 1, 1, theme.s(39), theme.s(39), theme.s(12),
                fill=Theme.CHIP_BG, outline="")
-    bubble.create_text(theme.s(20), theme.s(20) + 1, text=ICON.get(icon, icon),
-                       font=theme.icon(18), fill=theme.ACCENT, anchor="center")
+    put_icon(bubble, theme, icon, theme.s(20), theme.s(20) + 1, 18,
+             theme.ACCENT)
     box = tk.Frame(head, bg=theme.CARD)
     box.pack(side="left", fill="x", expand=True, padx=(theme.s(12), 0))
     tk.Label(box, text=title, bg=theme.CARD, fg=theme.TEXT,
@@ -1057,8 +1385,8 @@ def prompt(parent, theme, title, message, value="", ok_text="保存",
     close = tk.Canvas(head, width=theme.s(26), height=theme.s(26),
                       bg=theme.CARD, highlightthickness=0, bd=0, cursor="hand2")
     close.pack(side="right", anchor="n")
-    close.create_text(theme.s(13), theme.s(13), text=ICON["close"],
-                      font=theme.icon(12), fill=theme.MUTED, anchor="center")
+    put_icon(close, theme, "close", theme.s(13), theme.s(13), 12,
+             theme.MUTED)
     close.bind("<Button-1>", lambda e: _close())
 
     var = tk.StringVar(value=value)
@@ -1179,8 +1507,8 @@ class PopupMenu(tk.Toplevel):
             row = tk.Frame(body, bg=theme.CARD, cursor="hand2")
             row.pack(fill="x", padx=pad, pady=1)
             if icon:
-                ic = tk.Label(row, text=ICON.get(icon, icon), bg=theme.CARD,
-                              fg=theme.MUTED, font=theme.icon(13), width=2)
+                ic = Icon(row, theme, icon, size=13, color=theme.MUTED,
+                          bg=theme.CARD)
                 ic.pack(side="left", padx=(theme.s(6), 0), pady=theme.s(6))
             txt = tk.Label(row, text=label, bg=theme.CARD,
                            fg=theme.RED if label.startswith("删除") else theme.TEXT,
