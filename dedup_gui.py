@@ -1884,7 +1884,7 @@ class ResultsPage(tk.Frame):
                 if item.protected:
                     self._protected[str(item.path)] = True
         try:
-            self._last_cleanup = tools.last_manifest("cleanup")
+            self._last_cleanup = tools.last_restorable_cleanup()
             self.btn_undo_clean.set_enabled(self._last_cleanup is not None)
         except Exception:
             pass
@@ -2185,7 +2185,7 @@ class ResultsPage(tk.Frame):
     def undo_clean(self):
         if self.busy:
             return
-        path = self._last_cleanup or tools.last_manifest("cleanup")
+        path = self._last_cleanup or tools.last_restorable_cleanup()
         if not path or not Path(path).exists():
             self.app.toast("没有可以撤销的清理记录", "info")
             self.btn_undo_clean.set_enabled(False)

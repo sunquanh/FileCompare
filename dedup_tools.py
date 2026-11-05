@@ -465,13 +465,17 @@ def save_manifest(kind: str, root: Path, records) -> Path:
 
 
 def rewrite_manifest(path: Path, records) -> Path:
-    """把已执行的部分记录写回（用于中断后仍可撤销）。"""
+    """把已执行的部分记录写回（用于中断后仍可撤销）。
+
+    原子写（临时文件 + os.replace）：改写中途被杀也不会留下截断的记录。"""
     try:
         data = read_manifest(path)
         data["items"] = list(records)
         data["count"] = len(records)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                         encoding="utf-8")
+        os.replace(temp, path)
     except Exception as exc:
         ignore(__name__, exc)
     return path
@@ -502,6 +506,22 @@ def last_manifest_multi(*kinds: str):
                                  or _manifest_mtime(path) > _manifest_mtime(best)):
             best = path
     return best
+
+
+def last_restorable_cleanup():
+    """最新一份清理记录里有可还原（移入回收站）的文件时返回它，否则 None。
+
+    永久删除的记录不可还原，撤销按钮不应为它启用。"""
+    path = last_manifest("cleanup")
+    if path is None:
+        return None
+    try:
+        data = read_manifest(path)
+    except Exception:
+        return None
+    if any(r.get("act") == "recycle" for r in data.get("items", [])):
+        return path
+    return None
 
 
 def read_manifest(path: Path) -> dict:

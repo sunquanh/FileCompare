@@ -68,6 +68,7 @@ from dedup_models import (
     ScanOptions,
     ScanResult,
     app_dir,
+    check_cancel,
     clusters_complete_link,
     cv2,
     format_date,
@@ -95,11 +96,15 @@ _pick_keep = pick_keep
 
 
 def is_filesystem_root(path) -> bool:
-    """是不是盘符根目录（Windows 的 C:\）或根目录（POSIX 的 /）。"""
+    """是不是盘符根目录（Windows 的 C 盘根目录）、UNC 根目录
+    （服务器加共享名那一层）或根目录（POSIX 的 /）。"""
     text = str(path)
+    if text.startswith(("\\\\", "//")):
+        parts = [p for p in text[2:].replace("\\", "/").split("/") if p]
+        return len(parts) == 2
     if len(text) >= 2 and text[1] == ":":
         return text[2:] in ("", "\\", "/")
-    return text == "/"
+    return text in ("/", "\\")
 
 
 def video_available() -> bool:
@@ -220,7 +225,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 tiny_photos.append(str(item.path))
         for item, fp in valid:
             item.width, item.height = fp.width, fp.height
-        say(f"照片指纹完成：{len(valid):,} 张可用，{bad_photos} 张跳过")
+        say(f"照片指纹完成：{len(valid):,} 张可用，{bad_photos} 张跳过"
+            + (f"（其中 {len(tiny_photos)} 张小于 16px）" if tiny_photos else ""))
         if tiny_photos:
             shown = "、".join(tiny_photos[:10])
             extra = f" 等 {len(tiny_photos)} 张" if len(tiny_photos) > 10 else ""
@@ -361,7 +367,12 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 continue
             for chunk in cluster_audio(items):
                 if len(chunk) > 1 and fingerprint_available():
-                    fps = [(it, chromaprint(it.path)) for it in chunk]
+                    fps = []
+                    for i, it in enumerate(chunk):
+                        check_cancel(cancel)
+                        fps.append((it, chromaprint(it.path)))
+                        emit("audio", i + 1, len(chunk),
+                             f"声学指纹 {i + 1:,}/{len(chunk):,}")
                     usable = [(it, fp) for it, fp in fps if fp]
                     if len(usable) >= 2:
                         base = usable[0][1][0]
