@@ -52,6 +52,7 @@ try:
         confirm,
         ellipsize,
         enable_dark_titlebar,
+        wrap_lines,
         make_logo,
         prompt,
         put_icon,
@@ -2797,7 +2798,10 @@ class GroupCard(tk.Canvas):
         tw = s(148)
         th = s(96)
         label_h = s(42)
-        head_h = s(30) + (s(16) if self.group.note else 0)
+        note_lines = (wrap_lines(t.font(8), self.group.note,
+                                 max(s(40), w - pad * 2))
+                      if self.group.note else [])
+        head_h = s(30) + s(16) * len(note_lines)
         n = len(self.group.items)
         per = max(1, (w - pad * 2 + gap) // (tw + gap))
         rows = max(1, math.ceil(n / per))
@@ -2807,7 +2811,7 @@ class GroupCard(tk.Canvas):
         self.delete("all")
         round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, s(14),
                    fill=t.CARD, outline=t.BORDER_SOFT)
-        self._draw_header(w, pad, head_h)
+        self._draw_header(w, pad, head_h, note_lines)
 
         base_y = pad + head_h + s(10)
         self._tiles = {}
@@ -2822,7 +2826,7 @@ class GroupCard(tk.Canvas):
             self._draw_tile(i, item, x, y, tw, th)
         self._rendered = True
 
-    def _draw_header(self, w, pad, head_h):
+    def _draw_header(self, w, pad, head_h, note_lines=()):
         t = self.theme
         s = t.s
         g = self.group
@@ -2883,9 +2887,10 @@ class GroupCard(tk.Canvas):
         info = ellipsize(t.font(8), info, avail)
         self.create_text(pad + bw + s(10), by + s(12) + 0.5, text=info,
                          font=t.font(8), fill=t.MUTED, anchor="w")
-        if g.note:
-            self.create_text(pad, by + s(12) + s(16) + 0.5, text=g.note,
-                             font=t.font(8), fill=t.MUTED, anchor="w")
+        for i, line in enumerate(note_lines):
+            self.create_text(pad, by + s(12) + s(16) * (i + 1) + 0.5,
+                             text=line, font=t.font(8), fill=t.MUTED,
+                             anchor="w")
 
     def _draw_tile(self, i, item, x, y, tw, th):
         t = self.theme
@@ -3583,7 +3588,7 @@ class OrganizePage(ToolPage):
                   icon="warning")
             return
         kind_label = "移动" if data.get("kind") == "finder" else "整理"
-        msg = (f"将撤销 {data['time']} 的{kind_label}（{data.get('count', '?')} 个文件）：\n"
+        msg = (f"将撤销 {data.get('time', '未知时间')} 的{kind_label}（{data.get('count', '?')} 个文件）：\n"
                f"把文件放回原来的位置。\n\n如果原位置已有同名文件，会跳过。")
         if confirm(self.app, t, f"撤销上次{kind_label}", msg, ok_text="撤销",
                    cancel_text="取消", icon="warning") != "ok":
@@ -4044,7 +4049,7 @@ class RenamePage(ToolPage):
             alert(self.app, t, "操作记录损坏", "无法读取上一次改名记录。",
                   icon="warning")
             return
-        msg = (f"将撤销 {data['time']} 的改名（{data.get('count', '?')} 个文件）：\n"
+        msg = (f"将撤销 {data.get('time', '未知时间')} 的改名（{data.get('count', '?')} 个文件）：\n"
                "把文件名改回原来的样子。")
         if confirm(self.app, t, "撤销上次改名", msg, ok_text="撤销",
                    cancel_text="取消", icon="warning") != "ok":

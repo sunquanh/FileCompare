@@ -686,7 +686,7 @@ def _cli_undo(args):
     if not isinstance(data, dict):
         print(f"操作记录损坏：{path.name} 不是对象")
         return 1
-    print(f"撤销 {data['time']} 的 {data['kind']} 操作，共 "
+    print(f"撤销 {data.get('time', '未知时间')} 的 {data.get('kind', '未知操作')} 操作，共 "
           f"{data.get('count', '?')} 条: {path.name}")
     if not args.yes and input("确认? (y/回车=取消) ").strip().lower() != "y":
         print("已取消")

@@ -562,7 +562,32 @@ def ellipsize(font, text, max_width):
             lo = mid
         else:
             hi = mid - 1
-    return text[:lo] + ell
+def wrap_lines(font, text, max_width):
+    """按像素宽把文本折成多行（中英文混排按字折），返回行列表。"""
+    if not text:
+        return []
+    if font.measure(text) <= max_width:
+        return [text]
+    lines, cur = [], ""
+    for ch in text:
+        if font.measure(cur + ch) <= max_width or not cur:
+            cur += ch
+        else:
+            lines.append(cur)
+            cur = ch
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _shade(hex_color, factor):
+    """把 #rrggbb 按 factor 变深（<1）或变浅（>1），非法值原样返回。"""
+    try:
+        r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    except (ValueError, TypeError):
+        return hex_color
+    r, g, b = (max(0, min(255, round(c * factor))) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ---------------------------------------------------------------- 按钮
@@ -585,6 +610,7 @@ class CanvasButton(tk.Canvas):
         self.padding = theme.s(padding)
         self.enabled = True
         self._hover = False
+        self._pressed = False
         self._bg = bg or theme.BG
         natural = self.font.measure(text) + self.padding * 2
         if icon:
@@ -612,11 +638,14 @@ class CanvasButton(tk.Canvas):
         fill, hover, fg, outline = self.STYLES.get(self.kind, self.STYLES["secondary"])
         if not self.enabled:
             fill, fg, outline = Theme.BTN_DISABLED_BG, Theme.FAINT, None
+        elif self._pressed:
+            fill = _shade(fill, 0.85) if fill else _shade(hover, 0.85)
         elif self._hover:
             fill = hover
         if not fill:
             fill = self._bg
-        round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, self.radius,
+        dy = 1 if self._pressed and self.enabled else 0
+        round_rect(self, 0.5, 0.5 + dy, w - 0.5, h - 0.5 + dy, self.radius,
                    fill=fill, outline=outline or fill)
         size_px = self.theme.s(self.icon_size)
         text_w = self.font.measure(self.text)
@@ -624,13 +653,13 @@ class CanvasButton(tk.Canvas):
         left = (w - total) / 2
         if self.icon:
             put_icon(self, self.theme, self.icon,
-                     left + size_px / 2, h / 2 + 0.5, self.icon_size, fg)
-            self.create_text(left + size_px + self.theme.s(7), h / 2 + 0.5,
+                     left + size_px / 2, h / 2 + 0.5 + dy, self.icon_size, fg)
+            self.create_text(left + size_px + self.theme.s(7), h / 2 + 0.5 + dy,
                              text=self.text, font=self.font, fill=fg, anchor="w")
         else:
-            self.create_text(w / 2, h / 2 + 0.5, text=self.text, font=self.font,
+            self.create_text(w / 2, h / 2 + 0.5 + dy, text=self.text, font=self.font,
                              fill=fg, anchor="center")
-        if self._focused and self.enabled:
+        if self._focused and self.enabled and not self._pressed:
             # 主按钮底色就是强调色，描边用白色才看得见
             ring = (Theme.ON_ACCENT if self.kind in ("primary", "danger")
                     else self.theme.ACCENT)
@@ -646,8 +675,19 @@ class CanvasButton(tk.Canvas):
 
     def _on_key_activate(self, _=None):
         if self.enabled and self.command:
-            self.command()
+            self._pressed = True
+            self._draw()
+            self.after(80, self._key_run)
         return "break"
+
+    def _key_run(self):
+        try:
+            self._pressed = False
+            self._draw()
+        except tk.TclError:
+            return
+        if self.enabled and self.command:
+            self.command()
 
     def _on_enter(self, _=None):
         if self.enabled:
@@ -656,15 +696,22 @@ class CanvasButton(tk.Canvas):
 
     def _on_leave(self, _=None):
         self._hover = False
+        if self._pressed:
+            # 松开发生在按钮外时收不到 ButtonRelease，离开即复位，防卡在按下态
+            self._pressed = False
         self._draw()
 
     def _on_press(self, _=None):
         if self.enabled and self.command:
+            self._pressed = True
             self.configure(cursor="arrow")
+            self._draw()
 
     def _on_release(self, event=None):
         if not self.enabled:
             return
+        self._pressed = False
+        self._draw()
         self.configure(cursor="hand2")
         inside = (0 <= event.x <= self._btn_w and 0 <= event.y <= self._btn_h) \
             if event else True
@@ -682,6 +729,7 @@ class CanvasButton(tk.Canvas):
 
     def set_enabled(self, enabled: bool):
         self.enabled = bool(enabled)
+        self._pressed = False
         self.configure(cursor="hand2" if enabled else "arrow",
                        takefocus=1 if enabled else 0)
         self._draw()
