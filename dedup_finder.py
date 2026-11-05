@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import sys
@@ -20,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import dedup_core as core
+import dedup_tools as tools
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -32,6 +34,21 @@ BANNER = "=" * 62
 
 def log(message=""):
     print(message, flush=True)
+
+
+def confirm(message, args):
+    """移动原文件前的确认。--yes 跳过；读不到输入或回答不是 y 一律取消。"""
+    if args.yes:
+        return True
+    try:
+        answer = input(message).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("已取消")
+        return False
+    if answer not in ("y", "yes"):
+        print("已取消")
+        return False
+    return True
 
 
 def safe_name(path: Path, used: set, index: int) -> str:
@@ -173,6 +190,15 @@ def main():
         on_log=lambda message: None)
     print()
 
+    if args.mode == "move" and result.groups:
+        move_files = sum(len(g.items) for g in result.groups
+                         if g.kind in (core.KIND_EXACT, core.KIND_PHOTO,
+                                       core.KIND_VIDEO))
+        if move_files:
+            log(f"将移动 {move_files} 个重复文件到 {out_dir}，原位置的文件会被移走。")
+            if not confirm("确认执行? (y/回车=取消) ", args):
+                return 1
+
     summary = {}
     rows = []
     for kind in (core.KIND_EXACT, core.KIND_PHOTO, core.KIND_VIDEO):
@@ -188,10 +214,16 @@ def main():
         log(f"  {kind}: {groups} 组 / {files} 个文件 / 可释放 "
             f"{core.human_size(wasted)}")
 
+    organize_records = []
     if args.organize:
         moved = 0
         mode = args.organize_mode or args.mode
-        for path, size in collect_files_in(root, out_dir):
+        pending = collect_files_in(root, out_dir)
+        if mode == "move" and pending:
+            log(f"归档将移动 {len(pending)} 个文件到 {out_dir / '_归档'}，原位置的文件会被移走。")
+            if not confirm("确认执行? (y/回车=取消) ", args):
+                pending = []
+        for path, size in pending:
             category = "其他"
             for name, exts in core_category().items():
                 if path.suffix.lower() in exts:
@@ -205,6 +237,8 @@ def main():
             try:
                 if mode == "move":
                     shutil.move(str(path), str(target))
+                    organize_records.append({"act": "move", "src": str(path),
+                                             "dst": str(target)})
                 elif mode == "copy":
                     shutil.copy2(str(path), str(target))
                 else:
@@ -222,6 +256,31 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
         log(f"  报告: {report}")
+
+    move_records = list(organize_records)
+    if args.mode == "move":
+        move_records += [{"act": "move", "src": r["原始路径"], "dst": r["放入"]}
+                         for r in rows]
+    if move_records:
+        try:
+            manifest = tools.save_manifest("finder", root, move_records)
+            log(f"  操作记录: {manifest}")
+        except Exception as exc:
+            fallback = out_dir / f"finder-{stamp}.json"
+            try:
+                data = {"kind": "finder", "root": str(root),
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "count": len(move_records), "items": move_records}
+                temp = fallback.with_suffix(".tmp")
+                temp.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+                os.replace(temp, fallback)
+                log(f"  [警告] 撤销记录写入失败({exc})，已改存到 {fallback}，"
+                    "可拷入 _操作记录 后用 undo --kind finder 撤销")
+            except Exception as exc2:
+                log(f"  [警告] 撤销记录写入失败({exc})，备用记录也写失败"
+                    f"({exc2})，请自行保留报告.csv")
 
     log(f"\n完成：{result.total_groups} 组，可释放 "
         f"{core.human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")

@@ -241,6 +241,9 @@
   这三个 bat 调用的是 dedup_finder.py，算法与图形界面完全一致（共用
   dedup_core）。适合批处理或在没有图形界面的环境使用。
 
+  移动文件前会先询问确认（加 --yes 跳过询问）。移动操作会写一份撤销
+  记录，可用 python dedup_tools.py undo --kind finder 还原。
+
 
 【依赖】
 

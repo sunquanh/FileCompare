@@ -110,15 +110,19 @@ def _full_hash(path: Path, size: int | None = None) -> str:
 
 # ---------------------------------------------------------------- 阶段
 def _stage_groups(items, func, tag, workers, cancel, on_progress, cache,
-                  label):
-    """对一批文件计算指纹并按 (size, 指纹) 分组，只保留 ≥2 的组。"""
+                  label, trust_cache=True):
+    """对一批文件计算指纹并按 (size, 指纹) 分组，只保留 ≥2 的组。
+
+    trust_cache=False 时不读/写缓存：用于最终全文件校验，缓存只按大小+mtime
+    校验，内容变了仍可能命中，误判为完全重复会丢数据。
+    """
     def work(item):
-        if cache is not None:
+        if trust_cache and cache is not None:
             hit = cache.get(item, tag)
             if hit:
                 return hit
         digest = func(item.path, item.size)
-        if cache is not None:
+        if trust_cache and cache is not None:
             cache.put(item, tag, digest)
         return digest
 
@@ -170,7 +174,7 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
 
     groups = _stage_groups([f for g in remaining for f in g], _full_hash,
                            CACHE_TAGS["full"], workers, cancel, on_progress,
-                           cache, "完整校验")
+                           cache, "完整校验", trust_cache=False)
     groups.sort(key=lambda g: -g[0].size)
     return groups
 
@@ -178,4 +182,5 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
 def hash_all(files, workers=4, cancel=None, on_progress=None, cache=None):
     """全量哈希（供旧版 CLI 或其他调用方使用）。"""
     return _stage_groups(files, _full_hash, CACHE_TAGS["full"], workers,
-                         cancel, on_progress, cache, "完整校验")
+                         cancel, on_progress, cache, "完整校验",
+                         trust_cache=False)

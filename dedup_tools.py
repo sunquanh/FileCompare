@@ -608,7 +608,8 @@ def main():
     rename.set_defaults(func=_cli_rename)
 
     undo = sub.add_parser("undo", help="撤销最近一次操作")
-    undo.add_argument("--kind", choices=["organize", "rename"], default=None)
+    undo.add_argument("--kind", choices=["organize", "rename", "finder"],
+                      default=None)
     undo.add_argument("--yes", action="store_true")
     undo.set_defaults(func=_cli_undo)
 
