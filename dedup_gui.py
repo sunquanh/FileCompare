@@ -3516,6 +3516,10 @@ class OrganizePage(ToolPage):
             alert(self.app, t, "操作记录损坏", "无法读取上一次整理记录。",
                   icon="warning")
             return
+        if not isinstance(data, dict):
+            alert(self.app, t, "操作记录损坏", "无法读取上一次整理记录。",
+                  icon="warning")
+            return
         kind_label = "移动" if data.get("kind") == "finder" else "整理"
         msg = (f"将撤销 {data['time']} 的{kind_label}（{data.get('count', '?')} 个文件）：\n"
                f"把文件放回原来的位置。\n\n如果原位置已有同名文件，会跳过。")
@@ -3935,6 +3939,10 @@ class RenamePage(ToolPage):
         try:
             data = tools.read_manifest(mp)
         except Exception:
+            alert(self.app, t, "操作记录损坏", "无法读取上一次改名记录。",
+                  icon="warning")
+            return
+        if not isinstance(data, dict):
             alert(self.app, t, "操作记录损坏", "无法读取上一次改名记录。",
                   icon="warning")
             return
