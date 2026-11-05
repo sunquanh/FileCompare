@@ -2198,7 +2198,11 @@ class ResultsPage(tk.Frame):
         if not isinstance(data, dict):
             self.app.toast("清理记录损坏，无法还原", "err")
             return
-        paths = [r.get("src") for r in data.get("items", [])
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            self.app.toast("清理记录损坏，无法还原", "err")
+            return
+        paths = [r.get("src") for r in items
                  if isinstance(r, dict) and r.get("src")]
         if not paths:
             self.app.toast("这次清理没有可还原的文件", "info")
