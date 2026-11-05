@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 import dedup_video
@@ -37,7 +38,7 @@ SCAN_STAGE_LABELS = {
 
 # ---------------------------------------------------------------- 收集
 def collect_files(options: ScanOptions, cancel=None, on_progress=None):
-    """递归收集文件，返回 (FileItem 列表, 跳过的硬链接数)。
+    """递归收集文件，返回 (FileItem 列表, 跳过的硬链接数, 无法读取的文件数)。
 
     同一个物理文件（NTFS 硬链接、目录联接、重复挂载）只保留第一次出现的路径，
     否则会把「删除后并不释放空间」的硬链接当成重复文件。
@@ -54,6 +55,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
     found: list[FileItem] = []
     seen_inodes: set[tuple] = set()
     skipped_inodes = 0
+    skipped_unreadable = 0
     checked = 0
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True,
@@ -73,6 +75,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
             try:
                 stat = path.stat()
             except OSError:
+                skipped_unreadable += 1
                 continue
             checked += 1
             if stat.st_size <= 0 or stat.st_size < options.min_size:
@@ -89,6 +92,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
                 path=path, size=stat.st_size, mtime=stat.st_mtime,
                 mtime_ns=getattr(stat, "st_mtime_ns", 0),
                 dev=stat.st_dev, ino=stat.st_ino,
+                is_symlink=path.is_symlink(),
                 protected=bool(protect_roots) and is_protected(path)))
             if on_progress and (len(found) % 400 == 0):
                 on_progress(len(found), 0, f"已发现 {len(found):,} 个文件")
@@ -97,7 +101,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
 
     if on_progress:
         on_progress(len(found), len(found), f"共发现 {len(found):,} 个文件")
-    return found, skipped_inodes
+    return found, skipped_inodes, skipped_unreadable
 
 
 _SKIP = {
@@ -297,10 +301,9 @@ def hardlink_replace(keep_path, dup_paths):
             if path.stat().st_dev != keep_stat.st_dev:
                 failed.append(str(path))
                 continue
-            temp = path.with_name(path.name + ".deduplink.tmp")
+            temp = path.with_name(
+                path.name + f".deduplink-{uuid.uuid4().hex[:8]}.tmp")
             try:
-                if temp.exists():
-                    temp.unlink()
                 os.link(keep, temp)
                 os.replace(temp, path)
                 kept.append(str(path))

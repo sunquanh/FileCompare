@@ -128,17 +128,20 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     keep_rule = getattr(options, "keep_rule", "best")
     emit("collect", 0, 0, "正在遍历文件夹…")
     say(f"开始扫描：{root}")
-    files, skipped_inodes = collect_files(
+    files, skipped_inodes, skipped_unreadable = collect_files(
         options, cancel=cancel,
         on_progress=lambda d, t, m: emit("collect", d, t, m))
     if skipped_inodes:
         say(f"跳过 {skipped_inodes} 个硬链接/重复挂载（同一物理文件）")
 
     if not files:
+        if skipped_unreadable:
+            say(f"{skipped_unreadable} 个文件无法读取，已跳过")
         say("没有发现可检测的文件")
         return ScanResult(root=root, file_count=0,
                           elapsed=time.perf_counter() - started,
-                          skipped_inodes=skipped_inodes)
+                          skipped_inodes=skipped_inodes,
+                          skipped_unreadable=skipped_unreadable)
 
     total_size = sum(f.size for f in files)
     photos = [f for f in files if is_photo(f.path)]
@@ -154,11 +157,13 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     notes: list[str] = []
 
     # ---- 完全重复
+    exact_stats: dict = {}
     if options.exact:
         emit("exact", 0, 0, "正在分组比对文件指纹…")
         exact_groups = find_exact(
             files, options.workers, cancel=cancel,
-            on_progress=lambda d, t, m: emit("exact", d, t, m), cache=cache)
+            on_progress=lambda d, t, m: emit("exact", d, t, m), cache=cache,
+            stats=exact_stats)
         for members in exact_groups:
             items = sorted(members, key=lambda x: (-x.size, str(x.path)))
             group = DupGroup(KIND_EXACT, items, 100, "字节完全一致")
@@ -345,10 +350,15 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                             say(f"声学指纹显示《{chunk[0].audio_title}》版本不同，跳过")
                             continue
                 title = f"{chunk[0].audio_artist} - {chunk[0].audio_title}"
+                verified = fingerprint_available()
                 group = DupGroup(KIND_AUDIO,
                                  sorted(chunk, key=lambda x: str(x.path)),
                                  98 if len(chunk) > 2 else 99,
-                                 f"标签相同：{title}"[:64])
+                                 f"标签相同：{title}"[:64],
+                                 select_by_default=verified)
+                if not verified:
+                    group.similarity = 90
+                    group.note = f"标签相同，未做声学比对（默认不勾选）：{title}"[:64]
                 group.keep = pick_keep(group.kind, group.items, keep_rule, root)
                 groups.append(group)
                 audio_groups += 1
@@ -394,11 +404,16 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
 
     groups.sort(key=lambda g: (KIND_ORDER.index(g.kind)
                                if g.kind in KIND_ORDER else 9, -g.wasted))
+    skipped_unreadable += len(exact_stats.get("unreadable", ()))
+    if skipped_unreadable:
+        say(f"扫描中共 {skipped_unreadable} 个文件无法读取，已跳过")
     result = ScanResult(
         root=root, groups=groups, file_count=len(files),
         total_size=total_size, elapsed=time.perf_counter() - started,
         bad_photos=bad_photos, bad_videos=bad_videos, bad_audio=bad_audio,
-        skipped_inodes=skipped_inodes, video_backend=backend, notes=notes)
+        skipped_inodes=skipped_inodes,
+        skipped_unreadable=skipped_unreadable,
+        video_backend=backend, notes=notes)
     say(f"扫描完成：{result.total_groups} 组，可释放 "
         f"{human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")
     return result

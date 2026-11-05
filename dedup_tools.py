@@ -374,12 +374,22 @@ def build_rename_plan(root: Path, opts: RenameOptions, cancel=None):
     return rows, summary
 
 
-def apply_rename_plan(rows, on_progress=None, cancel=None):
-    """执行重命名（两阶段，支持互换与仅大小写改动）。返回 (done, failed, records)。"""
+def apply_rename_plan(rows, on_progress=None, cancel=None, on_record=None):
+    """执行重命名（两阶段，支持互换与仅大小写改动）。返回 (done, failed, records)。
+
+    on_record(records) 在阶段一完成后与阶段二每 100 个文件回调一次。
+    records 始终反映文件当前所在位置（阶段一是临时名，阶段二改成目标名），
+    供调用方边执行边写撤销记录，进程中断也能撤销已完成部分。
+    """
     todo = [row for row in rows if row[3] != "same"]
     total = len(todo)
-    done, failed, records = 0, 0, []
+    done, failed = 0, 0
     staged: list[tuple[Path, Path, str]] = []
+    state: dict[str, str] = {}
+
+    def snapshot():
+        return [{"act": "rename", "src": src, "dst": dst}
+                for src, dst in state.items()]
 
     # 阶段一：全部改成临时名，避免 A→B、B→A 互相占用
     for src, _old, new, _status in todo:
@@ -395,6 +405,9 @@ def apply_rename_plan(rows, on_progress=None, cancel=None):
             failed += 1
             continue
         staged.append((source, temp, new))
+        state[str(source)] = str(temp)
+    if on_record is not None and state:
+        on_record(snapshot())
 
     # 阶段二：临时名 → 目标名
     for step, (source, temp, new) in enumerate(staged, 1):
@@ -405,17 +418,19 @@ def apply_rename_plan(rows, on_progress=None, cancel=None):
                 raise FileExistsError("目标已存在")
             os.rename(temp, target)
             done += 1
-            records.append({"act": "rename", "src": str(source),
-                            "dst": str(target)})
+            state[str(source)] = str(target)
+            if on_record is not None and done % 100 == 0:
+                on_record(snapshot())
         except Exception:
             try:
                 os.rename(temp, source)
+                state.pop(str(source), None)
             except OSError:
                 pass
             failed += 1
         if on_progress:
             on_progress(step, total, new)
-    return done, failed, records
+    return done, failed, snapshot()
 
 
 # ---------------------------------------------------------------- 操作记录
@@ -559,8 +574,25 @@ def _cli_rename(args):
             "确认执行? (y/回车=取消) ").strip().lower() not in ("y", "yes"):
         print("已取消")
         return
-    done, failed, records = apply_rename_plan(rows)
-    path = save_manifest("rename", Path(args.dir), records)
+    partial = {"path": None}
+
+    def journal(records):
+        """边执行边写记录：进程被中断时已改名的文件也能撤销。"""
+        try:
+            if partial["path"] is None:
+                partial["path"] = save_manifest("rename", Path(args.dir),
+                                               records)
+            else:
+                rewrite_manifest(partial["path"], records)
+        except Exception:
+            pass
+
+    done, failed, records = apply_rename_plan(rows, on_record=journal)
+    if partial["path"] is not None:
+        rewrite_manifest(partial["path"], records)
+        path = partial["path"]
+    else:
+        path = save_manifest("rename", Path(args.dir), records)
     print(f"完成: {done} 个, 失败 {failed}。操作记录: {path}")
 
 

@@ -3851,12 +3851,29 @@ class RenamePage(ToolPage):
                                "info"))
 
         def work():
+            partial = {"path": None}
+
+            def journal(records):
+                """边执行边写记录：进程被中断时已改名的文件也能撤销。"""
+                try:
+                    if partial["path"] is None:
+                        partial["path"] = tools.save_manifest(
+                            "rename", root, records)
+                    else:
+                        tools.rewrite_manifest(partial["path"], records)
+                except Exception:
+                    pass
+
             try:
                 done, failed, records = tools.apply_rename_plan(
-                    rows, on_progress=prog)
+                    rows, on_progress=prog, on_record=journal)
                 mp = ""
                 if records:
-                    mp = str(tools.save_manifest("rename", root, records))
+                    if partial["path"] is not None:
+                        tools.rewrite_manifest(partial["path"], records)
+                        mp = str(partial["path"])
+                    else:
+                        mp = str(tools.save_manifest("rename", root, records))
                 self.app.post(("ren_done", (done, failed, mp, len(changes))))
             except Exception as exc:
                 self.app.post(("log", f"重命名失败：{exc}", "err"))

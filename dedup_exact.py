@@ -110,11 +110,12 @@ def _full_hash(path: Path, size: int | None = None) -> str:
 
 # ---------------------------------------------------------------- 阶段
 def _stage_groups(items, func, tag, workers, cancel, on_progress, cache,
-                  label, trust_cache=True):
+                  label, trust_cache=True, stats=None):
     """对一批文件计算指纹并按 (size, 指纹) 分组，只保留 ≥2 的组。
 
     trust_cache=False 时不读/写缓存：用于最终全文件校验，缓存只按大小+mtime
     校验，内容变了仍可能命中，误判为完全重复会丢数据。
+    stats 不为 None 时，把读不到的文件路径记进 stats["unreadable"]（set）。
     """
     def work(item):
         if trust_cache and cache is not None:
@@ -129,6 +130,11 @@ def _stage_groups(items, func, tag, workers, cancel, on_progress, cache,
     throttle = ProgressThrottle(on_progress)
     digests = parallel_map(work, items, workers=workers, cancel=cancel,
                            on_progress=lambda d, t, m: throttle(d, t, label))
+    if stats is not None:
+        bad = stats.setdefault("unreadable", set())
+        for item, digest in zip(items, digests):
+            if not digest:
+                bad.add(str(item.path))
     buckets: dict[tuple, list[FileItem]] = {}
     for item, digest in zip(items, digests):
         if not digest:
@@ -138,8 +144,12 @@ def _stage_groups(items, func, tag, workers, cancel, on_progress, cache,
             for v in buckets.values() if len(v) > 1]
 
 
-def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
-    """返回 [[FileItem, ...], ...]，全部按字节确认一致。"""
+def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None,
+               stats=None):
+    """返回 [[FileItem, ...], ...]，全部按字节确认一致。
+
+    stats 不为 None 时，把读不到的文件路径记进 stats["unreadable"]。
+    """
     by_size: dict[int, list[FileItem]] = {}
     for f in files:
         by_size.setdefault(f.size, []).append(f)
@@ -149,7 +159,7 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
 
     remaining = _stage_groups([f for g in candidates for f in g], _quick_hash,
                               CACHE_TAGS["quick"], workers, cancel,
-                              on_progress, cache, "快速比对")
+                              on_progress, cache, "快速比对", stats=stats)
     if not remaining:
         return []
 
@@ -157,7 +167,8 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
     big = [f for g in remaining for f in g if f.size > SAMPLE_MIN]
     if big:
         sampled = _stage_groups(big, _sample_hash, CACHE_TAGS["sample"],
-                                workers, cancel, on_progress, cache, "采样比对")
+                                workers, cancel, on_progress, cache, "采样比对",
+                                stats=stats)
         sampled_ids = {id(f) for g in sampled for f in g}
         merged = []
         for group in remaining:
@@ -174,7 +185,7 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None):
 
     groups = _stage_groups([f for g in remaining for f in g], _full_hash,
                            CACHE_TAGS["full"], workers, cancel, on_progress,
-                           cache, "完整校验", trust_cache=False)
+                           cache, "完整校验", trust_cache=False, stats=stats)
     groups.sort(key=lambda g: -g[0].size)
     return groups
 

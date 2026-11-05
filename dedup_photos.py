@@ -13,8 +13,13 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-import numpy as np
-from PIL import Image, ImageOps
+try:
+    import numpy as np
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover
+    np = None
+    Image = None
+    ImageOps = None
 
 from dedup_models import check_cancel, enable_heif, ignore
 

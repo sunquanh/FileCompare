@@ -183,11 +183,16 @@ def main():
         workers=args.workers or 0,
     )
 
-    result = core.scan_folder(
-        options,
-        on_progress=lambda stage, done, total, detail:
-            print(f"\r  {detail:<40}", end="", flush=True),
-        on_log=lambda message: None)
+    try:
+        result = core.scan_folder(
+            options,
+            on_progress=lambda stage, done, total, detail:
+                print(f"\r  {detail:<40}", end="", flush=True),
+            on_log=lambda message: None)
+    except RuntimeError as exc:
+        print()
+        log(str(exc))
+        return 1
     print()
 
     if args.mode == "move" and result.groups:
@@ -282,6 +287,8 @@ def main():
                 log(f"  [警告] 撤销记录写入失败({exc})，备用记录也写失败"
                     f"({exc2})，请自行保留报告.csv")
 
+    if result.skipped_unreadable:
+        log(f"  注意：{result.skipped_unreadable} 个文件无法读取，已跳过")
     log(f"\n完成：{result.total_groups} 组，可释放 "
         f"{core.human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")
     return 0

@@ -13,8 +13,12 @@ import json
 import subprocess
 import threading
 
-import numpy as np
-from PIL import Image
+try:
+    import numpy as np
+    from PIL import Image
+except Exception:  # pragma: no cover
+    np = None
+    Image = None
 
 from dedup_models import (check_cancel, cv2, find_tool, hidden_subprocess_kwargs,
                           ignore)

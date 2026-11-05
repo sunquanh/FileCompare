@@ -20,6 +20,8 @@ FPCALC = find_tool("fpcalc")
 
 _BITRATES_V1L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256,
                   320, 0]
+_BITRATES_V2L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144,
+                  160, 0]
 _SAMPLE_RATES = [44100, 48000, 32000, 0]
 
 
@@ -364,7 +366,9 @@ def _mp3_header_info(f, size):
                 bitrate_idx = (data[index + 2] >> 4) & 0x0F
                 sample_idx = (data[index + 2] >> 2) & 0x03
                 if bitrate_idx not in (0, 15) and sample_idx != 3:
-                    bitrate = _BITRATES_V1L3[bitrate_idx] * 1000
+                    table = (_BITRATES_V1L3 if version == 3
+                             else _BITRATES_V2L3)
+                    bitrate = table[bitrate_idx] * 1000
                     rate = _SAMPLE_RATES[sample_idx]
                     if version == 2:      # MPEG2
                         rate //= 2

@@ -238,6 +238,7 @@ class FileItem:
     mtime_ns: int = 0
     dev: int = 0
     ino: int = 0
+    is_symlink: bool = False
     width: int = 0
     height: int = 0
     duration: float = 0.0
@@ -269,8 +270,10 @@ class DupGroup:
 
     @property
     def wasted(self) -> int:
-        if self.kind == KIND_NAME or len(self.items) < 2:
-            # 同名相似只说明文件名相同，内容未必一致，不计入可释放空间
+        if (self.kind == KIND_NAME or len(self.items) < 2
+                or not self.select_by_default):
+            # 同名组内容未必一致、无声学比对的音频组默认不删，
+            # 都不计入可释放空间
             return 0
         return sum(i.size for i in self.items) - max(i.size for i in self.items)
 
@@ -336,6 +339,7 @@ class ScanResult:
     bad_videos: int = 0
     bad_audio: int = 0
     skipped_inodes: int = 0
+    skipped_unreadable: int = 0
     cancelled: bool = False
     video_backend: str = ""
     notes: list[str] = field(default_factory=list)
@@ -370,6 +374,10 @@ def pick_keep(kind: str, items: list[FileItem], rule: str = "best",
     """推荐保留哪一项。rule 见 KEEP_RULE_LABELS。"""
     if not items:
         return 0
+    # 符号链接只剩指针：组里有真实文件时，不选链接作保留项
+    cands = [i for i, it in enumerate(items) if not it.is_symlink]
+    if not cands:
+        cands = list(range(len(items)))
 
     def root_depth(item):
         if root is None:
@@ -397,7 +405,7 @@ def pick_keep(kind: str, items: list[FileItem], rule: str = "best",
         key = lambda x: (x.protected, x.mtime, -len(str(x.path)))
     else:
         key = lambda x: (x.protected, x.width * x.height, x.size, x.mtime)
-    return max(range(len(items)), key=lambda i: key(items[i]))
+    return max(cands, key=lambda i: key(items[i]))
 
 
 # ---------------------------------------------------------------- 聚类
