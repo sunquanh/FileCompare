@@ -81,7 +81,7 @@ from dedup_models import (
     pick_keep,
 )
 from dedup_names import find_name_groups, name_key
-from dedup_photos import PhotoFP, match_photos
+from dedup_photos import PhotoFP, match_photos, probe_size
 from dedup_photos import fingerprint as photo_fingerprint
 from dedup_video import (
     match_videos,
@@ -92,6 +92,14 @@ from dedup_video import (
 from dedup_video import signature as video_signature
 
 _pick_keep = pick_keep
+
+
+def is_filesystem_root(path) -> bool:
+    """是不是盘符根目录（Windows 的 C:\）或根目录（POSIX 的 /）。"""
+    text = str(path)
+    if len(text) >= 2 and text[1] == ":":
+        return text[2:] in ("", "\\", "/")
+    return text == "/"
 
 
 def video_available() -> bool:
@@ -128,7 +136,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     keep_rule = getattr(options, "keep_rule", "best")
     emit("collect", 0, 0, "正在遍历文件夹…")
     say(f"开始扫描：{root}")
-    files, skipped_inodes, skipped_unreadable = collect_files(
+    files, skipped_inodes, skipped_unreadable, skipped_empty = collect_files(
         options, cancel=cancel,
         on_progress=lambda d, t, m: emit("collect", d, t, m))
     if skipped_inodes:
@@ -141,7 +149,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         return ScanResult(root=root, file_count=0,
                           elapsed=time.perf_counter() - started,
                           skipped_inodes=skipped_inodes,
-                          skipped_unreadable=skipped_unreadable)
+                          skipped_unreadable=skipped_unreadable,
+                          skipped_empty=skipped_empty)
 
     total_size = sum(f.size for f in files)
     photos = [f for f in files if is_photo(f.path)]
@@ -154,6 +163,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     groups: list[DupGroup] = []
     consumed: set[str] = set()
     bad_photos = bad_videos = bad_audio = 0
+    tiny_photos: list[str] = []
     notes: list[str] = []
 
     # ---- 完全重复
@@ -202,9 +212,19 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         valid = [(todo_photos[i], fps[i]) for i in range(len(todo_photos))
                  if fps[i]]
         bad_photos = len(todo_photos) - len(valid)
+        invalid = [todo_photos[i] for i in range(len(todo_photos))
+                   if not fps[i]]
+        for item in invalid:
+            size = probe_size(item.path)
+            if size and (size[0] < 16 or size[1] < 16):
+                tiny_photos.append(str(item.path))
         for item, fp in valid:
             item.width, item.height = fp.width, fp.height
         say(f"照片指纹完成：{len(valid):,} 张可用，{bad_photos} 张跳过")
+        if tiny_photos:
+            shown = "、".join(tiny_photos[:10])
+            extra = f" 等 {len(tiny_photos)} 张" if len(tiny_photos) > 10 else ""
+            say(f"小于 16px 的图片 {len(tiny_photos)} 张，已跳过：{shown}{extra}")
 
         if len(valid) >= 2:
             emit("photo", 0, 1, "正在比对相似照片…")
@@ -340,7 +360,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             if len(items) < 2:
                 continue
             for chunk in cluster_audio(items):
-                if len(chunk) > 1 and fingerprint_available() and len(chunk) <= 12:
+                if len(chunk) > 1 and fingerprint_available():
                     fps = [(it, chromaprint(it.path)) for it in chunk]
                     usable = [(it, fp) for it, fp in fps if fp]
                     if len(usable) >= 2:
@@ -407,12 +427,15 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     skipped_unreadable += len(exact_stats.get("unreadable", ()))
     if skipped_unreadable:
         say(f"扫描中共 {skipped_unreadable} 个文件无法读取，已跳过")
+    if skipped_empty:
+        say(f"{skipped_empty} 个 0 字节文件，已跳过")
     result = ScanResult(
         root=root, groups=groups, file_count=len(files),
         total_size=total_size, elapsed=time.perf_counter() - started,
         bad_photos=bad_photos, bad_videos=bad_videos, bad_audio=bad_audio,
         skipped_inodes=skipped_inodes,
         skipped_unreadable=skipped_unreadable,
+        skipped_empty=skipped_empty, tiny_photos=tiny_photos,
         video_backend=backend, notes=notes)
     say(f"扫描完成：{result.total_groups} 组，可释放 "
         f"{human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")

@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -134,7 +135,8 @@ def collect_all(root: Path, recursive: bool = True, cancel=None,
         else:
             dirnames[:] = []
         if with_dirs:
-            dirs.extend(dirnames)
+            # 目录名也要带完整路径：改名撞名按（目录，文件名）成对算
+            dirs.extend(directory / d for d in dirnames)
         for name in filenames:
             path = directory / name
             try:
@@ -311,10 +313,13 @@ def build_rename_plan(root: Path, opts: RenameOptions, cancel=None):
     selected.sort(key=lambda p: str(p).lower())
     selected_keys = {norm(str(p)) for p in selected}
 
-    # 撞名集合：所有不参与本次改名的文件 + 所有目录
+    # 撞名集合：按（目录，文件名）成对算，只防同目录撞名；
+    # 包含所有不参与本次改名的文件 + 所有目录
     _all, dir_names = collect_all(root, recursive=True, with_dirs=True)
-    occupied = {norm(p.name) for p in _all if norm(str(p)) not in selected_keys}
-    occupied |= {norm(d) for d in dir_names}
+    occupied = {(norm(str(p.parent)), norm(p.name)) for p in _all
+                if norm(str(p)) not in selected_keys}
+    occupied |= {(norm(str(Path(d).parent)), norm(Path(d).name))
+                 for d in dir_names}
 
     pattern = None
     if opts.use_replace and opts.find:
@@ -326,7 +331,7 @@ def build_rename_plan(root: Path, opts: RenameOptions, cancel=None):
 
     counter = opts.num_start
     rows = []
-    planned_new: set[str] = set()
+    planned_new: set[tuple] = set()
     for path in selected:
         _check_cancel(cancel)
         stem, ext = path.stem, path.suffix
@@ -361,11 +366,13 @@ def build_rename_plan(root: Path, opts: RenameOptions, cancel=None):
         status = "rename"
         base = new_stem
         k = 2
-        while norm(base + ext) in occupied or norm(base + ext) in planned_new:
+        here = norm(str(path.parent))
+        while ((here, norm(base + ext)) in occupied
+               or (here, norm(base + ext)) in planned_new):
             base = f"{new_stem} ({k})"
             k += 1
             status = "auto"
-        planned_new.add(norm(base + ext))
+        planned_new.add((here, norm(base + ext)))
         rows.append([str(path), path.name, base + ext, status])
 
     summary = {}
@@ -449,7 +456,7 @@ def save_manifest(kind: str, root: Path, records) -> Path:
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                     encoding="utf-8")
     os.replace(temp, path)
-    for old in sorted(MANIFEST_DIR.glob("*.json"))[:-MANIFEST_KEEP]:
+    for old in sorted(MANIFEST_DIR.glob(f"{kind}-*.json"))[:-MANIFEST_KEEP]:
         try:
             old.unlink()
         except Exception as exc:
@@ -470,13 +477,31 @@ def rewrite_manifest(path: Path, records) -> Path:
     return path
 
 
+def _manifest_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def last_manifest(kind: str | None = None):
     if not MANIFEST_DIR.exists():
         return None
-    files = sorted(MANIFEST_DIR.glob("*.json"))
+    files = sorted(MANIFEST_DIR.glob("*.json"), key=_manifest_mtime)
     if kind:
         files = [f for f in files if f.name.startswith(kind + "-")]
     return files[-1] if files else None
+
+
+def last_manifest_multi(*kinds: str):
+    """取多个种类里最新的一份操作记录（按修改时间）。"""
+    best = None
+    for kind in kinds:
+        path = last_manifest(kind)
+        if path is not None and (best is None
+                                 or _manifest_mtime(path) > _manifest_mtime(best)):
+            best = path
+    return best
 
 
 def read_manifest(path: Path) -> dict:
@@ -547,7 +572,7 @@ def _cli_organize(args):
     if not args.yes and input(
             "确认执行? (y/回车=取消) ").strip().lower() not in ("y", "yes"):
         print("已取消")
-        return
+        return 1
     done, failed, records, _ = apply_organize_plan(
         rows, action="copy" if args.copy else "move")
     path = save_manifest("organize", root, records)
@@ -573,7 +598,7 @@ def _cli_rename(args):
     if not args.yes and input(
             "确认执行? (y/回车=取消) ").strip().lower() not in ("y", "yes"):
         print("已取消")
-        return
+        return 1
     partial = {"path": None}
 
     def journal(records):
@@ -606,7 +631,7 @@ def _cli_undo(args):
           f"{data.get('count', '?')} 条: {path.name}")
     if not args.yes and input("确认? (y/回车=取消) ").strip().lower() != "y":
         print("已取消")
-        return
+        return 1
     done, failed, skipped = undo_manifest(path)
     print(f"撤销完成: {done} 个, 跳过 {skipped} 个, 失败 {failed} 个")
 
@@ -646,8 +671,8 @@ def main():
     undo.set_defaults(func=_cli_undo)
 
     args = parser.parse_args()
-    args.func(args)
+    return args.func(args) or 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

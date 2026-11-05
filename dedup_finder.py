@@ -153,6 +153,8 @@ def main():
     if not root.is_dir():
         log(f"目录不存在: {root}")
         return 1
+    if core.is_filesystem_root(root):
+        log("警告：正在扫描盘符根目录，文件很多时会很慢。")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out).resolve() if args.out else root / f"_重复检测_{stamp}"
@@ -238,7 +240,12 @@ def main():
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / path.name
             if target.exists():
-                continue
+                stem, suffix = path.stem, path.suffix
+                k = 1
+                while (target_dir / f"{stem}_{k}{suffix}").exists():
+                    k += 1
+                target = target_dir / f"{stem}_{k}{suffix}"
+                log(f"  {path.name} 已存在，改名为 {target.name}")
             try:
                 if mode == "move":
                     shutil.move(str(path), str(target))
@@ -287,8 +294,18 @@ def main():
                 log(f"  [警告] 撤销记录写入失败({exc})，备用记录也写失败"
                     f"({exc2})，请自行保留报告.csv")
 
+    if args.clean_empty and move_records:
+        dirs = {str(Path(r["src"]).parent) for r in move_records}
+        removed = []
+        tools._remove_empty_dir_chains(
+            dirs, [str(root), str(out_dir)], on_removed=removed.append)
+        if removed:
+            log(f"  清理空目录: {len(removed)} 个")
+
     if result.skipped_unreadable:
         log(f"  注意：{result.skipped_unreadable} 个文件无法读取，已跳过")
+    if result.skipped_empty:
+        log(f"  注意：{result.skipped_empty} 个 0 字节文件，已跳过")
     log(f"\n完成：{result.total_groups} 组，可释放 "
         f"{core.human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")
     return 0

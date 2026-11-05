@@ -340,6 +340,8 @@ class ScanResult:
     bad_audio: int = 0
     skipped_inodes: int = 0
     skipped_unreadable: int = 0
+    skipped_empty: int = 0
+    tiny_photos: list[str] = field(default_factory=list)
     cancelled: bool = False
     video_backend: str = ""
     notes: list[str] = field(default_factory=list)

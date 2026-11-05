@@ -980,7 +980,11 @@ def confirm(parent, theme, title, message, ok_text="确定", cancel_text="取消
             pass
 
     top.bind("<Escape>", lambda e: _close())
-    top.bind("<Return>", lambda e: _close("ok"))
+    if danger:
+        # 危险框回车不再确认，必须点红色按钮
+        top.bind("<Return>", lambda e: _close())
+    else:
+        top.bind("<Return>", lambda e: _close("ok"))
     top.bind("<Destroy>", _cleanup_overlay, add="+")
 
     top.update_idletasks()

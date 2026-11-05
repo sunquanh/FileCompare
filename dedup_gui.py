@@ -1224,6 +1224,12 @@ class ScanPage(tk.Frame):
             alert(self.app, t, "目录不存在", f"找不到这个文件夹：\n{root}",
                   icon="warning")
             return
+        if core.is_filesystem_root(root):
+            if confirm(self.app, t, "扫描整个盘符？",
+                       "你选择的是盘符根目录，扫描可能耗时很久。确定要继续吗？",
+                       ok_text="继续扫描", cancel_text="取消",
+                       icon="warning") != "ok":
+                return
 
         preset = self.seg_strict.value
         preset_vals = core.PRESETS.get(preset, core.PRESETS["standard"])
@@ -2292,6 +2298,16 @@ class ResultsPage(tk.Frame):
             return
         if blocked:
             self.app.log(f"已跳过 {len(blocked)} 个保护/保留文件", "warn")
+        # 先按计划写一份记录：删一半被杀也能撤销已进回收站的部分
+        try:
+            planned = [{"act": "recycle" if recycle else "delete",
+                        "src": p, "size": self._size_map.get(p, 0)}
+                       for p in paths]
+            self._cleanup_partial = tools.save_manifest(
+                "cleanup", self.result.root if self.result else Path("."),
+                planned)
+        except Exception:
+            self._cleanup_partial = None
         t = self.theme
         self._last_recycle = recycle
         self.busy = True
@@ -2328,12 +2344,17 @@ class ResultsPage(tk.Frame):
                 records = [{"act": "recycle" if recycle else "delete",
                             "src": p, "size": self._size_map.get(p, 0)}
                            for p in deleted]
-                self._last_cleanup = tools.save_manifest(
-                    "cleanup", self.result.root if self.result else Path("."),
-                    records)
+                if getattr(self, "_cleanup_partial", None) is not None:
+                    tools.rewrite_manifest(self._cleanup_partial, records)
+                    self._last_cleanup = self._cleanup_partial
+                else:
+                    self._last_cleanup = tools.save_manifest(
+                        "cleanup", self.result.root if self.result else Path("."),
+                        records)
                 self.btn_undo_clean.set_enabled(bool(recycle))
             except Exception:
                 pass
+        self._cleanup_partial = None
         self.app.log(f"清理完成：成功 {len(deleted)} 个，失败 {len(failed)} 个",
                      "ok" if not failed else "warn")
         if deleted:
@@ -3114,7 +3135,7 @@ class OrganizePage(ToolPage):
                                      icon="history", height=38, size=9,
                                      bg=t.BG)
         self.undo_btn.pack()
-        self.undo_btn.set_enabled(tools.last_manifest("organize") is not None)
+        self.undo_btn.set_enabled(tools.last_manifest_multi("organize", "finder") is not None)
 
         self.path_var = tk.StringVar(
             value=self.settings.get("org_dir")
@@ -3458,7 +3479,7 @@ class OrganizePage(ToolPage):
         self.btn_run.set_enabled(False)
         self.btn_preview.set_enabled(True)
         self.app.set_status("引擎就绪", t.GREEN)
-        self.undo_btn.set_enabled(tools.last_manifest("organize") is not None)
+        self.undo_btn.set_enabled(tools.last_manifest_multi("organize", "finder") is not None)
         if failed:
             self.app.log(f"整理完成：成功 {done} 个，失败 {failed} 个", "warn")
             self.app.toast(f"完成 {done} 个，{failed} 个失败", "warn")
@@ -3476,9 +3497,9 @@ class OrganizePage(ToolPage):
     def undo(self):
         if self.busy:
             return
-        mp = tools.last_manifest("organize")
+        mp = tools.last_manifest_multi("organize", "finder")
         if not mp:
-            self.app.toast("没有可以撤销的整理记录", "info")
+            self.app.toast("没有可以撤销的整理/移动记录", "info")
             return
         t = self.theme
         try:
@@ -3487,17 +3508,18 @@ class OrganizePage(ToolPage):
             alert(self.app, t, "操作记录损坏", "无法读取上一次整理记录。",
                   icon="warning")
             return
-        msg = (f"将撤销 {data['time']} 的整理（{data.get('count', '?')} 个文件）：\n"
+        kind_label = "移动" if data.get("kind") == "finder" else "整理"
+        msg = (f"将撤销 {data['time']} 的{kind_label}（{data.get('count', '?')} 个文件）：\n"
                f"把文件放回原来的位置。\n\n如果原位置已有同名文件，会跳过。")
-        if confirm(self.app, t, "撤销上次整理", msg, ok_text="撤销",
+        if confirm(self.app, t, f"撤销上次{kind_label}", msg, ok_text="撤销",
                    cancel_text="取消", icon="warning") != "ok":
             return
         self.busy = True
         self.undo_btn.set_enabled(False)
         self.btn_preview.set_enabled(False)
         self.btn_run.set_enabled(False)
-        self.app.set_status("正在撤销整理…", t.AMBER, "把文件放回原位")
-        self.app.log(f"撤销整理：{mp.name}", "info")
+        self.app.set_status(f"正在撤销{kind_label}…", t.AMBER, "把文件放回原位")
+        self.app.log(f"撤销{kind_label}：{mp.name}", "info")
 
         def work():
             try:
@@ -3520,7 +3542,7 @@ class OrganizePage(ToolPage):
         self.busy = False
         self.btn_preview.set_enabled(True)
         self.btn_run.set_enabled(False)
-        self.undo_btn.set_enabled(tools.last_manifest("organize") is not None)
+        self.undo_btn.set_enabled(tools.last_manifest_multi("organize", "finder") is not None)
         self.app.set_status("引擎就绪", t.GREEN)
         if failed < 0:
             self.app.toast("撤销失败，请查看日志", "err")
@@ -3530,10 +3552,10 @@ class OrganizePage(ToolPage):
                      "warn" if failed else "ok")
         self.app.toast(f"已撤销 {done} 个文件", "ok" if not failed else "warn")
         self.preview_meta.configure(text="已撤销")
-        self._placeholder_preview("已撤销上一次整理，文件已放回原位。")
+        self._placeholder_preview("已撤销上一次整理/移动，文件已放回原位。")
 
     def on_show(self):
-        self.undo_btn.set_enabled(tools.last_manifest("organize") is not None)
+        self.undo_btn.set_enabled(tools.last_manifest_multi("organize", "finder") is not None)
         if not self.path_var.get():
             self.path_var.set(self.settings.get("last_dir", ""))
 

@@ -190,6 +190,17 @@ def open_small(path, max_edge=1024):
         return im
 
 
+def probe_size(path):
+    """只读图片头，返回 (宽, 高)；读不到返回 None（不解码像素）。"""
+    if Image is None:
+        return None
+    try:
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        return None
+
+
 def fingerprint(path, max_edge=1024) -> PhotoFP | None:
     try:
         rgb = open_small(path, max_edge)

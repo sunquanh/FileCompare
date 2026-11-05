@@ -38,7 +38,8 @@ SCAN_STAGE_LABELS = {
 
 # ---------------------------------------------------------------- 收集
 def collect_files(options: ScanOptions, cancel=None, on_progress=None):
-    """递归收集文件，返回 (FileItem 列表, 跳过的硬链接数, 无法读取的文件数)。
+    """递归收集文件，返回 (FileItem 列表, 跳过的硬链接数, 无法读取的文件数,
+    0 字节文件数)。
 
     同一个物理文件（NTFS 硬链接、目录联接、重复挂载）只保留第一次出现的路径，
     否则会把「删除后并不释放空间」的硬链接当成重复文件。
@@ -56,6 +57,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
     seen_inodes: set[tuple] = set()
     skipped_inodes = 0
     skipped_unreadable = 0
+    skipped_empty = 0
     checked = 0
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True,
@@ -78,7 +80,10 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
                 skipped_unreadable += 1
                 continue
             checked += 1
-            if stat.st_size <= 0 or stat.st_size < options.min_size:
+            if stat.st_size <= 0:
+                skipped_empty += 1
+                continue
+            if stat.st_size < options.min_size:
                 continue
             if not path.is_file():
                 continue
@@ -101,7 +106,7 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
 
     if on_progress:
         on_progress(len(found), len(found), f"共发现 {len(found):,} 个文件")
-    return found, skipped_inodes, skipped_unreadable
+    return found, skipped_inodes, skipped_unreadable, skipped_empty
 
 
 _SKIP = {
