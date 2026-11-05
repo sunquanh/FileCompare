@@ -441,8 +441,29 @@ def apply_rename_plan(rows, on_progress=None, cancel=None, on_record=None):
 
 
 # ---------------------------------------------------------------- 操作记录
+def _cleanup_stale_temps():
+    """删掉一小时前被杀留下的 .tmp 临时记录。
+
+    save/rewrite 都用“临时文件 + os.replace”写记录，中途被杀会留一个
+    .tmp；它不进 *.json glob，不影响撤销，只是攒灰。只删一小时前的，
+    不碰正在写的临时文件。"""
+    try:
+        now = datetime.now()
+        for temp in MANIFEST_DIR.glob("*.tmp"):
+            try:
+                age = (now - datetime.fromtimestamp(
+                    temp.stat().st_mtime)).total_seconds()
+                if age > 3600:
+                    temp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def save_manifest(kind: str, root: Path, records) -> Path:
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_temps()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     path = MANIFEST_DIR / f"{kind}-{stamp}.json"
     data = {
@@ -469,6 +490,7 @@ def rewrite_manifest(path: Path, records) -> Path:
 
     原子写（临时文件 + os.replace）：改写中途被杀也不会留下截断的记录。"""
     try:
+        _cleanup_stale_temps()
         data = read_manifest(path)
         data["items"] = list(records)
         data["count"] = len(records)
@@ -519,7 +541,13 @@ def last_restorable_cleanup():
         data = read_manifest(path)
     except Exception:
         return None
-    if any(r.get("act") == "recycle" for r in data.get("items", [])):
+    if not isinstance(data, dict):
+        return None
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return None
+    if any(isinstance(r, dict) and r.get("act") == "recycle"
+           for r in items):
         return path
     return None
 

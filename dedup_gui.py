@@ -2195,7 +2195,11 @@ class ResultsPage(tk.Frame):
         except Exception:
             self.app.toast("清理记录损坏，无法还原", "err")
             return
-        paths = [r.get("src") for r in data.get("items", []) if r.get("src")]
+        if not isinstance(data, dict):
+            self.app.toast("清理记录损坏，无法还原", "err")
+            return
+        paths = [r.get("src") for r in data.get("items", [])
+                 if isinstance(r, dict) and r.get("src")]
         if not paths:
             self.app.toast("这次清理没有可还原的文件", "info")
             return

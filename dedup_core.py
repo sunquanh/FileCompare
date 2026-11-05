@@ -101,7 +101,7 @@ def is_filesystem_root(path) -> bool:
     text = str(path)
     if text.startswith(("\\\\", "//")):
         parts = [p for p in text[2:].replace("\\", "/").split("/") if p]
-        return len(parts) == 2
+        return len(parts) == 2 and parts[0] not in ("?", ".")
     if len(text) >= 2 and text[1] == ":":
         return text[2:] in ("", "\\", "/")
     return text in ("/", "\\")
@@ -368,11 +368,13 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             for chunk in cluster_audio(items):
                 if len(chunk) > 1 and fingerprint_available():
                     fps = []
+                    fp_throttle = ProgressThrottle(
+                        lambda d, t, m: emit("audio", d, t,
+                                           f"声学指纹 {d:,}/{t:,}"))
                     for i, it in enumerate(chunk):
                         check_cancel(cancel)
                         fps.append((it, chromaprint(it.path)))
-                        emit("audio", i + 1, len(chunk),
-                             f"声学指纹 {i + 1:,}/{len(chunk):,}")
+                        fp_throttle(i + 1, len(chunk))
                     usable = [(it, fp) for it, fp in fps if fp]
                     if len(usable) >= 2:
                         base = usable[0][1][0]
