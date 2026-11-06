@@ -15,6 +15,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252，打印中文会报 UnicodeEncodeError
+    # （v1.0 打包就是这么失败的）；改成 UTF-8，改不成也不报错。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     spec = ROOT / "dedup_gui.spec"
     if not spec.exists():
         print(f"找不到打包配置：{spec}")
