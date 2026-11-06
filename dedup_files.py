@@ -47,7 +47,8 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
     root = Path(options.root).resolve()
     skip = set(options.exclude)
     protect_roots = [norm_path(Path(x).expanduser()) .rstrip("\\/")
-                     for x in options.protect]
+                     for x in list(options.protect)
+                     + list(getattr(options, "reference_dirs", ()))]
 
     def is_protected(candidate: Path) -> bool:
         text = norm_path(candidate)
@@ -107,6 +108,37 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
     if on_progress:
         on_progress(len(found), len(found), f"共发现 {len(found):,} 个文件")
     return found, skipped_inodes, skipped_unreadable, skipped_empty
+
+
+def find_duplicate_dirs(files):
+    """找内容成组相同的目录：同一目录下直接文件的 (文件名, 大小) 集合完全一致。
+
+    返回 [[FileItem, ...], ...]，每个内层列表是一组重复目录（FileItem 的 path
+    指向目录本身，size 是目录内直接文件的总大小）。只按文件名+大小判断，
+    内容未校验，调用方应默认不勾选。"""
+    by_dir: dict[str, list[FileItem]] = {}
+    for f in files:
+        by_dir.setdefault(str(Path(f.path).parent), []).append(f)
+    sigs: dict[tuple, list[Path]] = {}
+    totals: dict[str, int] = {}
+    for directory, items in by_dir.items():
+        if len(items) < 2:
+            continue
+        sig = tuple(sorted((it.name, it.size) for it in items))
+        sigs.setdefault(sig, []).append(Path(directory))
+        totals[directory] = sum(it.size for it in items)
+    groups = []
+    for sig, dirs in sigs.items():
+        if len(dirs) < 2:
+            continue
+        items = sorted(
+            (FileItem(path=d, size=totals[str(d)],
+                      mtime=max((f.mtime for f in by_dir[str(d)]), default=0.0))
+             for d in dirs),
+            key=lambda x: str(x.path))
+        groups.append(items)
+    groups.sort(key=lambda g: -g[0].size)
+    return groups
 
 
 _SKIP = {
@@ -323,6 +355,40 @@ def hardlink_replace(keep_path, dup_paths):
     return kept, failed
 
 
+def restore_hardlinks(records):
+    """撤销硬链接替换：副本恢复成普通文件（内容与保留文件相同）。
+
+    records: [{"act": "hardlink", "src": 副本路径, "dst": 保留文件路径}]。
+    只有当副本仍是保留文件的硬链接时才恢复，否则跳过（不覆盖、不猜测）。
+    返回 (restored, failed)。
+    """
+    restored, failed = [], []
+    for record in records:
+        src, dst = Path(record["src"]), Path(record["dst"])
+        try:
+            if not src.exists() or not dst.exists():
+                failed.append(str(src))
+                continue
+            if not os.path.samefile(src, dst):
+                failed.append(str(src))
+                continue
+            temp = src.with_name(
+                src.name + f".deduprestore-{uuid.uuid4().hex[:8]}.tmp")
+            try:
+                shutil.copy2(str(dst), str(temp))
+                os.replace(temp, src)
+                restored.append(str(src))
+            finally:
+                if temp.exists():
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            failed.append(str(src))
+    return restored, failed
+
+
 # ---------------------------------------------------------------- 缩略图
 def make_thumbnail(path, box=(150, 100), radius=10):
     """生成圆角缩略图（PIL Image, RGBA）。失败返回 None。"""
@@ -389,4 +455,37 @@ def export_report(path, groups, root=None):
                     f"{group.similarity}%", "是" if index == group.keep else "",
                     "是" if item.protected else "", str(item.path),
                 ])
+    return path
+
+
+def export_report_json(path, groups, root=None):
+    """导出 JSON 报告（供脚本和 CLI 使用）。"""
+    import json
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "root": str(root) if root else "",
+        "groups": [
+            {
+                "kind": group.kind,
+                "similarity": group.similarity,
+                "note": group.note,
+                "keep": group.keep,
+                "wasted": group.wasted,
+                "items": [
+                    {"path": str(item.path), "name": item.name,
+                     "size": item.size, "mtime": item.mtime,
+                     "dims": item.dims,
+                     "duration": item.duration,
+                     "protected": bool(item.protected)}
+                    for item in group.items
+                ],
+            }
+            for group in groups
+        ],
+        "total_groups": len(groups),
+        "total_wasted": sum(g.wasted for g in groups),
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
     return path

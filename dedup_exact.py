@@ -145,10 +145,11 @@ def _stage_groups(items, func, tag, workers, cancel, on_progress, cache,
 
 
 def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None,
-               stats=None):
+               stats=None, quick=False):
     """返回 [[FileItem, ...], ...]，全部按字节确认一致。
 
     stats 不为 None 时，把读不到的文件路径记进 stats["unreadable"]。
+    quick=True 时跳过中段采样（首尾哈希后直接全量校验），供快速扫描用。
     """
     by_size: dict[int, list[FileItem]] = {}
     for f in files:
@@ -163,9 +164,9 @@ def find_exact(files, workers=4, cancel=None, on_progress=None, cache=None,
     if not remaining:
         return []
 
-    # 中段采样：只处理大文件
+    # 中段采样：只处理大文件；快速扫描跳过这一段，直接全量校验
     big = [f for g in remaining for f in g if f.size > SAMPLE_MIN]
-    if big:
+    if big and not quick:
         sampled = _stage_groups(big, _sample_hash, CACHE_TAGS["sample"],
                                 workers, cancel, on_progress, cache, "采样比对",
                                 stats=stats)

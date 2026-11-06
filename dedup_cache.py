@@ -115,6 +115,9 @@ class HashCache:
     def put(self, item, tag: str, value):
         if not self.enabled or self._conn is None:
             return
+        if tag in ("q3", "s3") and int(item.size) < (1 << 20):
+            # 小文件的首尾/采样哈希重算只要读几 KB，不值得占缓存写放大
+            return
         payload = json.dumps({"__size__": int(item.size),
                               "__mtime__": self._mtime_ns(item),
                               "v": value}, ensure_ascii=False)
@@ -167,3 +170,38 @@ class HashCache:
     def stats(self):
         return {"hits": self.hits, "misses": self.misses,
                 "size": self.path.stat().st_size if self.path.exists() else 0}
+
+
+def cache_files(path=None):
+    """缓存数据库及 WAL 附属文件。"""
+    base = Path(path) if path else (app_dir() / "dedup_cache.sqlite3")
+    return [base, Path(str(base) + "-wal"), Path(str(base) + "-shm")]
+
+
+def cache_info(path=None):
+    """返回 (缓存条目数, 占用字节数)，读不到时按 0 计。"""
+    base = Path(path) if path else (app_dir() / "dedup_cache.sqlite3")
+    count = 0
+    if base.exists():
+        try:
+            conn = sqlite3.connect(f"file:{base}?mode=ro", uri=True, timeout=5)
+            count = conn.execute("SELECT COUNT(*) FROM fp").fetchone()[0]
+            conn.close()
+        except Exception:
+            count = 0
+    size = sum(f.stat().st_size for f in cache_files(base)
+               if f.exists())
+    return count, size
+
+
+def clear_all(path=None):
+    """删除缓存数据库文件，返回释放的字节数。扫描进行中不要调用。"""
+    freed = 0
+    for f in cache_files(path):
+        try:
+            if f.exists():
+                freed += f.stat().st_size
+                f.unlink()
+        except OSError:
+            pass
+    return freed

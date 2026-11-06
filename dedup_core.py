@@ -37,11 +37,13 @@ from dedup_exact import (
 from dedup_files import (
     collect_files,
     export_report,
+    find_duplicate_dirs,
     hardlink_replace,
     make_thumbnail,
     permanent_delete,
     recycle_paths,
     restore_from_recycle,
+    restore_hardlinks,
 )
 from dedup_models import (
     AUDIO_EXT,
@@ -49,6 +51,7 @@ from dedup_models import (
     KEEP_RULE_LABELS,
     KEEP_RULES,
     KIND_AUDIO,
+    KIND_DIR,
     KIND_EXACT,
     KIND_NAME,
     KIND_ORDER,
@@ -95,6 +98,23 @@ from dedup_video import signature as video_signature
 _pick_keep = pick_keep
 
 
+# 相似类（照片/视频）低于该相似度时默认不勾选，需人工对比确认后再删
+SIMILARITY_AUTO_SELECT = 95
+
+
+SYSTEM_DIR_NAMES = {
+    "windows", "program files", "program files (x86)", "programdata",
+    "appdata", "system volume information", "$recycle.bin", "perflogs",
+    "recovery", "system32",
+}
+
+
+def is_system_area(path) -> bool:
+    """路径本身或其任一上级是 Windows 系统目录（扫描/清理有误删风险）。"""
+    parts = [p.lower() for p in Path(path).parts]
+    return any(p in SYSTEM_DIR_NAMES for p in parts)
+
+
 def is_filesystem_root(path) -> bool:
     """是不是盘符根目录（Windows 的 C 盘根目录）、UNC 根目录
     （服务器加共享名那一层）或根目录（POSIX 的 /）。"""
@@ -139,6 +159,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
 
     root = Path(options.root)
     keep_rule = getattr(options, "keep_rule", "best")
+    quick = bool(getattr(options, "quick_scan", False))
     emit("collect", 0, 0, "正在遍历文件夹…")
     say(f"开始扫描：{root}")
     files, skipped_inodes, skipped_unreadable, skipped_empty = collect_files(
@@ -168,6 +189,16 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     groups: list[DupGroup] = []
     consumed: set[str] = set()
     bad_photos = bad_videos = bad_audio = 0
+    # ---- 重复目录（只按文件名+大小，内容未校验，默认不勾选，不占 consumed）
+    dir_groups = find_duplicate_dirs(files)
+    for members in dir_groups:
+        group = DupGroup(KIND_DIR, members, 0,
+                         "目录内文件的文件名+大小完全一致，内容未校验（默认不勾选）",
+                         select_by_default=False)
+        group.keep = pick_keep(group.kind, members, keep_rule, root)
+        groups.append(group)
+    if dir_groups:
+        say(f"重复目录：{len(dir_groups)} 组")
     tiny_photos: list[str] = []
     notes: list[str] = []
 
@@ -178,7 +209,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         exact_groups = find_exact(
             files, options.workers, cancel=cancel,
             on_progress=lambda d, t, m: emit("exact", d, t, m), cache=cache,
-            stats=exact_stats)
+            stats=exact_stats, quick=quick)
         for members in exact_groups:
             items = sorted(members, key=lambda x: (-x.size, str(x.path)))
             group = DupGroup(KIND_EXACT, items, 100, "字节完全一致")
@@ -187,13 +218,16 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             consumed |= {str(i.path) for i in items}
         say(f"完全重复：{len(exact_groups)} 组")
         emit("exact", 1, 1, f"完成，发现 {len(exact_groups)} 组")
+        if quick:
+            notes.append("快速扫描：仅完全重复，已全量确认")
+            say("快速扫描：已跳过照片/视频/音乐/同名检测")
     else:
         say("已跳过完全重复检测")
         emit("exact", 1, 1, "已跳过")
 
     # ---- 相似照片
     todo_photos = [f for f in photos if str(f.path) not in consumed]
-    if options.photos and todo_photos:
+    if options.photos and todo_photos and not quick:
         emit("photo", 0, len(todo_photos), "正在计算照片指纹…")
         tag = CACHE_TAGS["photo"]
 
@@ -253,6 +287,9 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 group = DupGroup(
                     KIND_PHOTO, items, max(0, 100 - round(fine / 2.56)),
                     f"位差 {coarse}/64 · pHash {fine}/256")
+                if group.similarity < SIMILARITY_AUTO_SELECT:
+                    group.select_by_default = False
+                    group.note += "（相似度低于 95%，默认不勾选）"
                 group.keep = pick_keep(group.kind, items, keep_rule, root)
                 groups.append(group)
                 consumed |= {str(i.path) for i in items}
@@ -267,7 +304,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     # ---- 重复视频
     todo_videos = [f for f in videos if str(f.path) not in consumed]
     backend = video_backend()
-    if options.videos and todo_videos and backend:
+    if options.videos and todo_videos and backend and not quick:
         emit("video", 0, len(todo_videos), "正在读取视频关键帧…")
         tag = CACHE_TAGS["video"]
 
@@ -313,6 +350,9 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             fine = max((p[3] for p in sel), default=0.0)
             group = DupGroup(KIND_VIDEO, items, round(ratio * 100),
                              f"匹配 {ratio:.0%} 帧 · 位差 {fine:.0f}/256")
+            if group.similarity < SIMILARITY_AUTO_SELECT:
+                group.select_by_default = False
+                group.note += "（相似度低于 95%，默认不勾选）"
             group.keep = pick_keep(group.kind, items, keep_rule, root)
             groups.append(group)
             consumed |= {str(i.path) for i in items}
@@ -328,7 +368,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
 
     # ---- 重复音乐
     todo_audio = [f for f in audios if str(f.path) not in consumed]
-    if options.audio and todo_audio:
+    if options.audio and todo_audio and not quick:
         emit("audio", 0, len(todo_audio), "正在读取音乐标签…")
         tag = CACHE_TAGS["audio"]
 
@@ -409,7 +449,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         emit("audio", 1, 1, "已跳过")
 
     # ---- 同名相似（默认不勾选，只作提示）
-    if options.names:
+    if options.names and not quick:
         emit("name", 0, 1, "正在比对文件名…")
         todo_names = [f for f in files if str(f.path) not in consumed]
         name_groups, oversized, fuzzy_groups = find_name_groups(
@@ -461,6 +501,7 @@ __all__ = [
     "KEEP_RULES",
     "KEEP_RULE_LABELS",
     "KIND_AUDIO",
+    "KIND_DIR",
     "KIND_EXACT",
     "KIND_NAME",
     "KIND_ORDER",
@@ -487,6 +528,8 @@ __all__ = [
     "audio_fingerprint_available",
     "cv2",
     "export_report",
+    "export_report_json",
+    "find_duplicate_dirs",
     "find_exact",
     "format_date",
     "format_duration",
@@ -501,6 +544,7 @@ __all__ = [
     "permanent_delete",
     "recycle_paths",
     "restore_from_recycle",
+    "restore_hardlinks",
     "scan_folder",
     "video_available",
 ]

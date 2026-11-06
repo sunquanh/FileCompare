@@ -35,6 +35,7 @@ try:
         apply_palette,
         remap_tree,
         KIND_AUDIO,
+        KIND_DIR,
         KIND_EXACT,
         KIND_NAME,
         KIND_PHOTO,
@@ -75,7 +76,7 @@ except Exception as _exc:  # pragma: no cover
 
 APP_NAME = "Dedup"
 APP_CN = "重复文件清理器"
-VERSION = "2.5"
+VERSION = "2.6"
 SETTINGS_PATH = core.app_dir() / "dedup_settings.json"
 LEGACY_SETTINGS = Path(__file__).resolve().with_name("dedup_settings.json")
 
@@ -93,7 +94,10 @@ DEFAULTS = {
     "names": True,
     "names_fuzzy": False,
     "protect": "",
+    "reference": "",
+    "quick_scan": False,
     "cache": True,
+    "check_update": True,
     "keep_rule": "best",
     "sort_key": "wasted",
     "theme": "dark",
@@ -403,6 +407,40 @@ class ThumbnailService:
 
 
 # ---------------------------------------------------------------- 应用
+def parse_version(text):
+    """把 v2.6 / 2.6.1 这类版本号解析成数字元组，解析失败返回 None。"""
+    parts = (text or "").strip().lstrip("vV").split(".")
+    try:
+        nums = tuple(int(p) for p in parts if p != "")
+    except ValueError:
+        return None
+    return nums or None
+
+
+def is_newer_version(latest, current):
+    """latest 是否比 current 新（纯比较，不联网）。"""
+    a, b = parse_version(latest), parse_version(current)
+    return bool(a and b and a > b)
+
+
+def check_for_update(app):
+    """后台线程：查 GitHub 最新 Release，有新版只提示，不下载。"""
+    import json as _json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/sunquanh/FileCompare/releases/latest",
+            headers={"User-Agent": "FileCompare",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "")
+        if tag and is_newer_version(tag, VERSION):
+            app.post(("update_available", tag))
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self, initial_dir=None, start_page="scan"):
         super().__init__()
@@ -448,6 +486,9 @@ class App(tk.Tk):
 
         self.after(80, self._poll)
         self.after(120, lambda: enable_dark_titlebar(self, dark=(self.theme_name == "dark")))
+        if self.settings.get("check_update", True):
+            threading.Thread(target=lambda: check_for_update(self),
+                             daemon=True, name="update-check").start()
         self.bind("<Control-o>", lambda e: self.show_page("scan"))
         self.bind("<Control-Key-1>", lambda e: self.show_page("scan"))
         self.bind("<Control-Key-2>", lambda e: self.show_page("results"))
@@ -710,6 +751,12 @@ class App(tk.Tk):
             self.results_page.on_error(*event[1])
         elif kind == "deleted":
             self.results_page.on_deleted(*event[1])
+        elif kind == "hardlinked":
+            self.results_page.on_hardlinked(*event[1])
+        elif kind == "update_available":
+            self.log(f"发现新版本 {event[1]}，可到 GitHub Releases 下载", "info")
+            self.toast(f"发现新版本 {event[1]}，可到 GitHub Releases 下载",
+                       "info", 6000)
         elif kind == "org_plan":
             self.organize_page.on_plan(*event[1])
         elif kind == "org_done":
@@ -890,7 +937,7 @@ class ScanPage(tk.Frame):
         self.entry.bind("<Return>", lambda e: self.start_scan())
         tk.Label(text_box, text="可直接输入或粘贴路径，回车开始扫描",
                  bg=t.CARD, fg=t.FAINT, font=t.font(8), anchor="w").pack(
-            fill="x", pady=(s(2), 0))
+            fill="x", pady=0)
 
         CanvasButton(body, t, "选择文件夹", command=self.browse, kind="secondary",
                      icon="folder", height=38, size=9, padding=14, bg=t.CARD
@@ -898,7 +945,7 @@ class ScanPage(tk.Frame):
 
         # 选项区
         options = tk.Frame(page, bg=t.BG)
-        options.pack(fill="x", pady=(s(12), 0))
+        options.pack(fill="x", pady=(s(8), 0))
         options.grid_columnconfigure(0, weight=1, uniform="opt")
         options.grid_columnconfigure(1, weight=1, uniform="opt")
 
@@ -942,13 +989,13 @@ class ScanPage(tk.Frame):
             side="left", padx=(s(6), 0))
 
         # 右侧：扫描选项
-        opt_card = Card(options, t, padding=16)
+        opt_card = Card(options, t, padding=12)
         opt_card.grid(row=0, column=1, sticky="n", padx=(s(8), 0))
         o = opt_card.body
         self._section_title(o, "扫描选项", "settings", None)
 
         preset_row = tk.Frame(o, bg=t.CARD)
-        preset_row.pack(fill="x", pady=(s(8), 0))
+        preset_row.pack(fill="x", pady=(s(4), 0))
         tk.Label(preset_row, text="扫描方案", bg=t.CARD, fg=t.TEXT_DIM,
                  font=t.font(9), anchor="w").pack(side="left")
         self.btn_save_preset = CanvasButton(
@@ -961,7 +1008,7 @@ class ScanPage(tk.Frame):
         self.btn_load_preset.pack(side="right", padx=(0, s(6)))
 
         tk.Label(o, text="识别严格程度", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(8), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         self.seg_strict = Segmented(
             o, t, [("relaxed", "宽松"), ("standard", "标准"), ("strict", "严格")],
             value=self.settings.get("strictness", "standard"),
@@ -969,11 +1016,11 @@ class ScanPage(tk.Frame):
         self.seg_strict.pack(anchor="w")
         self.strict_hint = tk.Label(o, text="", bg=t.CARD, fg=t.MUTED,
                                     font=t.font(8), anchor="w")
-        self.strict_hint.pack(fill="x", pady=(s(4), 0))
+        self.strict_hint.pack(fill="x", pady=(s(2), 0))
         self._strict_changed(self.seg_strict.value)
 
         tk.Label(o, text="最小文件大小", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         self.seg_size = Segmented(
             o, t, [(0, "不限"), (1 << 20, "1 MB"), (10 << 20, "10 MB"),
                    (100 << 20, "100 MB")],
@@ -982,7 +1029,7 @@ class ScanPage(tk.Frame):
         self.seg_size.pack(anchor="w")
 
         tk.Label(o, text="排除目录", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         ex_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
                             highlightbackground=t.BORDER, highlightcolor=t.ACCENT)
         ex_field.pack(fill="x")
@@ -990,11 +1037,11 @@ class ScanPage(tk.Frame):
         ex_entry = tk.Entry(ex_field, textvariable=self.exclude_var, bg=t.INPUT,
                             fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
                             bd=0, highlightthickness=0, font=t.font(9))
-        ex_entry.pack(fill="x", padx=s(10), ipady=s(5))
+        ex_entry.pack(fill="x", padx=s(10), ipady=s(4))
         self._placeholder(ex_entry, self.exclude_var, "例如：缓存, 备份（逗号分隔）")
 
         tk.Label(o, text="保护文件夹（永不清理）", bg=t.CARD, fg=t.TEXT_DIM,
-                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(10), s(6)))
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         pr_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
                             highlightbackground=t.BORDER,
                             highlightcolor=t.ACCENT)
@@ -1003,15 +1050,29 @@ class ScanPage(tk.Frame):
         pr_entry = tk.Entry(pr_field, textvariable=self.protect_var, bg=t.INPUT,
                             fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
                             bd=0, highlightthickness=0, font=t.font(9))
-        pr_entry.pack(fill="x", padx=s(10), ipady=s(5))
+        pr_entry.pack(fill="x", padx=s(10), ipady=s(4))
         self._placeholder(pr_entry, self.protect_var,
                           "例如：D:\\照片原图（多个用逗号分隔）")
         tk.Label(o, text="保护文件夹里的文件会标记为「保护」，不会被勾选或删除",
                  bg=t.CARD, fg=t.FAINT, font=t.font(8), anchor="w").pack(
-            fill="x", pady=(s(4), 0))
+            fill="x", pady=(s(2), 0))
+
+        tk.Label(o, text="参考目录（只比对、不清理）", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
+        rf_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
+                            highlightbackground=t.BORDER,
+                            highlightcolor=t.ACCENT)
+        rf_field.pack(fill="x")
+        self.reference_var = tk.StringVar(value=self.settings.get("reference", ""))
+        rf_entry = tk.Entry(rf_field, textvariable=self.reference_var, bg=t.INPUT,
+                            fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
+                            bd=0, highlightthickness=0, font=t.font(9))
+        rf_entry.pack(fill="x", padx=s(10), ipady=s(4))
+        self._placeholder(rf_entry, self.reference_var,
+                          "例如：D:\\\\照片原图（多个用逗号分隔）")
 
         sub_row = tk.Frame(o, bg=t.CARD)
-        sub_row.pack(fill="x", pady=(s(10), 0))
+        sub_row.pack(fill="x", pady=(s(6), 0))
         sub_text = tk.Frame(sub_row, bg=t.CARD)
         sub_text.pack(side="left", fill="x", expand=True)
         tk.Label(sub_text, text="包含子文件夹", bg=t.CARD, fg=t.TEXT,
@@ -1024,7 +1085,7 @@ class ScanPage(tk.Frame):
         self.sw_recursive.pack(side="right", pady=(s(4), 0))
 
         cache_row = tk.Frame(o, bg=t.CARD)
-        cache_row.pack(fill="x", pady=(s(10), 0))
+        cache_row.pack(fill="x", pady=(s(6), 0))
         cache_text = tk.Frame(cache_row, bg=t.CARD)
         cache_text.pack(side="left", fill="x", expand=True)
         tk.Label(cache_text, text="指纹缓存", bg=t.CARD, fg=t.TEXT,
@@ -1036,6 +1097,24 @@ class ScanPage(tk.Frame):
                                value=bool(self.settings.get("cache", True)),
                                bg=t.CARD)
         self.sw_cache.pack(side="right", pady=(s(4), 0))
+        self.btn_clear_cache = CanvasButton(
+            cache_row, t, "清理缓存", command=self.clear_cache, kind="ghost",
+            height=30, size=8, padding=10, bg=t.CARD)
+        self.btn_clear_cache.pack(side="right", padx=(0, s(6)))
+
+        quick_row = tk.Frame(o, bg=t.CARD)
+        quick_row.pack(fill="x", pady=(s(6), 0))
+        quick_text = tk.Frame(quick_row, bg=t.CARD)
+        quick_text.pack(side="left", fill="x", expand=True)
+        tk.Label(quick_text, text="快速扫描", bg=t.CARD, fg=t.TEXT,
+                 font=t.font(9), anchor="w").pack(fill="x")
+        tk.Label(quick_text, text="只找完全重复，跳过照片/视频/音乐/同名",
+                 bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w").pack(
+            fill="x", pady=(s(2), 0))
+        self.sw_quick = Switch(quick_row, t,
+                               value=bool(self.settings.get("quick_scan", False)),
+                               bg=t.CARD)
+        self.sw_quick.pack(side="right", pady=(s(4), 0))
 
         # 底栏（固定在窗口底部，不随内容滚动）
         footer = tk.Frame(outer, bg=t.BG)
@@ -1151,6 +1230,25 @@ class ScanPage(tk.Frame):
         entry.bind("<FocusOut>", lambda e: sync(), add="+")
         sync()
 
+    def clear_cache(self):
+        t = self.theme
+        if self.app.scanning:
+            self.app.toast("扫描进行中，稍后再清理缓存", "warn")
+            return
+        from dedup_cache import cache_info, clear_all
+        count, size = cache_info()
+        if not count and not size:
+            self.app.toast("指纹缓存已经是空的", "info")
+            return
+        if confirm(self.app, t, "清理指纹缓存",
+                   f"缓存里有 {count:,} 条指纹，占用 {core.human_size(size)}。\n"
+                   "清理后下次扫描会重新计算指纹，变慢一些。",
+                   ok_text="清理", cancel_text="取消", icon="trash") != "ok":
+            return
+        freed = clear_all()
+        self.app.log(f"已清理指纹缓存，释放 {core.human_size(freed)}", "ok")
+        self.app.toast(f"已清理缓存，释放 {core.human_size(freed)}", "ok")
+
     def _strict_changed(self, value):
         hints = {
             "relaxed": "宽松：更容易找到相似文件，可能混入少量误判",
@@ -1167,6 +1265,8 @@ class ScanPage(tk.Frame):
             "min_size": int(self.seg_size.value),
             "exclude": self.exclude_var.get().strip(),
             "protect": self.protect_var.get().strip(),
+            "reference": self.reference_var.get().strip(),
+            "quick_scan": bool(self.sw_quick.value),
             "recursive": bool(self.sw_recursive.value),
             "cache": bool(self.sw_cache.value),
             "exact": bool(self.sw_exact.value),
@@ -1246,7 +1346,9 @@ class ScanPage(tk.Frame):
         self.seg_size.set_value(int(data.get("min_size", 0)))
         self.exclude_var.set(data.get("exclude", ""))
         self.protect_var.set(data.get("protect", ""))
+        self.reference_var.set(data.get("reference", ""))
         for attr, key in (("sw_recursive", "recursive"), ("sw_cache", "cache"),
+                          ("sw_quick", "quick_scan"),
                           ("sw_exact", "exact"), ("sw_photo", "photos"),
                           ("sw_video", "videos"), ("sw_audio", "audio"),
                           ("sw_name", "names"), ("sw_fuzzy", "names_fuzzy")):
@@ -1294,6 +1396,13 @@ class ScanPage(tk.Frame):
                        ok_text="继续扫描", cancel_text="取消",
                        icon="warning") != "ok":
                 return
+        if core.is_system_area(root):
+            if confirm(self.app, t, "扫描系统区域？",
+                       "这个目录在系统区域（Windows、Program Files 或 AppData）里，\n"
+                       "清理时误删系统文件可能导致系统出问题。确定要继续吗？",
+                       ok_text="继续扫描", cancel_text="取消",
+                       icon="warning") != "ok":
+                return
 
         preset = self.seg_strict.value
         preset_vals = core.PRESETS.get(preset, core.PRESETS["standard"])
@@ -1322,6 +1431,10 @@ class ScanPage(tk.Frame):
             min_size=int(self.seg_size.value),
             exclude=exclude,
             protect=protect,
+            reference_dirs=tuple(os.path.expandvars(os.path.expanduser(x))
+                                 for x in re.split(r"[,，;；\n]+",
+                                 self.reference_var.get().strip()) if x),
+            quick_scan=bool(self.sw_quick.value),
             recursive=bool(self.sw_recursive.value),
             keep_rule=self.settings.get("keep_rule", "best"),
         )
@@ -1338,6 +1451,8 @@ class ScanPage(tk.Frame):
             "min_size": int(self.seg_size.value),
             "exclude": self.exclude_var.get().strip(),
             "protect": self.protect_var.get().strip(),
+            "reference": self.reference_var.get().strip(),
+            "quick_scan": bool(self.sw_quick.value),
             "recursive": bool(self.sw_recursive.value),
             "exact": opts.exact,
             "photos": opts.photos,
@@ -1523,6 +1638,8 @@ class ResultsPage(tk.Frame):
         self.kind = "全部"
         self.query = ""
         self.cards = []
+        self._page = 0
+        self._page_size = 50
         self.sort_key = "wasted"
         self.keep_rule = "best"
         self._protected = {}
@@ -1676,6 +1793,21 @@ class ResultsPage(tk.Frame):
         self.btn_keep.pack(side="left", padx=(s(6), 0))
         self.search = SearchBox(bar, t, width=214, on_change=self._on_search)
         self.search.pack(side="right")
+        pager = tk.Frame(bar, bg=t.BG)
+        pager.pack(side="right", padx=(0, s(6)))
+        self.btn_prev_page = CanvasButton(pager, t, "‹",
+                                          command=lambda: self._change_page(-1),
+                                          kind="ghost", height=34, size=8,
+                                          padding=10, bg=t.BG)
+        self.btn_prev_page.pack(side="left")
+        self.page_label = tk.Label(pager, text="", bg=t.BG, fg=t.MUTED,
+                                   font=t.font(9))
+        self.page_label.pack(side="left", padx=(s(6), s(6)))
+        self.btn_next_page = CanvasButton(pager, t, "›",
+                                          command=lambda: self._change_page(1),
+                                          kind="ghost", height=34, size=8,
+                                          padding=10, bg=t.BG)
+        self.btn_next_page.pack(side="left")
 
         self.actionbar = tk.Frame(self.result_view, bg=t.BG_SOFT)
         self.actionbar.pack(side="bottom", fill="x")
@@ -1696,6 +1828,11 @@ class ResultsPage(tk.Frame):
                                        icon="trash", width=142, height=38,
                                        size=9, bg=t.BG_SOFT)
         self.btn_delete.pack(side="right")
+        self.btn_hardlink = CanvasButton(inner, t, "替换为硬链接",
+                                         command=self.ask_hardlink, kind="ghost",
+                                         icon="link", width=142, height=38,
+                                         size=9, bg=t.BG_SOFT)
+        self.btn_hardlink.pack(side="right", padx=(0, s(8)))
         self.btn_clear = CanvasButton(inner, t, "取消选择", command=self.clear_selection,
                                       kind="ghost", height=38, size=9,
                                       bg=t.BG_SOFT, padding=12)
@@ -1710,6 +1847,7 @@ class ResultsPage(tk.Frame):
                                            bg=t.BG_SOFT, padding=12)
         self.btn_undo_clean.pack(side="right", padx=(0, s(8)))
         self.btn_delete.set_enabled(False)
+        self.btn_hardlink.set_enabled(False)
         self.btn_clear.set_enabled(False)
         self.btn_undo_clean.set_enabled(False)
         self.hint_label = tk.Label(inner, text="移入回收站后可随时还原", bg=t.BG_SOFT,
@@ -2028,11 +2166,13 @@ class ResultsPage(tk.Frame):
 
     def _on_filter(self, value):
         self.kind = value
+        self._page = 0
         self._render_groups()
         self.scroll.scroll_to_top()
 
     def _on_search(self, value):
         self.query = value
+        self._page = 0
         self._render_groups()
         self.scroll.scroll_to_top()
 
@@ -2065,6 +2205,12 @@ class ResultsPage(tk.Frame):
         self.scroll.clear()
         self.cards = []
         groups = self._visible_groups()
+        total = len(groups)
+        pages = max(1, (total + self._page_size - 1) // self._page_size)
+        self._page = min(max(0, self._page), pages - 1)
+        groups = groups[self._page * self._page_size:
+                       (self._page + 1) * self._page_size]
+        self._update_pager(total, pages)
         if not groups:
             box = tk.Frame(self.scroll.inner, bg=t.BG)
             box.pack(pady=t.s(70))
@@ -2089,12 +2235,39 @@ class ResultsPage(tk.Frame):
         if end < len(groups):
             self.after(1, lambda: self._render_batch(groups, end, token))
 
+    def _change_page(self, delta):
+        total = len(self._visible_groups())
+        pages = max(1, (total + self._page_size - 1) // self._page_size)
+        new = min(max(0, self._page + delta), pages - 1)
+        if new == self._page:
+            return
+        self._page = new
+        self._render_groups()
+        self.scroll.scroll_to_top()
+
+    def _update_pager(self, total, pages):
+        if pages <= 1:
+            self.btn_prev_page.pack_forget()
+            self.page_label.pack_forget()
+            self.btn_next_page.pack_forget()
+            return
+        self.btn_prev_page.pack(side="left")
+        self.page_label.pack(side="left", padx=(self.theme.s(6), self.theme.s(6)))
+        self.btn_next_page.pack(side="left")
+        self.page_label.configure(text=f"第 {self._page + 1}/{pages} 页 · 共 {total} 组")
+        self.btn_prev_page.set_enabled(self._page > 0)
+        self.btn_next_page.set_enabled(self._page < pages - 1)
+
     # ------------------------------------------------------------ 选择
     def _selected_count_in(self, group):
         return sum(1 for item in group.items if str(item.path) in self.selection)
 
     def toggle_item(self, card, index):
         group = card.group
+        if group.kind == core.KIND_DIR:
+            # 重复目录只是提示：内容未校验，整目录删除风险大，禁止直接清理
+            self.app.toast("重复目录仅作提示，不能直接清理", "warn")
+            return
         item = group.items[index]
         key = str(item.path)
         if index == group.keep:
@@ -2154,6 +2327,7 @@ class ResultsPage(tk.Frame):
             self.sel_size.configure(text="")
             self.hint_label.pack_forget()
         self.btn_delete.set_enabled(n > 0 and not self.busy)
+        self.btn_hardlink.set_enabled(n > 0 and not self.busy)
         self.btn_clear.set_enabled(n > 0 and not self.busy)
 
     # ------------------------------------------------------------ 排序 / 保留策略
@@ -2264,15 +2438,25 @@ class ResultsPage(tk.Frame):
         if not isinstance(items, list):
             self.app.toast("清理记录损坏，无法还原", "err")
             return
-        paths = [r.get("src") for r in items
-                 if isinstance(r, dict) and r.get("src")]
-        if not paths:
+        recycle_paths = [r.get("src") for r in items
+                         if isinstance(r, dict) and r.get("act") == "recycle"
+                         and r.get("src")]
+        hardlink_records = [r for r in items
+                            if isinstance(r, dict) and r.get("act") == "hardlink"
+                            and r.get("src") and r.get("dst")]
+        if not recycle_paths and not hardlink_records:
             self.app.toast("这次清理没有可还原的文件", "info")
             return
         t = self.theme
-        if confirm(self.app, t, "撤销上次清理",
-                   f"把 {len(paths)} 个文件从回收站还原到原位置。\n"
-                   "如果原位置已有同名文件，会跳过而不是覆盖。",
+        parts = []
+        if recycle_paths:
+            parts.append(f"把 {len(recycle_paths)} 个文件从回收站还原到原位置")
+        if hardlink_records:
+            parts.append(f"把 {len(hardlink_records)} 个硬链接恢复成普通文件")
+        detail = "；".join(parts) + "。\n"
+        if recycle_paths:
+            detail += "如果原位置已有同名文件，会跳过而不是覆盖。"
+        if confirm(self.app, t, "撤销上次清理", detail,
                    ok_text="还原", cancel_text="取消",
                    icon="history") != "ok":
             return
@@ -2281,11 +2465,20 @@ class ResultsPage(tk.Frame):
         self.app.set_status("正在还原…", t.AMBER, "从回收站还原文件")
 
         def work():
+            restored, failed = [], []
             try:
-                restored, failed = core.restore_from_recycle(paths)
+                if recycle_paths:
+                    done, bad = core.restore_from_recycle(recycle_paths)
+                    restored.extend(done)
+                    failed.extend(bad)
+                if hardlink_records:
+                    done, bad = core.restore_hardlinks(hardlink_records)
+                    restored.extend(done)
+                    failed.extend(bad)
             except Exception as exc:
                 self.app.post(("log", f"还原失败：{exc}", "err"))
-                restored, failed = [], paths
+                all_paths = recycle_paths + [r["src"] for r in hardlink_records]
+                failed = [p for p in all_paths if p not in restored]
             self.app.post(("cleanup_restored", (restored, failed)))
 
         threading.Thread(target=work, daemon=True, name="cleanup-undo").start()
@@ -2315,11 +2508,16 @@ class ResultsPage(tk.Frame):
         initial = f"重复文件报告_{datetime.now():%Y%m%d_%H%M}.csv"
         path = filedialog.asksaveasfilename(
             parent=self.app, title="导出检测报告", initialfile=initial,
-            defaultextension=".csv", filetypes=[("CSV 表格", "*.csv")])
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON 报告", "*.json")])
         if not path:
             return
         try:
-            core.export_report(path, self.result.groups, self.result.root)
+            if str(path).lower().endswith(".json"):
+                core.export_report_json(path, self.result.groups,
+                                        self.result.root)
+            else:
+                core.export_report(path, self.result.groups, self.result.root)
             self.app.toast("报告已导出", "ok")
             self.app.log(f"报告已导出：{path}", "ok")
         except Exception as exc:
@@ -2355,19 +2553,23 @@ class ResultsPage(tk.Frame):
                 self._delete(paths, recycle=False)
 
     def _delete(self, paths, recycle):
-        # 最后一道闸：保护目录里的文件、以及各组当前保留的文件都不进入清理表
+        # 最后一道闸：保护目录里的文件、各组当前保留的文件、以及重复目录
+        # 本身都不进入清理表（目录组内容未校验，整目录删除风险大）
         keep = {str(grp.items[grp.keep].path)
                 for grp in (self.result.groups if self.result else [])
                 if 0 <= grp.keep < len(grp.items)}
-        blocked = [p for p in paths if self._protected.get(p) or p in keep]
+        dir_paths = {str(i.path) for grp in (self.result.groups if self.result else [])
+                     if grp.kind == core.KIND_DIR for i in grp.items}
+        blocked = [p for p in paths if self._protected.get(p) or p in keep
+                   or p in dir_paths]
         paths = [p for p in paths if p not in keep and
-                 not self._protected.get(p)]
+                 not self._protected.get(p) and p not in dir_paths]
         if not paths:
-            self.app.toast("所选文件都在保护文件夹内或属于保留项，已取消",
+            self.app.toast("所选文件都在保护文件夹内、属于保留项或是重复目录，已取消",
                            "warn")
             return
         if blocked:
-            self.app.log(f"已跳过 {len(blocked)} 个保护/保留文件", "warn")
+            self.app.log(f"已跳过 {len(blocked)} 个保护/保留/目录项", "warn")
         # 先按计划写一份记录：删一半被杀也能撤销已进回收站的部分
         try:
             planned = [{"act": "recycle" if recycle else "delete",
@@ -2428,35 +2630,8 @@ class ResultsPage(tk.Frame):
         self.app.log(f"清理完成：成功 {len(deleted)} 个，失败 {len(failed)} 个",
                      "ok" if not failed else "warn")
         if deleted:
-            remain = []
-            for group in self.result.groups:
-                keep_path = (str(group.items[group.keep].path)
-                             if 0 <= group.keep < len(group.items) else None)
-                group.items = [i for i in group.items if str(i.path) not in deleted_set]
-                if len(group.items) < 2:
-                    continue
-                idx = next((i for i, it in enumerate(group.items)
-                            if str(it.path) == keep_path), None)
-                group.keep = idx if idx is not None else core._pick_keep(group.kind,
-                                                                         group.items)
-                remain.append(group)
-            self.result.groups = remain
-            self.selection -= deleted_set
-            for group in remain:
-                if 0 <= group.keep < len(group.items):
-                    self.selection.discard(str(group.items[group.keep].path))
-            for item in list(self._size_map):
-                if item in deleted_set:
-                    self._size_map.pop(item, None)
-            self.app.set_result_count(len(remain))
-            self._rebuild_filters()
-            self._update_summary()
-            self._render_groups()
-            self._update_footer()
+            remain = self._prune_removed(deleted_set)
             if not remain:
-                self._show_state("empty")
-                self._show_clean(self.result)
-                self.subtitle.configure(text=f"{short_root(self.result.root)}    ·    已清理完毕")
                 self.app.toast(f"已清理 {len(deleted)} 个文件", "ok")
                 return
             self.app.toast(f"已清理 {len(deleted)} 个文件，释放 "
@@ -2469,6 +2644,165 @@ class ResultsPage(tk.Frame):
             more = f"\n… 还有 {len(failed) - 8} 个" if len(failed) > 8 else ""
             alert(self.app, self.theme, f"{len(failed)} 个文件未能处理",
                   f"可能是权限、只读或文件被占用。\n\n{names}{more}",
+                  icon="warning")
+
+    def _prune_removed(self, removed_set):
+        """从结果里去掉已处理的文件（删除/硬链接共用）。返回是否还有剩余组。"""
+        remain = []
+        for group in self.result.groups:
+            keep_path = (str(group.items[group.keep].path)
+                         if 0 <= group.keep < len(group.items) else None)
+            group.items = [i for i in group.items if str(i.path) not in removed_set]
+            if len(group.items) < 2:
+                continue
+            idx = next((i for i, it in enumerate(group.items)
+                        if str(it.path) == keep_path), None)
+            group.keep = idx if idx is not None else core._pick_keep(group.kind,
+                                                                     group.items)
+            remain.append(group)
+        self.result.groups = remain
+        self.selection -= removed_set
+        for group in remain:
+            if 0 <= group.keep < len(group.items):
+                self.selection.discard(str(group.items[group.keep].path))
+        for item in list(self._size_map):
+            if item in removed_set:
+                self._size_map.pop(item, None)
+        self.app.set_result_count(len(remain))
+        self._rebuild_filters()
+        self._update_summary()
+        self._render_groups()
+        self._update_footer()
+        if not remain:
+            self._show_state("empty")
+            self._show_clean(self.result)
+            self.subtitle.configure(text=f"{short_root(self.result.root)}    ·    已清理完毕")
+        return bool(remain)
+
+    # ------------------------------------------------------------ 硬链接
+    def ask_hardlink(self):
+        if self.busy:
+            return
+        paths = [p for p in self.selection if p in self._size_map]
+        if not paths:
+            self.app.toast("还没有选择要处理的文件", "warn")
+            return
+        size = sum(self._size_map[p] for p in paths)
+        t = self.theme
+        choice = confirm(
+            self.app, t, "把副本替换为硬链接？",
+            f"即将处理 {len(paths)} 个文件，共 {core.human_size(size)}。\n"
+            f"副本会被删掉，并在原位置建一个指向保留文件的硬链接：\n"
+            f"文件看起来还在，磁盘只占一份。跨盘的副本会跳过。",
+            ok_text="替换为硬链接", cancel_text="取消", icon="link",
+            note="硬链接可以随时撤销：恢复成普通文件，内容不变。")
+        if choice == "ok":
+            self._hardlink(paths)
+
+    def _hardlink(self, paths):
+        # 最后一道闸：保护目录里的文件、以及各组当前保留的文件都不进入处理表
+        keep = {str(grp.items[grp.keep].path)
+                for grp in (self.result.groups if self.result else [])
+                if 0 <= grp.keep < len(grp.items)}
+        blocked = [p for p in paths if self._protected.get(p) or p in keep]
+        paths = [p for p in paths if p not in keep and
+                 not self._protected.get(p)]
+        # 重复目录的成员是目录本身，不能做硬链接
+        dir_paths = {str(i.path) for grp in (self.result.groups if self.result else [])
+                     if grp.kind == core.KIND_DIR for i in grp.items}
+        paths = [p for p in paths if p not in dir_paths]
+        if not paths:
+            self.app.toast("所选文件都在保护文件夹内、属于保留项或是目录，已取消",
+                           "warn")
+            return
+        if blocked:
+            self.app.log(f"已跳过 {len(blocked)} 个保护/保留文件", "warn")
+        keep_of = {}
+        for grp in (self.result.groups if self.result else []):
+            if grp.kind == core.KIND_DIR:
+                continue
+            if 0 <= grp.keep < len(grp.items):
+                kp = str(grp.items[grp.keep].path)
+                for item in grp.items:
+                    keep_of[str(item.path)] = kp
+        planned = [{"act": "hardlink", "src": p,
+                    "dst": keep_of.get(p, ""), "size": self._size_map.get(p, 0)}
+                   for p in paths if keep_of.get(p)]
+        if not planned:
+            self.app.toast("所选文件没有对应的保留文件，已取消", "warn")
+            return
+        # 先按计划写一份记录：处理一半被杀也能撤销已替换的部分
+        try:
+            self._cleanup_partial = tools.save_manifest(
+                "cleanup", self.result.root if self.result else Path("."),
+                planned)
+        except Exception:
+            self._cleanup_partial = None
+        t = self.theme
+        self.busy = True
+        self.btn_hardlink.set_text("正在处理…")
+        self.btn_hardlink.set_enabled(False)
+        self.btn_delete.set_enabled(False)
+        self.btn_clear.set_enabled(False)
+        self.app.set_status("正在替换硬链接…", t.AMBER, "副本替换为硬链接")
+        self.app.log(f"替换为硬链接：{len(planned)} 个文件，{core.human_size(sum(self._size_map.get(p, 0) for p in paths))}",
+                     "warn")
+
+        def work():
+            linked, failed = [], []
+            by_keep = {}
+            for record in planned:
+                by_keep.setdefault(record["dst"], []).append(record["src"])
+            try:
+                for keep_path, dups in by_keep.items():
+                    ok, bad = core.hardlink_replace(keep_path, dups)
+                    linked.extend(ok)
+                    failed.extend(bad)
+                done_records = [r for r in planned if r["src"] in set(linked)]
+                self.app.post(("hardlinked", (linked, failed, done_records)))
+            except Exception as exc:
+                self.app.post(("hardlinked", ([], [r["src"] for r in planned], [])))
+                self.app.post(("log", f"硬链接替换失败：{exc}", "err"))
+
+        threading.Thread(target=work, daemon=True, name="hardlink").start()
+
+    def on_hardlinked(self, linked, failed, records):
+        t = self.theme
+        self.busy = False
+        self.btn_hardlink.set_text("替换为硬链接")
+        self.app.set_status("引擎就绪", t.GREEN)
+        linked_set = set(linked)
+        freed = sum(self._size_map.get(p, 0) for p in linked_set)
+        if linked:
+            try:
+                if getattr(self, "_cleanup_partial", None) is not None:
+                    tools.rewrite_manifest(self._cleanup_partial, records)
+                    self._last_cleanup = self._cleanup_partial
+                else:
+                    self._last_cleanup = tools.save_manifest(
+                        "cleanup", self.result.root if self.result else Path("."),
+                        records)
+                self.btn_undo_clean.set_enabled(True)
+            except Exception:
+                pass
+        self._cleanup_partial = None
+        self.app.log(f"硬链接替换完成：成功 {len(linked)} 个，失败 {len(failed)} 个",
+                     "ok" if not failed else "warn")
+        if linked:
+            remain = self._prune_removed(linked_set)
+            if not remain:
+                self.app.toast(f"已替换 {len(linked)} 个文件为硬链接", "ok")
+                return
+            self.app.toast(f"已替换 {len(linked)} 个文件为硬链接，释放 "
+                           f"{core.human_size(freed)}", "ok")
+        else:
+            self._update_footer()
+
+        if failed:
+            names = "\n".join(Path(p).name for p in failed[:8])
+            more = f"\n… 还有 {len(failed) - 8} 个" if len(failed) > 8 else ""
+            alert(self.app, self.theme, f"{len(failed)} 个文件未能处理",
+                  f"可能是跨盘、权限或文件被占用。\n\n{names}{more}",
                   icon="warning")
 
 
@@ -2568,6 +2902,7 @@ class CompareDialog(tk.Toplevel):
         same = (left.size == right.size)
         self.meta.configure(
             text=f"{core.human_size(left.size)} vs {core.human_size(right.size)}"
+                 + f" · 相似度 {self.group.similarity}%"
                  + (" · 大小相同" if same else "")
                  + " · 滚轮缩放，拖动平移，左右键切换版本")
         self.zoom = 0.0
@@ -2833,7 +3168,8 @@ class GroupCard(tk.Canvas):
         kind_color = t.kind_color(g.kind)
         dim = t.kind_dim(g.kind)
         icons = {KIND_EXACT: "document", KIND_PHOTO: "image",
-                 KIND_VIDEO: "video", KIND_AUDIO: "audio", KIND_NAME: "copy"}
+                 KIND_VIDEO: "video", KIND_AUDIO: "audio", KIND_NAME: "copy",
+                 KIND_DIR: "folder"}
         f = t.font(8, "bold")
         bw = f.measure(g.kind) + s(28)
         by = pad

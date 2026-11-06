@@ -123,7 +123,9 @@ KIND_PHOTO = "相似照片"
 KIND_VIDEO = "重复视频"
 KIND_AUDIO = "重复音乐"
 KIND_NAME = "同名相似"
-KIND_ORDER = (KIND_EXACT, KIND_PHOTO, KIND_VIDEO, KIND_AUDIO, KIND_NAME)
+KIND_DIR = "重复目录"
+KIND_ORDER = (KIND_EXACT, KIND_PHOTO, KIND_VIDEO, KIND_AUDIO, KIND_NAME,
+              KIND_DIR)
 
 # 保留策略
 KEEP_RULES = ("best", "oldest", "newest", "largest", "shortest", "folder")
@@ -304,6 +306,8 @@ class ScanOptions:
     min_size: int = 0
     exclude: tuple = ()
     protect: tuple = ()
+    reference_dirs: tuple = ()
+    quick_scan: bool = False
     recursive: bool = True
     workers: int = 0
     keep_rule: str = "best"
@@ -315,6 +319,8 @@ class ScanOptions:
             self.workers = min(8, os.cpu_count() or 4)
         self.exclude = tuple(x for x in (self.exclude or ()) if x)
         self.protect = tuple(x for x in (self.protect or ()) if x)
+        self.reference_dirs = tuple(x for x in (self.reference_dirs or ())
+                                    if x)
         if self.keep_rule not in KEEP_RULES:
             self.keep_rule = "best"
         if not self.max_image_edge:

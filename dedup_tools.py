@@ -531,7 +531,7 @@ def last_manifest_multi(*kinds: str):
 
 
 def last_restorable_cleanup():
-    """最新一份清理记录里有可还原（移入回收站）的文件时返回它，否则 None。
+    """最新一份清理记录里有可还原（移入回收站/硬链接）的文件时返回它，否则 None。
 
     永久删除的记录不可还原，撤销按钮不应为它启用。"""
     path = last_manifest("cleanup")
@@ -546,7 +546,7 @@ def last_restorable_cleanup():
     items = data.get("items", [])
     if not isinstance(items, list):
         return None
-    if any(isinstance(r, dict) and r.get("act") == "recycle"
+    if any(isinstance(r, dict) and r.get("act") in ("recycle", "hardlink")
            for r in items):
         return path
     return None
@@ -611,6 +611,77 @@ def undo_manifest(path: Path, on_progress=None, cancel=None):
     if data.get("kind") == "organize":
         _remove_empty_dir_chains(touched, [root] if root else [])
     return done, failed, skipped
+
+
+def undo_cleanup_manifest(path):
+    """撤销一次清理记录：回收站还原 + 硬链接恢复。返回 (done, failed, skipped)。"""
+    from dedup_files import restore_from_recycle, restore_hardlinks
+    data = read_manifest(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"操作记录损坏：{path.name} 不是对象")
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError(f"操作记录损坏：{path.name} 的 items 不是列表")
+    recycle = [r.get("src") for r in items
+               if isinstance(r, dict) and r.get("act") == "recycle" and r.get("src")]
+    hardlinks = [r for r in items
+                 if isinstance(r, dict) and r.get("act") == "hardlink"
+                 and r.get("src") and r.get("dst")]
+    done = failed = 0
+    if recycle:
+        restored, missing = restore_from_recycle(recycle)
+        done += len(restored)
+        failed += len(missing)
+    if hardlinks:
+        restored, missing = restore_hardlinks(hardlinks)
+        done += len(restored)
+        failed += len(missing)
+    skipped = len(items) - len(recycle) - len(hardlinks)
+    return done, failed, skipped
+
+
+def scan_result_to_dict(result):
+    """ScanResult 转 JSON 友好结构（CLI 与脚本共用）。"""
+    return {
+        "root": str(result.root),
+        "file_count": result.file_count,
+        "total_size": result.total_size,
+        "elapsed": round(result.elapsed, 1),
+        "total_groups": result.total_groups,
+        "total_wasted": result.total_wasted,
+        "groups": [
+            {"kind": group.kind, "similarity": group.similarity,
+             "note": group.note, "keep": group.keep,
+             "items": [{"path": str(item.path), "size": item.size}
+                       for item in group.items]}
+            for group in result.groups
+        ],
+    }
+
+
+def _cli_scan(args):
+    import dedup_core as core
+    root = Path(args.dir)
+    if not root.is_dir():
+        print(f"目录不存在：{root}")
+        return 1
+    if args.dry_run:
+        print("dry-run：只扫描，不修改任何文件")
+    opts = core.ScanOptions.from_preset(root, quick_scan=args.quick_scan)
+    result = core.scan_folder(opts)
+    print(f"扫描完成：{result.file_count:,} 个文件，{result.total_groups} 组，"
+          f"可释放 {human_size(result.total_wasted)}，耗时 {result.elapsed:.1f} 秒")
+    for kind in core.KIND_ORDER:
+        count = result.counts()[kind]
+        if count["groups"]:
+            print("  " + kind + "：" + str(count["groups"]) + " 组，" + str(count["files"]) + " 个文件")
+    if args.json:
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(scan_result_to_dict(result),
+                                  ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        print(f"报告已写入：{out}")
 
 
 # ---------------------------------------------------------------- 命令行
@@ -691,7 +762,10 @@ def _cli_undo(args):
     if not args.yes and input("确认? (y/回车=取消) ").strip().lower() != "y":
         print("已取消")
         return 1
-    done, failed, skipped = undo_manifest(path)
+    if data.get("kind") == "cleanup":
+        done, failed, skipped = undo_cleanup_manifest(path)
+    else:
+        done, failed, skipped = undo_manifest(path)
     print(f"撤销完成: {done} 个, 跳过 {skipped} 个, 失败 {failed} 个")
 
 
@@ -723,8 +797,17 @@ def main():
     rename.add_argument("--yes", action="store_true")
     rename.set_defaults(func=_cli_rename)
 
+    scan = sub.add_parser("scan", help="扫描重复文件（只读，不修改任何文件）")
+    scan.add_argument("dir")
+    scan.add_argument("--json", default="", help="把分组结果写成 JSON 报告")
+    scan.add_argument("--quick-scan", action="store_true",
+                      help="快速扫描：只找完全重复")
+    scan.add_argument("--dry-run", action="store_true",
+                      help="试运行：只扫描，不修改任何文件（扫描本身就是只读的）")
+    scan.set_defaults(func=_cli_scan)
+
     undo = sub.add_parser("undo", help="撤销最近一次操作")
-    undo.add_argument("--kind", choices=["organize", "rename", "finder"],
+    undo.add_argument("--kind", choices=["organize", "rename", "finder", "cleanup"],
                       default=None)
     undo.add_argument("--yes", action="store_true")
     undo.set_defaults(func=_cli_undo)

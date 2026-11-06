@@ -250,12 +250,14 @@ class Theme:
     def kind_color(self, kind):
         return {KIND_EXACT: self.ACCENT, KIND_PHOTO: self.AMBER,
                 KIND_VIDEO: self.VIOLET, KIND_AUDIO: self.KIND_AUDIO,
-                KIND_NAME: self.KIND_NAME}.get(kind, self.TEXT_DIM)
+                KIND_NAME: self.KIND_NAME,
+                KIND_DIR: self.GREEN}.get(kind, self.TEXT_DIM)
 
     def kind_dim(self, kind):
         return {KIND_EXACT: self.KIND_EXACT_DIM, KIND_PHOTO: self.KIND_PHOTO_DIM,
                 KIND_VIDEO: self.KIND_VIDEO_DIM, KIND_AUDIO: self.KIND_AUDIO_DIM,
-                KIND_NAME: self.KIND_NAME_DIM}.get(kind, self.KIND_OTHER_DIM)
+                KIND_NAME: self.KIND_NAME_DIM,
+                KIND_DIR: self.KIND_OTHER_DIM}.get(kind, self.KIND_OTHER_DIM)
 
 
 for _key, _value in DARK.items():
@@ -267,6 +269,7 @@ KIND_PHOTO = "相似照片"
 KIND_VIDEO = "重复视频"
 KIND_AUDIO = "重复音乐"
 KIND_NAME = "同名相似"
+KIND_DIR = "重复目录"
 
 ICON = {
     "folder": "\uE8B7",
@@ -611,6 +614,8 @@ class CanvasButton(tk.Canvas):
         self.enabled = True
         self._hover = False
         self._pressed = False
+        self._press_cancelled = False
+        self._key_after_id = None
         self._bg = bg or theme.BG
         natural = self.font.measure(text) + self.padding * 2
         if icon:
@@ -674,13 +679,14 @@ class CanvasButton(tk.Canvas):
         self._draw()
 
     def _on_key_activate(self, _=None):
-        if self.enabled and self.command:
+        if self.enabled and self.command and self._key_after_id is None:
             self._pressed = True
             self._draw()
-            self.after(80, self._key_run)
+            self._key_after_id = self.after(80, self._key_run)
         return "break"
 
     def _key_run(self):
+        self._key_after_id = None
         try:
             self._pressed = False
             self._draw()
@@ -688,6 +694,15 @@ class CanvasButton(tk.Canvas):
             return
         if self.enabled and self.command:
             self.command()
+
+    def _cancel_key_run(self):
+        """取消待执行的键盘激活（鼠标点按/禁用时调用，防 80ms 内双执行）。"""
+        if self._key_after_id is not None:
+            try:
+                self.after_cancel(self._key_after_id)
+            except tk.TclError:
+                pass
+            self._key_after_id = None
 
     def _on_enter(self, _=None):
         if self.enabled:
@@ -697,25 +712,32 @@ class CanvasButton(tk.Canvas):
     def _on_leave(self, _=None):
         self._hover = False
         if self._pressed:
-            # 松开发生在按钮外时收不到 ButtonRelease，离开即复位，防卡在按下态
+            # 松开发生在按钮外时收不到 ButtonRelease，离开即复位；
+            # 同时记一笔“取消”，拖回再松开也不执行，言行一致
             self._pressed = False
+            self._press_cancelled = True
         self._draw()
 
     def _on_press(self, _=None):
         if self.enabled and self.command:
+            self._cancel_key_run()
             self._pressed = True
+            self._press_cancelled = False
             self.configure(cursor="arrow")
             self._draw()
 
     def _on_release(self, event=None):
         if not self.enabled:
             return
+        self._cancel_key_run()
         self._pressed = False
         self._draw()
         self.configure(cursor="hand2")
+        cancelled = self._press_cancelled
+        self._press_cancelled = False
         inside = (0 <= event.x <= self._btn_w and 0 <= event.y <= self._btn_h) \
             if event else True
-        if inside and self.command:
+        if inside and not cancelled and self.command:
             self.command()
 
     def restyle(self):
@@ -730,6 +752,7 @@ class CanvasButton(tk.Canvas):
     def set_enabled(self, enabled: bool):
         self.enabled = bool(enabled)
         self._pressed = False
+        self._cancel_key_run()
         self.configure(cursor="hand2" if enabled else "arrow",
                        takefocus=1 if enabled else 0)
         self._draw()
