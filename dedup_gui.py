@@ -1853,6 +1853,11 @@ class ResultsPage(tk.Frame):
                                       kind="ghost", height=38, size=9,
                                       bg=t.BG_SOFT, padding=12)
         self.btn_clear.pack(side="right", padx=(0, s(8)))
+        self.btn_pick_all = CanvasButton(inner, t, "全选除保留项",
+                                         command=self.pick_all_but_keep,
+                                         kind="ghost", icon="check", height=38,
+                                         size=9, bg=t.BG_SOFT, padding=12)
+        self.btn_pick_all.pack(side="right", padx=(0, s(8)))
         self.btn_pick = CanvasButton(inner, t, "快捷选择", command=self._pick_menu,
                                      kind="ghost", icon="layers", height=38,
                                      size=9, bg=t.BG_SOFT, padding=12)
