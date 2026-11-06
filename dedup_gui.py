@@ -565,6 +565,17 @@ class App(tk.Tk):
                  fg=t.FAINT, font=t.font(8), anchor="w").pack(
             side="bottom", fill="x", padx=t.s(24), pady=(0, t.s(14)))
 
+        # 启动时检查新版本（侧栏底部，版本行上方；下次启动生效）
+        upd_row = tk.Frame(self.sidebar, bg=t.SIDEBAR)
+        upd_row.pack(side="bottom", fill="x", padx=t.s(24), pady=(0, t.s(8)))
+        tk.Label(upd_row, text="启动时检查新版本", bg=t.SIDEBAR, fg=t.MUTED,
+                 font=t.font(8), anchor="w").pack(side="left")
+        self.sw_check_update = Switch(upd_row, t,
+                                      value=bool(self.settings.get("check_update", True)),
+                                      bg=t.SIDEBAR,
+                                      command=self._on_check_update_toggle)
+        self.sw_check_update.pack(side="right")
+
         self.status_canvas = tk.Canvas(self.sidebar, width=t.s(204),
                                        height=t.s(66), bg=t.SIDEBAR,
                                        highlightthickness=0, bd=0)
@@ -584,6 +595,11 @@ class App(tk.Tk):
         # 主区域
         self.main = tk.Frame(self, bg=t.BG)
         self.main.pack(side="left", fill="both", expand=True)
+
+    def _on_check_update_toggle(self, value):
+        # 下次启动生效：关掉后不再后台查新版
+        self.settings["check_update"] = bool(value)
+        save_settings(self.settings)
 
     def _nav_header(self, text):
         t = self.theme
@@ -2389,6 +2405,9 @@ class ResultsPage(tk.Frame):
     def _select_visible(self, predicate):
         self.selection.clear()
         for group in self._visible_groups():
+            if group.kind == core.KIND_DIR:
+                # 重复目录只是提示，不能进勾选（删除闸是最后一道防线）
+                continue
             if not predicate(group):
                 continue
             for index, item in enumerate(group.items):
@@ -2761,7 +2780,12 @@ class ResultsPage(tk.Frame):
                 done_records = [r for r in planned if r["src"] in set(linked)]
                 self.app.post(("hardlinked", (linked, failed, done_records)))
             except Exception as exc:
-                self.app.post(("hardlinked", ([], [r["src"] for r in planned], [])))
+                # 保留已成功的部分：撤销记录只写已替换的，剩下的算失败
+                done = [r for r in planned if r["src"] in set(linked)]
+                rest = [r["src"] for r in planned
+                        if r["src"] not in set(linked)
+                        and r["src"] not in set(failed)]
+                self.app.post(("hardlinked", (linked, failed + rest, done)))
                 self.app.post(("log", f"硬链接替换失败：{exc}", "err"))
 
         threading.Thread(target=work, daemon=True, name="hardlink").start()

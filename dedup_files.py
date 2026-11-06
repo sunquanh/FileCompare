@@ -115,15 +115,14 @@ def find_duplicate_dirs(files):
 
     返回 [[FileItem, ...], ...]，每个内层列表是一组重复目录（FileItem 的 path
     指向目录本身，size 是目录内直接文件的总大小）。只按文件名+大小判断，
-    内容未校验，调用方应默认不勾选。"""
+    内容未校验，调用方应默认不勾选。单个文件的目录也可成组（签名只有一个
+    (文件名, 大小)，同样默认不勾选、不直接清理）。"""
     by_dir: dict[str, list[FileItem]] = {}
     for f in files:
         by_dir.setdefault(str(Path(f.path).parent), []).append(f)
     sigs: dict[tuple, list[Path]] = {}
     totals: dict[str, int] = {}
     for directory, items in by_dir.items():
-        if len(items) < 2:
-            continue
         sig = tuple(sorted((it.name, it.size) for it in items))
         sigs.setdefault(sig, []).append(Path(directory))
         totals[directory] = sum(it.size for it in items)

@@ -102,17 +102,36 @@ _pick_keep = pick_keep
 SIMILARITY_AUTO_SELECT = 95
 
 
+# 只在盘符根 / UNC 根 / POSIX 根下直接出现时才算系统区；
+# “windows”“recovery”这类名字用户也可能给普通文件夹起，深处出现不算。
 SYSTEM_DIR_NAMES = {
     "windows", "program files", "program files (x86)", "programdata",
-    "appdata", "system volume information", "$recycle.bin", "perflogs",
+    "system volume information", "$recycle.bin", "perflogs",
     "recovery", "system32",
+}
+
+# AppData 是 Windows 管理的用户配置目录，名字本身就有指向性，任意深度都算。
+SYSTEM_DIR_NAMES_ANY_DEPTH = {
+    "appdata",
 }
 
 
 def is_system_area(path) -> bool:
-    """路径本身或其任一上级是 Windows 系统目录（扫描/清理有误删风险）。"""
+    """路径本身或其上级是 Windows 系统目录（扫描/清理有误删风险）。
+    系统名只认根下的直接子级（C:/Windows、D:/Program Files），避免
+    D:/backup/windows 这类普通文件夹被误拦；AppData 例外，任意深度都算；
+    相对路径只认开头就是系统名的那一级。"""
     parts = [p.lower() for p in Path(path).parts]
-    return any(p in SYSTEM_DIR_NAMES for p in parts)
+    if not parts:
+        return False
+    if any(p in SYSTEM_DIR_NAMES_ANY_DEPTH for p in parts):
+        return True
+    first = parts[0]
+    absolute = (len(first) >= 2 and first[1] == ":" and first[0].isalpha()) \
+        or first.startswith(chr(92) * 2) or first.startswith("/")
+    if absolute:
+        return len(parts) > 1 and parts[1] in SYSTEM_DIR_NAMES
+    return parts[0] in SYSTEM_DIR_NAMES
 
 
 def is_filesystem_root(path) -> bool:
