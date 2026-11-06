@@ -616,14 +616,15 @@ class CanvasButton(tk.Canvas):
         self._pressed = False
         self._press_cancelled = False
         self._key_after_id = None
-        self._bg = bg or theme.BG
+        # bg 只记显式传入的值；没传时 _draw 读当前主题，避免换主题后重画用旧色
+        self._bg = bg
         natural = self.font.measure(text) + self.padding * 2
         if icon:
             natural += theme.s(icon_size) + theme.s(7)
         w = theme.s(width) if width else natural
         h = theme.s(height)
         self._btn_w, self._btn_h = w, h
-        super().__init__(master, width=w, height=h, bg=self._bg,
+        super().__init__(master, width=w, height=h, bg=self._bg or theme.BG,
                          highlightthickness=0, bd=0, cursor="hand2",
                          takefocus=1)
         self._focused = False
@@ -648,7 +649,7 @@ class CanvasButton(tk.Canvas):
         elif self._hover:
             fill = hover
         if not fill:
-            fill = self._bg
+            fill = self._bg or self.theme.BG
         dy = 1 if self._pressed and self.enabled else 0
         round_rect(self, 0.5, 0.5 + dy, w - 0.5, h - 0.5 + dy, self.radius,
                    fill=fill, outline=outline or fill)
@@ -893,7 +894,8 @@ class Segmented(tk.Canvas):
         self.pad = theme.s(3)
         self.seg_pad = theme.s(padding)
         self._bg = bg or theme.CARD
-        self._fill = fill or theme.INPUT
+        # fill 只记显式传入的值；没传时 _draw 读当前主题，避免换主题后重画用旧色
+        self._fill = fill
         self._hover_idx = None
         widths = []
         for _, label in self.options:
@@ -923,7 +925,8 @@ class Segmented(tk.Canvas):
         self.delete("all")
         w = sum(self._widths) + self.pad * 2
         round_rect(self, 0.5, 0.5, w - 0.5, self.h - 0.5, self.theme.s(10),
-                   fill=self._fill, outline=self.theme.BORDER_SOFT)
+                   fill=self._fill or self.theme.INPUT,
+                   outline=self.theme.BORDER_SOFT)
         for i, ((val, label), (x1, x2)) in enumerate(zip(self.options, self._seg_bounds())):
             active = val == self.value
             if active:
@@ -999,12 +1002,13 @@ class Card(tk.Canvas):
         self.padding = theme.s(padding)
         self.radius = theme.s(radius)
         self._bg = bg or theme.BG
-        self._fill = fill or theme.CARD
-        self._outline = outline or theme.BORDER_SOFT
+        # fill/outline 只记显式传入的值；没传时 _draw_bg 读当前主题
+        self._fill = fill
+        self._outline = outline
         self._min_height = theme.s(min_height)
         super().__init__(master, bg=self._bg, highlightthickness=0, bd=0,
                          height=self._min_height or theme.s(80))
-        self.body = tk.Frame(self, bg=self._fill)
+        self.body = tk.Frame(self, bg=self._fill or theme.CARD)
         self._win = self.create_window(self.padding, self.padding,
                                        window=self.body, anchor="nw")
         self.bind("<Configure>", self._on_canvas)
@@ -1037,7 +1041,9 @@ class Card(tk.Canvas):
         w = max(self.winfo_width(), 2)
         h = max(self.winfo_height(), 2)
         round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, self.radius,
-                   fill=self._fill, outline=self._outline, tags=("bg",))
+                   fill=self._fill or self.theme.CARD,
+                   outline=self._outline or self.theme.BORDER_SOFT,
+                   tags=("bg",))
         self.tag_lower("bg")
 
 
