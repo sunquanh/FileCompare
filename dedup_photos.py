@@ -60,9 +60,39 @@ ZOOM_LAYOUT_TOL = 16.0
 # 缩放搜索档位：中心保留 1/z。z=1.43 ≈ 四边各裁 15%，1.67 ≈ 20%。
 # 先按 6% 粗扫，再在最好的两档附近按 1% 细扫：粗扫单档最坏错位 3%（相关
 # 值只剩 0.76~0.86），细扫一轮就能回到 0.95 以上。
-ZOOM_LADDER = (1.00, 1.06, 1.13, 1.20, 1.28, 1.37, 1.46, 1.56, 1.67)
+ZOOM_LADDER = (1.00, 1.06, 1.13, 1.20, 1.28, 1.37, 1.46, 1.56, 1.67, 1.82, 2.00)
 THUMB_SIZE = 64            # 缓存里存的中间图边长，缩放搜索的原料
-ZOOM_MAX_PAIRS = 128       # 每块最多对多少对做缩放搜索（按色分布由近到远取）
+ZOOM_MAX_PAIRS = 512       # 每块最多对多少对做缩放搜索（v7：缓存做便宜后提上限）
+# two_way=两路：直方图前 64 + dHash 前 64，去重后补齐到 128。
+# 缩放队列排序键（诊断用）：hist_pref=直方图升序/dHash次之（现状）；
+# pref_hist=dHash升序/直方图次之；fine_pref=pHash升序/dHash次之；
+# pref_fine=dHash升序/pHash次之；sum=dHash+pHash之和；
+# maxnorm=max(dHash/16, pHash/42)，按门校准的归一化。
+ZOOM_QUEUE_SORT = "hist_pref"  # 非默认分支仅供诊断（改常量切换），默认 hist_pref
+# 缩放路径单独的直方图门：裁掉太多会改变颜色分布（center50 实测 0.30~0.38），
+# 同尺度与 EXIF 两条路仍用调用方传的 hist_tol。
+ZOOM_HIST_TOL = 0.40
+# 缩放候选的长宽比窗口：直接比或倒数比在 [1/2, 2] 内（改长宽比的裁切、
+# 竖条/横条都在里头；同尺度路径仍用 12% 的严格门）。
+ZOOM_RATIO_MAX = 2.0
+# 边框去污染：缩放窗口向内缩 10%，框边不进高频（中心裁切走正常窗口，
+# 两档取最好的那个，互不干扰）。
+ZOOM_INSET = 0.90
+# 内缩窗口的近失带：中心档 NCC 在 tol-0.25 以上才值得试内缩档。
+ZOOM_INSET_NEAR = 0.25
+# 偏心位置的档位（中心梯子的粗档子集，细扫再补精度）。
+ZOOM_EXT_SCALES = (1.11, 1.25, 1.43, 1.67, 2.00)
+# 矩形窗口的占比（横条整宽 / 竖条整高）。
+ZOOM_RECT_FRACS = (0.75, 0.67, 0.60)
+# 小角度旋转档位（度）。
+ROT_ANGLES = (3.0, -3.0, 5.0, -5.0, 10.0, -10.0)
+# 第二道门（缩放描述子）的 NCC 下限：真对最低 0.61、假对最高 0.51，
+# 取 0.60 卡在中间；描述子与布局闸才是主判据。
+ZOOM_NCC_FLOOR = 0.60
+# 偏心搜索粗筛后取前几个算全高频（真窗口粗相关 ≥0.99，假对最高 0.87）。
+ZOOM_EXT_TOPK = 6
+# 反方向重提的下限：第一方向最好相关不到 0.50，基本不是同一张图。
+ZOOM_REVERSE_FLOOR = 0.50
 # 同机型 + 拍摄时间相差 ≤2 秒：EXIF 本身就对得上，结构阈值放宽一档
 EXIF_TIME_TOL = 2
 EXIF_NCC_TOL = 0.80
@@ -165,12 +195,13 @@ def _box_blur(arr, radius=2):
         tail = [slice(None)] * out.ndim
         head[axis] = slice(n - radius, n)
         tail[axis] = slice(0, radius)
-        padded = np.concatenate([out[tuple(head)], out, out[tuple(tail)]],
-                                axis=axis)
+        padded = np.concatenate(
+            [out[tuple(head)], out, out[tuple(tail)]], axis=axis)
         cs = np.cumsum(padded, axis=axis)
-        zero = [slice(None)] * out.ndim
-        zero[axis] = slice(0, 1)
-        cs = np.concatenate([np.zeros_like(cs[tuple(zero)]), cs], axis=axis)
+        zero_shape = list(cs.shape)
+        zero_shape[axis] = 1
+        cs = np.concatenate(
+            [np.zeros(zero_shape, dtype=np.float32), cs], axis=axis)
         hi = [slice(None)] * out.ndim
         lo = [slice(None)] * out.ndim
         hi[axis] = slice(k, k + n)
@@ -461,9 +492,9 @@ def _unpack_thumb(text: str) -> np.ndarray | None:
         return None
 
 
-def _zoom_window(n, z):
-    """中心取景窗 (边长, y0, x0)：保留中间 1/z 的区域。"""
-    side = max(8, min(n, int(round(n / float(z)))))
+def _zoom_window(n, z, inset=1.0):
+    """中心取景窗 (边长, y0, x0)：保留中间 1/z 的区域；inset<1 时再向内缩一圈。"""
+    side = max(8, min(n, int(round(n / float(z) * inset))))
     off = (n - side) // 2
     return side, off, off
 
@@ -477,13 +508,14 @@ def _zoom_view(thumb, z, size):
         (size, size), Image.Resampling.LANCZOS)
 
 
-def zoom_hp(thumb, z) -> np.ndarray:
+def zoom_hp(thumb, z, inset=1.0) -> np.ndarray:
     """缩放 z 倍后的 32×32 高频单位向量。
 
     从 64×64 中间图直接做面积平均（积分图，纯 numpy）：缩放搜索里这一步要
     被调用上千次，走 Pillow 重采样每次 0.9 毫秒，全表扫描时就是几秒的差别。
+    inset<1 时窗口再向内缩一圈（去边框：框边不进高频）。
     """
-    return zoom_hp_gray(_thumb_gray(thumb), z)
+    return zoom_hp_gray(_thumb_gray(thumb), z, inset)
 
 
 def _thumb_gray(thumb) -> np.ndarray:
@@ -491,20 +523,93 @@ def _thumb_gray(thumb) -> np.ndarray:
         [0.299, 0.587, 0.114], dtype=np.float32)
 
 
-def zoom_hp_gray(gray, z) -> np.ndarray:
+def _hp_from_rect(gray, y0, y1, x0, x1) -> np.ndarray:
+    """矩形区域 → 32×32 高频单位向量（缩放搜索共用；方形窗口是特例）。"""
+    cs = np.cumsum(np.cumsum(gray[y0:y1, x0:x1], axis=0), axis=1)
+    cs = np.pad(cs, ((1, 0), (1, 0)))
+    h, w = y1 - y0, x1 - x0
+    rows = np.round(np.arange(33) * h / 32.0).astype(int)
+    cols = np.round(np.arange(33) * w / 32.0).astype(int)
+    lo_r, hi_r = rows[:-1], np.maximum(rows[1:], rows[:-1] + 1)
+    lo_c, hi_c = cols[:-1], np.maximum(cols[1:], cols[:-1] + 1)
+    sums = (cs[hi_r[:, None], hi_c] - cs[lo_r[:, None], hi_c]
+            - cs[hi_r[:, None], lo_c] + cs[lo_r[:, None], lo_c])
+    counts = np.outer(hi_r - lo_r, hi_c - lo_c).astype(np.float32)
+    return _highpass_arr(sums / counts)[0]
+
+
+def _hp_from_rect_cs(cs, y0, y1, x0, x1) -> np.ndarray:
+    """同 _hp_from_rect，但吃已经算好的整图积分图（偏心搜索复用：
+    58 个窗口只做一次 cumsum，每个窗口只剩取 bin 和高通）。
+    cs 是整图灰度 pad 后的积分图，cs[i, j] = 灰度[0:i, 0:j] 之和。"""
+    h, w = y1 - y0, x1 - x0
+    rows = np.round(np.arange(33) * h / 32.0).astype(int)
+    cols = np.round(np.arange(33) * w / 32.0).astype(int)
+    lo_r, hi_r = rows[:-1], np.maximum(rows[1:], rows[:-1] + 1)
+    lo_c, hi_c = cols[:-1], np.maximum(cols[1:], cols[:-1] + 1)
+    sums = (cs[hi_r[:, None] + y0, hi_c + x0]
+            - cs[lo_r[:, None] + y0, hi_c + x0]
+            - cs[hi_r[:, None] + y0, lo_c + x0]
+            + cs[lo_r[:, None] + y0, lo_c + x0])
+    counts = np.outer(hi_r - lo_r, hi_c - lo_c).astype(np.float32)
+    return _highpass_arr(sums / counts)[0]
+
+
+def _mean8_from_cs(cs, y0, y1, x0, x1) -> np.ndarray:
+    """矩形区域的 8×8 灰度均值（积分图），去均值后归一化成 64 维向量。
+    偏心搜索的粗筛用：只算均值，不算高频。"""
+    h, w = y1 - y0, x1 - x0
+    rows = np.round(np.arange(9) * h / 8.0).astype(int)
+    cols = np.round(np.arange(9) * w / 8.0).astype(int)
+    lo_r, hi_r = rows[:-1], np.maximum(rows[1:], rows[:-1] + 1)
+    lo_c, hi_c = cols[:-1], np.maximum(cols[1:], cols[:-1] + 1)
+    sums = (cs[hi_r[:, None] + y0, hi_c + x0]
+            - cs[lo_r[:, None] + y0, hi_c + x0]
+            - cs[hi_r[:, None] + y0, lo_c + x0]
+            + cs[lo_r[:, None] + y0, lo_c + x0])
+    counts = np.outer(hi_r - lo_r, hi_c - lo_c).astype(np.float32)
+    m = (sums / counts).ravel().astype(np.float32)
+    m = m - m.mean()
+    n = float(np.sqrt(float((m * m).sum())))
+    return m / n if n > 1e-6 else m
+
+
+
+
+def _mean8_batch_from_cs(cs, rects) -> np.ndarray:
+    """一批矩形区域的 8×8 灰度均值（积分图），去均值后按行归一化。
+
+    与逐个调 _mean8_from_cs 数值等价，但一次向量化算完：偏心搜索的粗筛
+    要给 58 个窗口各算一次，逐个调的开销占了比对时间的三分之一。
+    rects 是 (y0, y1, x0, x1) 的序列，返回 (N, 64)。"""
+    rects = np.asarray(rects, dtype=np.int64)
+    y0, y1, x0, x1 = rects[:, 0], rects[:, 1], rects[:, 2], rects[:, 3]
+    h = (y1 - y0).astype(np.float64)
+    w = (x1 - x0).astype(np.float64)
+    edges = np.arange(9, dtype=np.float64)
+    rows = np.round(edges[None, :] * h[:, None] / 8.0).astype(np.int64)
+    cols = np.round(edges[None, :] * w[:, None] / 8.0).astype(np.int64)
+    lo_r, hi_r = rows[:, :-1], np.maximum(rows[:, 1:], rows[:, :-1] + 1)
+    lo_c, hi_c = cols[:, :-1], np.maximum(cols[:, 1:], cols[:, :-1] + 1)
+    hr = hi_r[:, :, None] + y0[:, None, None]
+    lr = lo_r[:, :, None] + y0[:, None, None]
+    hc = hi_c[:, None, :] + x0[:, None, None]
+    lc = lo_c[:, None, :] + x0[:, None, None]
+    sums = (cs[hr, hc] - cs[lr, hc] - cs[hr, lc] + cs[lr, lc])
+    counts = ((hi_r - lo_r)[:, :, None]
+              * (hi_c - lo_c)[:, None, :]).astype(np.float32)
+    m = (sums / counts).reshape(len(rects), 64).astype(np.float32)
+    m = m - m.mean(axis=1, keepdims=True)
+    n = np.sqrt((m * m).sum(axis=1, keepdims=True))
+    safe = np.where(n > 1e-6, n, 1.0)
+    return np.where(n > 1e-6, m / safe, m)
+
+
+def zoom_hp_gray(gray, z, inset=1.0) -> np.ndarray:
     """同 zoom_hp，但直接吃已经算好的 64×64 灰度（缩放搜索复用）。"""
     n = gray.shape[0]
-    side, y0, x0 = _zoom_window(n, z)
-    piece = gray[y0:y0 + side, x0:x0 + side]
-    cs = np.cumsum(np.cumsum(piece, axis=0), axis=1)
-    cs = np.pad(cs, ((1, 0), (1, 0)))
-    edges = np.round(np.arange(33) * side / 32.0).astype(int)
-    lo = edges[:-1]
-    hi = np.maximum(edges[1:], lo + 1)
-    sums = (cs[np.ix_(hi, hi)] - cs[np.ix_(lo, hi)]
-            - cs[np.ix_(hi, lo)] + cs[np.ix_(lo, lo)])
-    counts = np.outer(hi - lo, hi - lo).astype(np.float32)
-    return _highpass_arr(sums / counts)[0]
+    side, y0, x0 = _zoom_window(n, z, inset)
+    return _hp_from_rect(gray, y0, y0 + side, x0, x0 + side)
 
 
 def zoom_grid(thumb, z) -> np.ndarray:
@@ -519,6 +624,81 @@ def zoom_desc(thumb, z, mat=None):
     small = np.asarray(_zoom_view(thumb, z, 9).convert("L"),
                        dtype=np.int16)
     return _dhash_grid(small), _phash_array(arr, mat)
+
+
+def _zoom_rect_sq(n, z, py, px):
+    """方形窗口在 3×3 位置之一：py/px ∈ {0,1,2}（上/中/下 × 左/中/右）。"""
+    side = max(8, min(n, int(round(n / float(z)))))
+    y0 = py * (n - side) // 2
+    x0 = px * (n - side) // 2
+    return y0, y0 + side, x0, x0 + side
+
+
+def _rect_h(n, frac, pos):
+    """横条：整宽、高为 frac；pos ∈ {0,1,2}（上/中/下）。"""
+    h = max(8, min(n, int(round(n * frac))))
+    y0 = pos * (n - h) // 2
+    return y0, y0 + h, 0, n
+
+
+def _rect_v(n, frac, pos):
+    """竖条：整高、宽为 frac；pos ∈ {0,1,2}（左/中/右）。"""
+    w = max(8, min(n, int(round(n * frac))))
+    x0 = pos * (n - w) // 2
+    return 0, n, x0, x0 + w
+
+
+def _view_rect(thumb, y0, y1, x0, x1, size):
+    """矩形区域 → size×size（Pillow 重采样；布局/描述子共用）。"""
+    piece = thumb[y0:y1, x0:x1]
+    return Image.fromarray(np.ascontiguousarray(piece), "RGB").resize(
+        (size, size), Image.Resampling.LANCZOS)
+
+
+def zoom_grid_rect(thumb, y0, y1, x0, x1):
+    """矩形区域的 8×8 颜色布局。"""
+    return np.asarray(_view_rect(thumb, y0, y1, x0, x1, 8), dtype=np.uint8)
+
+
+def zoom_desc_rect(thumb, y0, y1, x0, x1, mat=None):
+    """矩形区域的 (dHash, pHash)，用来给出真实的粗差/细差。"""
+    gray = _view_rect(thumb, y0, y1, x0, x1, 32).convert("L")
+    arr = np.asarray(gray, dtype=np.float32)
+    mat = _dct_matrix(DCT_SIZE) if mat is None else mat
+    small = np.asarray(_view_rect(thumb, y0, y1, x0, x1, 9).convert("L"),
+                       dtype=np.int16)
+    return _dhash_grid(small), _phash_array(arr, mat)
+
+
+def _rot_thumb(thumb, angle):
+    """缩略图按 angle 度旋转（白底填充，与常见修图 App 的默认一致）。"""
+    return np.asarray(Image.fromarray(np.ascontiguousarray(thumb), "RGB")
+                      .rotate(angle, resample=Image.Resampling.BICUBIC,
+                              expand=False, fillcolor=(255, 255, 255)),
+                      dtype=np.uint8)
+
+
+def zoom_desc_win(thumb, win, mat=None):
+    """窗口（_zoom_hit 返回的描述）对应的 (dHash, pHash)。
+
+    win: ("sq", z, inset, py, px) | ("rh", frac, pos) | ("rv", frac, pos)
+    | ("rot", angle, z)。
+    """
+    n = thumb.shape[0]
+    if win[0] == "rot":
+        thumb = _rot_thumb(thumb, win[1])
+        win = ("sq", win[2], 1.0, 1, 1)
+    if win[0] == "sq":
+        _, z, inset, py, px = win
+        side = max(8, min(n, int(round(n / float(z) * inset))))
+        y0 = py * (n - side) // 2
+        x0 = px * (n - side) // 2
+        return zoom_desc_rect(thumb, y0, y0 + side, x0, x0 + side, mat)
+    if win[0] == "rh":
+        y0, y1, x0, x1 = _rect_h(n, win[1], win[2])
+        return zoom_desc_rect(thumb, y0, y1, x0, x1, mat)
+    y0, y1, x0, x1 = _rect_v(n, win[1], win[2])
+    return zoom_desc_rect(thumb, y0, y1, x0, x1, mat)
 
 
 def exif_shot(path):
@@ -723,6 +903,10 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
       2) EXIF：同机型且拍摄时间相差 ≤2 秒，结构阈值放宽一档——裁切、加字、
          换色调的版本几何对不上，但拍摄信息还在；
       3) 缩放搜索：把一方的 64×64 中间图按 1/z 重新对齐后再比。原先预切的
+         四档：中心梯子（到 2.0，即每边 50%）→ 内缩窗口（去边框）→
+         偏心位置 + 矩形窗口（改长宽比的裁切）→ 小角度旋转 ±3°/±5°/±10°。
+         缩放候选的长宽比门放宽到 2 倍、直方图门放宽到 0.40；同尺度与 EXIF
+         两条路仍用严格门。
          固定裁边层只能覆盖四边各裁 6%/12% 两档，实测 4%/8%/10%/14% 整类漏判。
     """
     n = len(fps)
@@ -797,6 +981,9 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
     chunk = max(8, min(512, int(400_000 / max(m, 1))))
     prefilter = int(dist) + PREFILTER_SLACK
     prefilter_zoom = int(dist) + PREFILTER_ZOOM_SLACK
+    # 缩放路径的直方图门：调用方传的 hist_tol 与 ZOOM_HIST_TOL 取宽的那个
+    # （测试里 hist_tol=1.0 的调用不能被收窄）。
+    zoom_hist_tol = max(float(hist_tol), ZOOM_HIST_TOL)
     all_idx = np.arange(m)
     total_blocks = (m + chunk - 1) // chunk
     dh0 = dh[:, 0, :]
@@ -804,6 +991,12 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
     shifts = np.stack([np.roll(dh0, -r, axis=1) for r in range(ORIENTS)])
 
     ladder_cache = {}
+    dst_mean_cache = {}
+    rot_gray_cache = {}
+    rot_hp_cache = {}
+    ext_hp_cache = {}
+    EXT_HP_CACHE_MAX = 8192
+    ext_means_cache = {}
     orient_cache = {}
     gray_cache = {}
 
@@ -828,57 +1021,254 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             orient_cache[pos] = rows
         return rows
 
-    def _ladder(pos):
-        """一次算好这张图在 9 个档位上的高频向量：同一张图会出现在很多配对
-        里，不缓存的话每次都要重采样一遍，全表扫描时占掉大半时间。"""
-        rows = ladder_cache.get(pos)
+    def _ladder(pos, inset=1.0):
+        """一次算好这张图在各档位上的高频向量：同一张图会出现在很多配对
+        里，不缓存的话每次都要重采样一遍，全表扫描时占掉大半时间。
+        inset<1 是内缩档（去边框），与正常档分开缓存。"""
+        key = (pos, inset)
+        rows = ladder_cache.get(key)
         if rows is None:
             fp = uniq[pos]
             if fp.thumb is None:
                 rows = ()
             else:
                 g = _gray(pos)
-                rows = np.stack([zoom_hp_gray(g, z) for z in ZOOM_LADDER])
-            ladder_cache[pos] = rows
+                rows = np.stack([zoom_hp_gray(g, z, inset)
+                                 for z in ZOOM_LADDER])
+            ladder_cache[key] = rows
         return rows
 
-    def _zoom_hit(src_pos, dst_pos, tol):
-        """把 src 的中间图按 1/z 对齐到 dst，返回 (相关, 布局差, z)。
+    def _layout_for(src_pos, dst_pos, win):
+        """窗口对应的 8×8 布局与目标图的布局差；过门返回差值，不过返回 None。
+        win: ("sq", z, inset, py, px) | ("rh", frac, pos) | ("rv", frac, pos)
+        | ("rot", angle, z)。"""
+        dst = uniq[dst_pos]
+        if dst.grid is None:
+            return 0.0
+        src = uniq[src_pos]
+        thumb = src.thumb
+        n = thumb.shape[0]
+        if win[0] == "rot":
+            thumb = _rot_thumb(thumb, win[1])
+            win = ("sq", win[2], 1.0, 1, 1)
+        if win[0] == "sq":
+            _, z, inset, py, px = win
+            side = max(8, min(n, int(round(n / float(z) * inset))))
+            y0 = py * (n - side) // 2
+            x0 = px * (n - side) // 2
+            grid = zoom_grid_rect(thumb, y0, y0 + side, x0, x0 + side)
+        elif win[0] == "rh":
+            y0, y1, x0, x1 = _rect_h(n, win[1], win[2])
+            grid = zoom_grid_rect(thumb, y0, y1, x0, x1)
+        else:
+            y0, y1, x0, x1 = _rect_v(n, win[1], win[2])
+            grid = zoom_grid_rect(thumb, y0, y1, x0, x1)
+        lay = layout_distance_inner(grid, dst.grid[0])
+        return lay if lay <= ZOOM_LAYOUT_TOL else None
 
-        z = 0 表示「粗档差得太远」。
-        """
-        src, dst = uniq[src_pos], uniq[dst_pos]
-        if src.thumb is None or src.hp is None or dst.hp is None:
-            return -2.0, None, 0.0
-        rows = _ladder(src_pos)
-        targets = _dst_rows(dst_pos)
-        if not len(rows) or not len(targets):
-            return -2.0, None, 0.0
+    def _best_ladder(src_pos, targets, tol, inset):
+        """中心梯子（某一个 inset）上最好的 (相关, z, 窗口)。
+        前两档各细扫 ±0.03 一遍（粗档有时会被相邻档抢走）。"""
+        rows = _ladder(src_pos, inset)
+        if not len(rows):
+            return -2.0, 0.0, None
         ladder = np.stack(rows).reshape(len(rows), -1) @ targets.T
         scores = [(float(v), float(z))
                   for v, z in zip(ladder.max(axis=1), ZOOM_LADDER)]
         scores.sort(reverse=True)
         best_v, best_z = scores[0]
-        if best_v < tol - 0.15:
-            return best_v, None, 0.0
-        # 粗档有时会被相邻档抢走（真峰在 1.40，最高一档却在 1.46），所以前两
-        # 档各细扫一遍
-        for _, center in scores[:2]:
-            for z in np.arange(center - 0.03, center + 0.0301, 0.01):
-                v = float((zoom_hp(src.thumb, float(z)).ravel()
+        best_win = ("sq", best_z, inset, 1, 1)
+        if best_v >= tol - 0.15:
+            thumb = uniq[src_pos].thumb
+            for _, center in scores[:2]:
+                for z in np.arange(center - 0.03, center + 0.0301, 0.01):
+                    v = float((zoom_hp(thumb, float(z), inset).ravel()
+                               @ targets.T).max())
+                    if v > best_v:
+                        best_v, best_z = v, float(z)
+                        best_win = ("sq", best_z, inset, 1, 1)
+        return best_v, best_z, best_win
+
+    def _ext_hp(src_pos, cs, y0, y1, x0, x1):
+        """偏心窗口的高频向量（32×32 展平），跨对缓存。
+
+        同一张图会出现在很多配对里，窗口集合只有 58 种；cs 由 src 的
+        灰度图唯一确定，所以键 (src_pos, y0, y1, x0, x1) 足够。
+        设上限防大图库爆内存，满了不再加新条。"""
+        key = (src_pos, y0, y1, x0, x1)
+        v = ext_hp_cache.get(key)
+        if v is None:
+            v = _hp_from_rect_cs(cs, y0, y1, x0, x1).ravel()
+            if len(ext_hp_cache) < EXT_HP_CACHE_MAX:
+                ext_hp_cache[key] = v
+        return v
+
+
+    def _extended_search(src_pos, dst_pos, targets, tol):
+        """偏心位置 + 矩形窗口：窗口高频与粗筛均值走跨对缓存。返回最好的 (相关, 窗口)。
+        只在中心梯子（含内缩）没过门时跑。先算 58 个窗口的 8×8 均值相关
+        （积分图，无高频），只取前 6 个算全高频 + NCC：真窗口粗相关 ≥0.99，
+        假对最高 0.87，取前 6 足够。"""
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        if src.thumb is None:
+            return -2.0, None
+        g = _gray(src_pos)
+        if not len(g):
+            return -2.0, None
+        n = g.shape[0]
+        cs = np.pad(np.cumsum(np.cumsum(g, axis=0), axis=1),
+                    ((1, 0), (1, 0)))
+        # 目标图的 8×8 均值（8 个方向），粗筛用
+        dmean = dst_mean_cache.get(dst_pos)
+        if dmean is None:
+            dg = _gray(dst_pos)
+            if not len(dg):
+                return -2.0, None
+            dcs = np.pad(np.cumsum(np.cumsum(dg, axis=0), axis=1),
+                         ((1, 0), (1, 0)))
+            dm = _mean8_from_cs(dcs, 0, dg.shape[0], 0, dg.shape[1])
+            dmean = np.stack([o.ravel() for o in _orients(dm.reshape(8, 8))])
+            dst_mean_cache[dst_pos] = dmean
+        wins = []
+        for z in ZOOM_EXT_SCALES:
+            for py in (0, 1, 2):
+                for px in (0, 1, 2):
+                    if py == 1 and px == 1:
+                        continue  # 中心位置已在梯子里
+                    y0, y1, x0, x1 = _zoom_rect_sq(n, z, py, px)
+                    wins.append((("sq", z, 1.0, py, px), y0, y1, x0, x1))
+        for frac in ZOOM_RECT_FRACS:
+            for pos in (0, 1, 2):
+                y0, y1, x0, x1 = _rect_h(n, frac, pos)
+                wins.append((("rh", frac, pos), y0, y1, x0, x1))
+                y0, y1, x0, x1 = _rect_v(n, frac, pos)
+                wins.append((("rv", frac, pos), y0, y1, x0, x1))
+        if not wins:
+            return -2.0, None
+        means = ext_means_cache.get(src_pos)
+        if means is None:
+            means = _mean8_batch_from_cs(
+                cs, [(y0, y1, x0, x1) for _, y0, y1, x0, x1 in wins])
+            if len(ext_means_cache) < EXT_HP_CACHE_MAX:
+                ext_means_cache[src_pos] = means
+        coarse = (means @ dmean.T).max(axis=1)
+        top = np.argsort(-coarse)[:ZOOM_EXT_TOPK]
+        best_v = -2.0
+        best_win = None
+        for k in top:
+            win, y0, y1, x0, x1 = wins[int(k)]
+            v = float((_ext_hp(src_pos, cs, y0, y1, x0, x1)
+                       @ targets.T).max())
+            if v > best_v:
+                best_v, best_win = v, win
+        if best_win is not None and best_win[0] == "sq" and best_v >= tol - 0.15:
+            _, z0, _, py, px = best_win
+            for z in np.arange(z0 - 0.03, z0 + 0.0301, 0.01):
+                y0, y1, x0, x1 = _zoom_rect_sq(n, float(z), py, px)
+                v = float((_ext_hp(src_pos, cs, y0, y1, x0, x1)
                            @ targets.T).max())
                 if v > best_v:
-                    best_v, best_z = v, float(z)
+                    best_v, best_win = v, ("sq", float(z), 1.0, py, px)
+        return best_v, best_win
 
-        if best_v < tol:
-            return best_v, None, best_z
-        lay = 0.0
-        if dst.grid is not None:
-            lay = layout_distance_inner(zoom_grid(src.thumb, best_z),
-                                        dst.grid[0])
-            if lay > ZOOM_LAYOUT_TOL:
-                return best_v, None, best_z
-        return best_v, lay, best_z
+    def _rotation_search(src_pos, dst_pos, targets, tol, best_z):
+        """小角度旋转：把 src 缩略图按 ±3°/±5°/±10° 转后再对齐。
+        z 取 1.0（纯旋转）与中心梯子最好的那档（旋转 + 裁切）两处。
+        只在两图尺寸基本一致时跑（旋转不改变尺寸；裁切/加框的尺寸
+        本来就不一样，跑了也是白跑）。返回最好的 (相关, z, 窗口)。"""
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        if src.thumb is None:
+            return -2.0, 0.0, None
+        if (abs(src.width - dst.width) > 0.10 * max(src.width, dst.width)
+                or abs(src.height - dst.height)
+                > 0.10 * max(src.height, dst.height)):
+            return -2.0, 0.0, None
+        best_v = -2.0
+        best_win = None
+        best_zz = 0.0
+        for angle in ROT_ANGLES:
+            key = (src_pos, angle)
+            g = rot_gray_cache.get(key)
+            if g is None:
+                g = _thumb_gray(_rot_thumb(src.thumb, angle))
+                rot_gray_cache[key] = g
+            for z in (1.0, best_z):
+                if z <= 0:
+                    continue
+                hp_key = (src_pos, angle, z)
+                hp = rot_hp_cache.get(hp_key)
+                if hp is None:
+                    hp = zoom_hp_gray(g, z).ravel()
+                    rot_hp_cache[hp_key] = hp
+                v = float((hp @ targets.T).max())
+                if v > best_v:
+                    best_v, best_win, best_zz = v, ("rot", angle, z), z
+        return best_v, best_zz, best_win
+
+    def _zoom_second_chance(src_pos, dst_pos, win, best_v):
+        """第二道门：NCC 在 [ZOOM_NCC_FLOOR, tol) 时，用缩放描述子再判一次。
+        描述子对重采样更稳（校准时真对 dHash≤16、pHash≤42，假对 dHash≥19、
+        pHash≥88）；门限取 dist+4 / fine+20（默认 12/62），比真对观测值更紧，
+        只影响召回不影响防误报。再叠加布局闸，假对进不来。返回布局差或 None。"""
+        if best_v < ZOOM_NCC_FLOOR or win is None:
+            return None
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        g_dh, g_ph = zoom_desc_win(src.thumb, win, mat)
+        c_v = int(popcount(np.uint64(g_dh) ^ dst.dh[0]).min())
+        f_v = int(popcount(np.uint64(g_ph)[None, :]
+                       ^ dst.ph[0]).sum(axis=1).min())
+        if c_v > int(dist) + 4 or f_v > int(fine) + 20:
+            return None
+        return _layout_for(src_pos, dst_pos, win)
+
+    def _zoom_hit(src_pos, dst_pos, tol):
+        """把 src 的中间图按 1/z 对齐到 dst，返回 (相关, 布局差, z, 窗口)。
+
+        四档，按顺序试，任一档相关过门且布局过门即命中：
+          ① 中心梯子；② 内缩窗口（去边框）；③ 偏心位置 + 矩形窗口；
+          ④ 小角度旋转。
+        布局不过不立即返回（后几档的窗口不同，可能过）；四档都没过时，
+        NCC 在 [0.60, tol) 的再走第二道门（缩放描述子 dHash/pHash）。
+        z = 0 表示「粗档差得太远」。
+        """
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        if src.thumb is None or src.hp is None or dst.hp is None:
+            return -2.0, None, 0.0, None
+        targets = _dst_rows(dst_pos)
+        if not len(targets):
+            return -2.0, None, 0.0, None
+        best_v, best_z, best_win = _best_ladder(src_pos, targets, tol, 1.0)
+        if best_v >= tol:
+            lay = _layout_for(src_pos, dst_pos, best_win)
+            if lay is not None:
+                return best_v, lay, best_z, best_win
+        if best_v >= tol - ZOOM_INSET_NEAR:
+            v2, z2, w2 = _best_ladder(src_pos, targets, tol, ZOOM_INSET)
+            if v2 > best_v:
+                best_v, best_z, best_win = v2, z2, w2
+            if best_v >= tol:
+                lay = _layout_for(src_pos, dst_pos, best_win)
+                if lay is not None:
+                    return best_v, lay, best_z, best_win
+        v3, w3 = _extended_search(src_pos, dst_pos, targets, tol)
+        if v3 > best_v:
+            best_v, best_win = v3, w3
+            best_z = w3[1] if w3[0] == "sq" else 0.0
+        if best_v >= tol:
+            lay = _layout_for(src_pos, dst_pos, best_win)
+            if lay is not None:
+                return best_v, lay, best_z, best_win
+        v4, z4, w4 = _rotation_search(src_pos, dst_pos, targets, tol, best_z)
+        if v4 > best_v:
+            best_v, best_z, best_win = v4, z4, w4
+        if best_v >= tol:
+            lay = _layout_for(src_pos, dst_pos, best_win)
+            if lay is not None:
+                return best_v, lay, best_z, best_win
+        lay = _zoom_second_chance(src_pos, dst_pos, best_win, best_v)
+        if lay is not None:
+            return best_v, lay, best_z, best_win
+        return best_v, None, best_z, best_win
 
     def run_block(start, end):
         found = []
@@ -886,7 +1276,15 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         ratio = ratios[blk, None]
         ratio_ok = (np.abs(ratio / ratios[None, :] - 1.0) <= ratio_tol) | (
             np.abs(ratio * ratios[None, :] - 1.0) <= ratio_tol)
-        cols = np.nonzero(ratio_ok.any(axis=0))[0]
+        # 缩放路径单独的长宽比窗口：改长宽比的裁切（横/竖条）长宽比差远超 12%，
+        # 同尺度与 EXIF 两条路仍用严格门，只有缩放搜索能进这档。
+        rr = ratio / ratios[None, :]
+        rm = ratio * ratios[None, :]
+        ratio_zoom = (((rr >= 1.0 / ZOOM_RATIO_MAX)
+                       & (rr <= ZOOM_RATIO_MAX))
+                      | ((rm >= 1.0 / ZOOM_RATIO_MAX)
+                         & (rm <= ZOOM_RATIO_MAX)))
+        cols = np.nonzero((ratio_ok | ratio_zoom).any(axis=0))[0]
         # 只需要 j > i >= blk[0] 的列：右上半三角以外本来就会被 mask 丢掉
         cols = cols[cols > blk[0]]
         if not cols.size:
@@ -902,6 +1300,7 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                                 ^ shifted[None, :, orient]).astype(np.uint8)
                 np.minimum(best, diff, out=best)
         base = ratio_ok[:, cols] & (cols[None, :] > blk[:, None])
+        base_zoom = ratio_zoom[:, cols] & (cols[None, :] > blk[:, None])
         # EXIF 一致的配对不受粗筛限制：裁切/加字/换色调会把整幅哈希推得很远
         blk_t = exif_t[blk][:, None]
         blk_m = exif_m[blk][:, None]
@@ -909,10 +1308,12 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         col_m = exif_m[cols][None, :]
         same_shot = ((blk_t > 0) & (blk_m > 0) & (blk_m == col_m)
                      & (np.abs(blk_t - col_t) <= EXIF_TIME_TOL))
-        ii, jj = np.nonzero(((best <= prefilter_zoom) | same_shot) & base)
+        ii, jj = np.nonzero(((best <= prefilter_zoom) | same_shot)
+                            & (base | base_zoom))
         a = blk[ii]
         b = cols[jj]
         pref = best[ii, jj]
+        strict_ratio = base[ii, jj]
         if not a.size:
             return found
 
@@ -921,11 +1322,16 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         for s in range(0, k, step):
             sl = slice(s, min(s + step, k))
             hist_dist = 1.0 - np.sqrt(hist[a[sl]] * hist[b[sl]]).sum(axis=1)
-            keep = np.nonzero(hist_dist <= hist_tol)[0]
+            # 缩放路径的直方图门单独放宽（裁掉太多会改变颜色分布）；
+            # 同尺度与 EXIF 两条路仍用严格门（strict_hist）。
+            keep = np.nonzero(hist_dist <= zoom_hist_tol)[0]
             if not keep.size:
                 continue
             ia_all, ib_all = a[sl][keep], b[sl][keep]
             hist_ok = hist_dist[keep]
+            pref_ok = pref[sl][keep]
+            strict_pair = strict_ratio[sl][keep]
+            strict_hist = hist_dist[keep] <= hist_tol
             allow_same = pref[sl][keep] <= prefilter
             kk = keep.size
             corr = np.ones(kk, dtype=np.float32)
@@ -948,7 +1354,8 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             coarse_flat = coarse.reshape(kk, -1)
             accepted = np.zeros(kk, dtype=bool)
             for pos in np.nonzero((cur < 10_000) & (corr >= ncc_tol)
-                                  & allow_same)[0]:
+                                  & allow_same
+                                  & strict_pair & strict_hist)[0]:
                 ia, ib = int(ia_all[pos]), int(ib_all[pos])
                 fa, fb = uniq[ia], uniq[ib]
                 lay = (0.0 if fa.grid is None or fb.grid is None
@@ -966,7 +1373,8 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 & (exif_t[ia_all] > 0) & (exif_m[ia_all] > 0)
                 & (exif_m[ia_all] == exif_m[ib_all])
                 & (np.abs(exif_t[ia_all] - exif_t[ib_all]) <= EXIF_TIME_TOL)
-                & (corr >= EXIF_NCC_TOL))[0]
+                & (corr >= EXIF_NCC_TOL)
+                & strict_pair & strict_hist)[0]
             for pos in shot:
                 ia, ib = int(ia_all[pos]), int(ib_all[pos])
                 fa, fb = uniq[ia], uniq[ib]
@@ -983,20 +1391,61 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             # ---- 3) 缩放搜索：任意裁边量。按色分布从近到远排队，限量做
             rest = np.nonzero(~accepted)[0]
             if rest.size:
-                order = rest[np.lexsort((-corr[rest], hist_ok[rest]))]
+                if ZOOM_QUEUE_SORT == "two_way":
+                    half = ZOOM_MAX_PAIRS // 2
+                    order_h = rest[np.lexsort((pref_ok[rest], hist_ok[rest]))]
+                    order_p = rest[np.lexsort((hist_ok[rest], pref_ok[rest]))]
+                    seen = set()
+                    merged = []
+                    for p in order_h[:half]:
+                        merged.append(int(p))
+                        seen.add(int(p))
+                    for p in order_p[:half]:
+                        if int(p) not in seen:
+                            merged.append(int(p))
+                            seen.add(int(p))
+                    if len(merged) < ZOOM_MAX_PAIRS:
+                        for p in order_h[half:]:
+                            if int(p) not in seen:
+                                merged.append(int(p))
+                                seen.add(int(p))
+                                if len(merged) >= ZOOM_MAX_PAIRS:
+                                    break
+                    order = np.array(merged, dtype=np.int64)
+                elif ZOOM_QUEUE_SORT == "pref_hist":
+                    order = rest[np.lexsort((hist_ok[rest], pref_ok[rest]))]
+                elif ZOOM_QUEUE_SORT == "fine_pref":
+                    order = rest[np.lexsort((pref_ok[rest], cur[rest]))]
+                elif ZOOM_QUEUE_SORT == "pref_fine":
+                    order = rest[np.lexsort((cur[rest], pref_ok[rest]))]
+                elif ZOOM_QUEUE_SORT == "sum":
+                    key = pref_ok[rest] + cur[rest]
+                    order = rest[np.argsort(key, kind="stable")]
+                elif ZOOM_QUEUE_SORT == "maxnorm":
+                    key = np.maximum(pref_ok[rest] / 16.0, cur[rest] / 42.0)
+                    order = rest[np.argsort(key, kind="stable")]
+                else:  # hist_pref（默认）
+                    order = rest[np.lexsort((pref_ok[rest], hist_ok[rest]))]
                 for pos in order[:ZOOM_MAX_PAIRS]:
                     ia, ib = int(ia_all[pos]), int(ib_all[pos])
-                    hit = _zoom_hit(ia, ib, crop_ncc_tol)
-                    src, dst = uniq[ia], uniq[ib]
+                    # 先试“大图当 src”的方向（裁切/加框的正确方向）；
+                    # 反方向只在第一方向最好相关 ≥0.50 时再试。
+                    if (uniq[ia].width * uniq[ia].height
+                            >= uniq[ib].width * uniq[ib].height):
+                        first, second = (ia, ib), (ib, ia)
+                    else:
+                        first, second = (ib, ia), (ia, ib)
+                    hit = _zoom_hit(first[0], first[1], crop_ncc_tol)
+                    src, dst = uniq[first[0]], uniq[first[1]]
                     # 方向不对称：镜像缩放窗口只能把「被裁的那张」当 src，
-                    # 所以失败后必须换方向再试一次（不能因为 z 非 0 就跳过）
-                    if hit[1] is None:
-                        hit = _zoom_hit(ib, ia, crop_ncc_tol)
-                        src, dst = uniq[ib], uniq[ia]
+                    # 所以失败后必须换方向再试一次
+                    if hit[1] is None and hit[0] >= ZOOM_REVERSE_FLOOR:
+                        hit = _zoom_hit(second[0], second[1], crop_ncc_tol)
+                        src, dst = uniq[second[0]], uniq[second[1]]
                     if hit[1] is None:
                         continue
-                    corr_v, lay, z = hit
-                    g_dh, g_ph = zoom_desc(src.thumb, z, mat)
+                    corr_v, lay, z, win = hit
+                    g_dh, g_ph = zoom_desc_win(src.thumb, win, mat)
                     c_v = int(popcount(np.uint64(g_dh) ^ dst.dh[0]).min())
                     f_v = int(popcount(np.uint64(g_ph)[None, :]
                                        ^ dst.ph[0]).sum(axis=1).min())
