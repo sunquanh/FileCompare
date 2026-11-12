@@ -118,6 +118,33 @@ SKIP_DIRS = {
 }
 SKIP_PREFIX = ("_重复检测", "_重复待删", "~$")
 
+# 任何深度都跳过的目录名（统一按小写比较：Windows 文件系统不分大小写，
+# 按原样比较会让 "windows" / "appdata" 这类写法漏网，实测确实漏）。
+SKIP_ALWAYS = {
+    "$recycle.bin", "system volume information", ".git", ".svn", ".hg",
+    "node_modules", "__pycache__", ".idea", ".vscode", ".vs",
+}
+# 只在扫描根的第一层跳过：这些名字用户也可能给普通文件夹起，深处出现不算
+# 系统目录（与 dedup_core.is_system_area 的判定保持一致）。
+SKIP_AT_ROOT = {
+    "windows", "program files", "program files (x86)", "programdata",
+    "appdata", "recovery", "system32", "perflogs",
+}
+
+
+def should_skip_dir(name: str, depth: int) -> bool:
+    """扫描时是否跳过这个目录。
+
+    depth 是相对扫描根的层数（根的直属子目录为 1）。分两类：任何深度都跳过
+    的开发目录、只在根下才认的系统目录。
+    """
+    folded = (name or "").strip().lower()
+    if not folded:
+        return False
+    if folded in SKIP_ALWAYS:
+        return True
+    return depth <= 1 and folded in SKIP_AT_ROOT
+
 KIND_EXACT = "完全重复"
 KIND_PHOTO = "相似照片"
 KIND_VIDEO = "重复视频"
@@ -146,18 +173,21 @@ KEEP_RULE_LABELS = {
 #   vid_ratio 匹配帧占比下限
 PRESETS = {
     "relaxed": {"img_dist": 12, "img_fine": 62, "img_hist": 0.38,
+                "img_ncc": 0.72, "img_layout": 20.0,
                 "vid_dist": 14, "vid_fine": 120, "vid_ratio": 0.50,
                 "name_ratio": 0.78},
     "standard": {"img_dist": 8, "img_fine": 42, "img_hist": 0.26,
+                 "img_ncc": 0.95, "img_layout": 12.0,
                  "vid_dist": 10, "vid_fine": 96, "vid_ratio": 0.60,
                  "name_ratio": 0.88},
     "strict": {"img_dist": 5, "img_fine": 26, "img_hist": 0.16,
+               "img_ncc": 0.97, "img_layout": 8.0,
                "vid_dist": 7, "vid_fine": 72, "vid_ratio": 0.75,
                "name_ratio": 0.94},
 }
 
 CACHE_TAGS = {"quick": "q3", "sample": "s3", "full": "f3",
-              "photo": "p4", "video": "v3", "audio": "a3"}
+              "photo": "p7", "video": "v3", "audio": "a3"}
 
 
 class ScanCancelled(Exception):
@@ -277,7 +307,18 @@ class DupGroup:
             # 同名组内容未必一致、无声学比对的音频组默认不删，
             # 都不计入可释放空间
             return 0
-        return sum(i.size for i in self.items) - max(i.size for i in self.items)
+        return self.wasted_if_keep(self.keep)
+
+    def wasted_if_keep(self, keep: int) -> int:
+        """按实际保留项计算可释放空间。
+
+        旧实现固定按「最大的那份保留」估算，一旦换成最旧 / 最短路径 /
+        顶层等保留策略，顶部的可释放空间就与实际释放量不符。
+        """
+        if not 0 <= keep < len(self.items):
+            keep = 0
+        total = sum(i.size for i in self.items)
+        return max(0, total - self.items[keep].size)
 
     def default_selection(self) -> set[str]:
         if not self.select_by_default:
@@ -299,6 +340,8 @@ class ScanOptions:
     img_dist: int = 8
     img_fine: int = 42
     img_hist: float = 0.26
+    img_ncc: float = 0.95
+    img_layout: float = 12.0
     vid_dist: int = 10
     vid_fine: int = 96
     vid_ratio: float = 0.60
@@ -521,6 +564,8 @@ __all__ = [
     "KIND_VIDEO",
     "PHOTO_EXT",
     "PRESETS",
+    "SKIP_ALWAYS",
+    "SKIP_AT_ROOT",
     "SKIP_DIRS",
     "SKIP_PREFIX",
     "VIDEO_EXT",
@@ -550,4 +595,5 @@ __all__ = [
     "norm_path",
     "np",
     "pick_keep",
+    "should_skip_dir",
 ]

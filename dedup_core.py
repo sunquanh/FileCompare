@@ -37,12 +37,15 @@ from dedup_exact import (
 from dedup_files import (
     collect_files,
     export_report,
+    export_report_json,
     find_duplicate_dirs,
     hardlink_replace,
     make_thumbnail,
     permanent_delete,
+    recycle_capable,
     recycle_paths,
     restore_from_recycle,
+    verify_recycled,
     restore_hardlinks,
 )
 from dedup_models import (
@@ -82,10 +85,12 @@ from dedup_models import (
     is_photo,
     is_video,
     np,
+    norm_path,
     pick_keep,
+    should_skip_dir,
 )
 from dedup_names import find_name_groups, name_key
-from dedup_photos import PhotoFP, match_photos, probe_size
+from dedup_photos import PhotoFP, match_photos, pair_similarity, probe_size
 from dedup_photos import fingerprint as photo_fingerprint
 from dedup_video import (
     match_videos,
@@ -204,12 +209,16 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     say(f"发现 {len(files):,} 个文件（照片 {len(photos):,} / 视频 {len(videos):,}"
         f" / 音乐 {len(audios):,}），共 {human_size(total_size)}")
     emit("collect", len(files), len(files), f"共 {len(files):,} 个文件")
+    ref_files = sum(1 for f in files if f.protected)
+    if ref_files:
+        say(f"保护/参考目录：{ref_files:,} 个文件只作为保留基准参与比对，不会被清理")
 
     groups: list[DupGroup] = []
     consumed: set[str] = set()
     bad_photos = bad_videos = bad_audio = 0
     # ---- 重复目录（只按文件名+大小，内容未校验，默认不勾选，不占 consumed）
-    dir_groups = find_duplicate_dirs(files)
+    # 参考/保护目录里的文件只作为保留基准，不参与「重复目录」提示
+    dir_groups = find_duplicate_dirs([f for f in files if not f.protected])
     for members in dir_groups:
         group = DupGroup(KIND_DIR, members, 0,
                          "目录内文件的文件名+大小完全一致，内容未校验（默认不勾选）",
@@ -292,9 +301,12 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 dist=getattr(options, "img_dist", 8),
                 fine=getattr(options, "img_fine", 42),
                 hist_tol=getattr(options, "img_hist", 0.26),
+                ncc_tol=getattr(options, "img_ncc", 0.88),
+                layout_tol=getattr(options, "img_layout", 14.0),
                 cancel=cancel,
                 on_progress=lambda d, t, m: emit("photo", d, t, "照片比对"))
-            edges = [(a, b, fine) for a, b, _c, fine, _h in pairs]
+            edges = [(a, b, pair_similarity(fine, ncc))
+                     for a, b, _c, fine, _h, ncc, _l in pairs]
             clusters = clusters_complete_link(len(valid), edges)
             clusters.sort(key=lambda c: -sum(valid[i][0].size for i in c))
             for cluster in clusters:
@@ -302,10 +314,12 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 member = set(cluster)
                 sel = [p for p in pairs if p[0] in member and p[1] in member]
                 fine = max((p[3] for p in sel), default=0)
-                coarse = max((p[2] for p in sel), default=0)
+                ncc = min((p[5] for p in sel), default=1.0)
+                sim = min((pair_similarity(p[3], p[5]) for p in sel),
+                          default=0)
                 group = DupGroup(
-                    KIND_PHOTO, items, max(0, 100 - round(fine / 2.56)),
-                    f"位差 {coarse}/64 · pHash {fine}/256")
+                    KIND_PHOTO, items, max(0, sim),
+                    f"结构吻合 {ncc:.0%} · 细节差 {fine}/256")
                 if group.similarity < SIMILARITY_AUTO_SELECT:
                     group.select_by_default = False
                     group.note += "（相似度低于 95%，默认不勾选）"
@@ -559,11 +573,15 @@ __all__ = [
     "is_video",
     "make_thumbnail",
     "name_key",
+    "norm_path",
     "np",
     "permanent_delete",
+    "recycle_capable",
     "recycle_paths",
+    "verify_recycled",
     "restore_from_recycle",
     "restore_hardlinks",
     "scan_folder",
+    "should_skip_dir",
     "video_available",
 ]

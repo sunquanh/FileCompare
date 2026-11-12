@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from dedup_models import app_dir, ignore
+from dedup_models import app_dir, ignore, should_skip_dir
 
 # ---------------------------------------------------------------- 类别表
 CATEGORY = {
@@ -100,6 +100,30 @@ def format_of(suffix: str) -> str:
     return s[1:].upper()
 
 
+def _exif_datetime_raw(image):
+    """读拍摄日期原串。
+
+    旧实现用私有 API `_getexif()`，Pillow 10 起已移除，于是「优先拍摄日期」
+    静默失效、全部退回文件修改时间。这里用公开的 getexif()。
+    """
+    for getter in ("getexif", "_getexif"):
+        try:
+            accessor = getattr(image, getter, None)
+            data = accessor() if callable(accessor) else None
+        except Exception:
+            data = None
+        if not data:
+            continue
+        for tag in (36867, 306):
+            try:
+                value = data.get(tag)
+            except Exception:
+                value = None
+            if value:
+                return value
+    return None
+
+
 def _exif_date(path: Path):
     try:
         from PIL import Image
@@ -110,8 +134,7 @@ def _exif_date(path: Path):
                                        ".png", ".webp", ".heic", ".heif"):
             return None
         with Image.open(path) as image:
-            exif = getattr(image, "_getexif", lambda: None)() or {}
-            raw = exif.get(36867) or exif.get(306)
+            raw = _exif_datetime_raw(image)
             if not raw:
                 return None
             return datetime.strptime(str(raw)[:10], "%Y:%m:%d")
@@ -131,7 +154,9 @@ def collect_all(root: Path, recursive: bool = True, cancel=None,
         directory = Path(dirpath)
         if recursive:
             dirnames[:] = [d for d in dirnames
-                           if d not in SKIP_DIRS and not d.startswith(("~$", "."))]
+                           if not d.startswith(("~$", "."))
+                           and not should_skip_dir(
+                               d, len(directory.parts) - len(root.parts) + 1)]
         else:
             dirnames[:] = []
         if with_dirs:
@@ -234,8 +259,17 @@ def apply_organize_plan(rows, action: str = "move", on_progress=None,
             else:
                 shutil.copy2(str(source), str(target_path))
             done += 1
-            records.append({"act": action, "src": str(source),
-                            "dst": str(target_path)})
+            record = {"act": action, "src": str(source),
+                      "dst": str(target_path)}
+            if action != "move":
+                # 记下复制件的大小/时间，撤销时据此确认没被改动过
+                try:
+                    st = target_path.stat()
+                    record["size"] = int(st.st_size)
+                    record["mtime"] = float(st.st_mtime)
+                except OSError as exc:
+                    ignore(__name__, exc)
+            records.append(record)
             if on_record is not None and done % 100 == 0:
                 on_record(records)
         except Exception as exc:
@@ -557,10 +591,78 @@ def read_manifest(path: Path) -> dict:
         return json.load(handle)
 
 
+def _copy_still_ours(record) -> bool:
+    """撤销「复制」前确认目标还是当初复制的那份。
+
+    旧实现直接 unlink：用户整理后又编辑过目标文件，撤销会把编辑结果删掉。
+    """
+    try:
+        st = Path(record["dst"]).stat()
+    except (OSError, KeyError):
+        return False
+    size = record.get("size")
+    mtime = record.get("mtime")
+    if size is None:
+        return True          # 旧记录没有校验信息，保持原行为
+    if int(st.st_size) != int(size):
+        return False
+    if mtime is not None and abs(float(st.st_mtime) - float(mtime)) > 2.0:
+        return False
+    return True
+
+
+def _undo_renames(records, cancel=None):
+    """两阶段撤销改名：支持 A↔B 互换与仅大小写改动。
+
+    单阶段判断「目标存在且源不存在」在 Windows 上必然失败：大小写改名时
+    新旧路径指向同一个文件，互换时两个位置都有文件——实测撤销一直是静默
+    跳过（0 成功、0 失败、N 跳过），用户以为撤销了其实没有。
+    """
+    done = failed = skipped = 0
+    staged = []
+    for record in records:
+        _check_cancel(cancel)
+        try:
+            source = Path(record["src"])
+            destination = Path(record["dst"])
+        except Exception:
+            failed += 1
+            continue
+        if not destination.exists():
+            skipped += 1
+            continue
+        temp = destination.with_name(f".dedupundo-{uuid.uuid4().hex[:10]}")
+        try:
+            os.rename(destination, temp)
+        except OSError:
+            failed += 1
+            continue
+        staged.append((source, destination, temp))
+    for source, destination, temp in staged:
+        _check_cancel(cancel)
+        try:
+            if source.exists():
+                # 原位置被别的文件占了：放回改名后的位置，绝不覆盖
+                os.rename(temp, destination)
+                skipped += 1
+                continue
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(temp, source)
+            done += 1
+        except Exception:
+            try:
+                if temp.exists() and not destination.exists():
+                    os.rename(temp, destination)
+            except OSError as exc:
+                ignore(__name__, exc)
+            failed += 1
+    return done, failed, skipped
+
+
 def undo_manifest(path: Path, on_progress=None, cancel=None):
     """撤销一次整理/重命名/清理记录。返回 (done, failed, skipped)。
 
-    原位置已有同名文件时跳过（绝不覆盖）。
+    原位置已有同名文件时跳过（绝不覆盖）；改名走两阶段执行。
     """
     data = read_manifest(path)
     if not isinstance(data, dict):
@@ -570,11 +672,15 @@ def undo_manifest(path: Path, on_progress=None, cancel=None):
         raise ValueError(f"操作记录损坏：{path.name} 的 items 不是列表")
     items = list(items)
     items.reverse()
-    done, failed, skipped = 0, 0, 0
     total = len(items)
-    touched: set[Path] = set()
+    rename_records = [r for r in items
+                      if isinstance(r, dict) and r.get("act") == "rename"]
+    rest = [r for r in items
+            if not (isinstance(r, dict) and r.get("act") == "rename")]
+    done, failed, skipped = _undo_renames(rename_records, cancel)
+    touched: set = set()
     root = data.get("root")
-    for index, record in enumerate(items):
+    for index, record in enumerate(rest):
         _check_cancel(cancel)
         try:
             source = Path(record["src"])
@@ -587,18 +693,12 @@ def undo_manifest(path: Path, on_progress=None, cancel=None):
                     source.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(destination), str(source))
                     done += 1
-            elif record["act"] == "rename":
-                if destination.exists() and not source.exists():
-                    os.rename(destination, source)
-                    done += 1
-                else:
-                    skipped += 1
             elif record["act"] == "copy":
-                if destination.exists():
+                if not destination.exists() or not _copy_still_ours(record):
+                    skipped += 1
+                else:
                     destination.unlink()
                     done += 1
-                else:
-                    skipped += 1
             else:
                 skipped += 1
         except Exception:

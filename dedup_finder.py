@@ -63,14 +63,30 @@ def safe_name(path: Path, used: set, index: int) -> str:
 
 
 def materialize(groups, out_dir: Path, kind: str, mode: str):
-    """把每组文件放进 团NN 子目录。返回记录行。"""
+    """把每组文件放进 团NN 子目录。返回 (记录行, 跳过统计)。
+
+    与图形界面保持同一套安全闸：保护/参考目录里的文件不动，非默认勾选的组
+    （相似度低于阈值的照片、未做声学指纹的音频、同名与目录组）整组跳过。
+    旧实现无条件搬走组内全部文件，一条 --mode move 就绕过了界面全部护栏。
+    """
     rows = []
     base = out_dir / kind
-    for index, group in enumerate(groups, 1):
+    protected = 0
+    low_confidence = 0
+    index = 0
+    for group in groups:
+        items = [item for item in group.items if not item.protected]
+        protected += len(group.items) - len(items)
+        # 参考/保护目录的文件被摘掉后只剩一个时，它仍是这组里可清理的冗余副本
+        only_copy_left = bool(items) and len(items) < len(group.items)
+        if not group.select_by_default or (len(items) < 2 and not only_copy_left):
+            low_confidence += len(items)
+            continue
+        index += 1
         group_dir = base / f"团{index:02d}"
         group_dir.mkdir(parents=True, exist_ok=True)
         used: set = set()
-        for order, item in enumerate(group, 1):
+        for order, item in enumerate(items, 1):
             target = group_dir / safe_name(item.path, used, order)
             try:
                 if mode == "move":
@@ -90,7 +106,7 @@ def materialize(groups, out_dir: Path, kind: str, mode: str):
                 "大小MB": round(item.size / 1048576, 2),
                 "原始路径": str(item.path), "放入": str(target),
             })
-    return rows
+    return rows, {"protected": protected, "low_confidence": low_confidence}
 
 
 def collect_files_in(root: Path, out_dir: Path):
@@ -100,8 +116,10 @@ def collect_files_in(root: Path, out_dir: Path):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True,
                                                 followlinks=False):
         directory = Path(dirpath)
+        depth = len(directory.parts) - len(Path(root).parts) + 1
         dirnames[:] = [d for d in dirnames
-                       if d not in core.SKIP_DIRS and not d.startswith("_重复")]
+                       if not d.startswith("_重复")
+                       and not core.should_skip_dir(d, depth)]
         if str(directory).lower().startswith(out_key.lower()):
             continue
         for name in filenames:
@@ -138,6 +156,9 @@ def main():
     parser.add_argument("--no-photo", action="store_true")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--exclude", default="", help="额外排除的目录名，逗号分隔")
+    parser.add_argument("--reference", default="",
+                        help="参考目录：只作为保留基准参与比对，永不清理"
+                             "（可在扫描目录之外），多个用逗号分隔")
     parser.add_argument("--organize", action="store_true",
                         help="顺便把不重复的文件按 类别/格式 归档")
     parser.add_argument("--organize-mode", choices=["link", "copy", "move"],
@@ -182,6 +203,8 @@ def main():
         vid_dist=args.vid_dist,
         min_size=args.min_size,
         exclude=exclude,
+        reference_dirs=tuple(x.strip()
+                             for x in args.reference.split(",") if x.strip()),
         workers=args.workers or 0,
     )
 
@@ -208,13 +231,18 @@ def main():
 
     summary = {}
     rows = []
+    skipped_protected = 0
+    skipped_low = 0
     for kind in (core.KIND_EXACT, core.KIND_PHOTO, core.KIND_VIDEO):
         groups = [g for g in result.groups if g.kind == kind]
         if not groups:
             continue
         summary[kind] = (len(groups), sum(len(g.items) for g in groups),
                          sum(g.wasted for g in groups))
-        rows += materialize([g.items for g in groups], out_dir, kind, args.mode)
+        kind_rows, skipped = materialize(groups, out_dir, kind, args.mode)
+        rows += kind_rows
+        skipped_protected += skipped["protected"]
+        skipped_low += skipped["low_confidence"]
 
     log()
     for kind, (groups, files, wasted) in summary.items():
@@ -261,6 +289,11 @@ def main():
                 continue
         log(f"  归档: {moved} 个文件")
 
+    if skipped_low:
+        log(f"  已跳过 {skipped_low} 个低置信文件（相似度不足或未做声学比对，"
+            "与界面默认不勾选一致）")
+    if skipped_protected:
+        log(f"  已跳过 {skipped_protected} 个保护/参考目录里的文件")
     if rows:
         report = out_dir / "报告.csv"
         with open(report, "w", newline="", encoding="utf-8-sig") as handle:

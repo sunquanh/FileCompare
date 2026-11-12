@@ -887,7 +887,7 @@ class Segmented(tk.Canvas):
                  height=34, size=9, padding=13, bg=None, fill=None):
         self.theme = theme
         self.options = [(o, o) if isinstance(o, str) else tuple(o) for o in options]
-        self.value = value if value is not None else self.options[0][0]
+        self.value = self._coerce(value)
         self.command = command
         self.font = theme.font(size, "normal")
         self.h = theme.s(height)
@@ -987,8 +987,26 @@ class Segmented(tk.Canvas):
                        takefocus=1 if enabled else 0)
         self._draw()
 
+    def _coerce(self, value):
+        """把不在选项里的值落到最近的合法项。
+
+        设置文件可能被手改、或被旧版本写过，值不一定还在当前选项里。
+        原样赋值会让界面没有任何选中高亮，而 value 又会直接传进引擎
+        （例如最小文件大小成了 1 GB，扫描结果几乎全被过滤掉）。
+        """
+        values = [v for v, _label in self.options]
+        if value in values:
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numbers = [v for v in values
+                       if isinstance(v, (int, float))
+                       and not isinstance(v, bool)]
+            if numbers:
+                return min(numbers, key=lambda v: abs(v - value))
+        return values[0]
+
     def set_value(self, value):
-        self.value = value
+        self.value = self._coerce(value)
         self._draw()
 
 

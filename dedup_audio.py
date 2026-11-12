@@ -455,8 +455,10 @@ def cluster_audio(items, dur_tol=4.0):
         if not cur:
             cur = [item]
             continue
-        tol = max(dur_tol, cur[-1].duration * 0.02)
-        if item.duration - cur[-1].duration <= tol:
+        # 与组内首项比较：跟 cur[-1] 比会链式漂移，100/103/106 秒的三个
+        # 版本会被并成一组（首尾差 6 秒 > 4 秒容差）。
+        tol = max(dur_tol, cur[0].duration * 0.02)
+        if item.duration - cur[0].duration <= tol:
             cur.append(item)
         else:
             groups.append(cur)
