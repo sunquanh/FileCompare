@@ -648,6 +648,29 @@ def _rect_v(n, frac, pos):
     return 0, n, x0, x0 + w
 
 
+def _ext_windows(n):
+    """偏心 + 矩形窗口表（只依赖 n 与常量 ZOOM_EXT_SCALES/ZOOM_RECT_FRACS）。
+    缩略图固定 64×64，n=64 的表全库共用，不用每对重建。"""
+    wins = []
+    for z in ZOOM_EXT_SCALES:
+        for py in (0, 1, 2):
+            for px in (0, 1, 2):
+                if py == 1 and px == 1:
+                    continue  # 中心位置已在梯子里
+                y0, y1, x0, x1 = _zoom_rect_sq(n, z, py, px)
+                wins.append((("sq", z, 1.0, py, px), y0, y1, x0, x1))
+    for frac in ZOOM_RECT_FRACS:
+        for pos in (0, 1, 2):
+            y0, y1, x0, x1 = _rect_h(n, frac, pos)
+            wins.append((("rh", frac, pos), y0, y1, x0, x1))
+            y0, y1, x0, x1 = _rect_v(n, frac, pos)
+            wins.append((("rv", frac, pos), y0, y1, x0, x1))
+    return wins
+
+
+_EXT_WINS_64 = _ext_windows(THUMB_SIZE)
+
+
 def _view_rect(thumb, y0, y1, x0, x1, size):
     """矩形区域 → size×size（Pillow 重采样；布局/描述子共用）。"""
     piece = thumb[y0:y1, x0:x1]
@@ -996,7 +1019,10 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
     rot_hp_cache = {}
     ext_hp_cache = {}
     EXT_HP_CACHE_MAX = 8192
+    ZOOM_BIG_CACHE_MAX = 2048  # 大条目缓存上限（ladder 45KB/条、orient 32KB/条）
+    ZOOM_CACHE_MAX = 8192  # 小条目缓存上限（rot_gray/gray 16KB、rot_hp 4KB、dst_mean 2KB）
     ext_means_cache = {}
+    fine_hp_cache = {}
     orient_cache = {}
     gray_cache = {}
 
@@ -1005,7 +1031,8 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         if g is None:
             fp = uniq[pos]
             g = () if fp.thumb is None else _thumb_gray(fp.thumb)
-            gray_cache[pos] = g
+            if len(gray_cache) < ZOOM_CACHE_MAX:
+                gray_cache[pos] = g
         return g
     def _dst_rows(pos):
         """目标图的 8 个方向预展开成 (8, 1024)：缩放搜索里同一张目标图会被
@@ -1018,7 +1045,8 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             else:
                 rows = np.stack([o.ravel() for o in _orients(fp.hp[0])])
                 rows = rows.astype(np.float32)
-            orient_cache[pos] = rows
+            if len(orient_cache) < ZOOM_BIG_CACHE_MAX:
+                orient_cache[pos] = rows
         return rows
 
     def _ladder(pos, inset=1.0):
@@ -1035,7 +1063,8 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 g = _gray(pos)
                 rows = np.stack([zoom_hp_gray(g, z, inset)
                                  for z in ZOOM_LADDER])
-            ladder_cache[key] = rows
+            if len(ladder_cache) < ZOOM_BIG_CACHE_MAX:
+                ladder_cache[key] = rows
         return rows
 
     def _layout_for(src_pos, dst_pos, win):
@@ -1072,7 +1101,7 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         rows = _ladder(src_pos, inset)
         if not len(rows):
             return -2.0, 0.0, None
-        ladder = np.stack(rows).reshape(len(rows), -1) @ targets.T
+        ladder = rows.reshape(len(rows), -1) @ targets.T
         scores = [(float(v), float(z))
                   for v, z in zip(ladder.max(axis=1), ZOOM_LADDER)]
         scores.sort(reverse=True)
@@ -1080,13 +1109,28 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         best_win = ("sq", best_z, inset, 1, 1)
         if best_v >= tol - 0.15:
             thumb = uniq[src_pos].thumb
+            zs = []
             for _, center in scores[:2]:
                 for z in np.arange(center - 0.03, center + 0.0301, 0.01):
-                    v = float((zoom_hp(thumb, float(z), inset).ravel()
-                               @ targets.T).max())
-                    if v > best_v:
-                        best_v, best_z = v, float(z)
-                        best_win = ("sq", best_z, inset, 1, 1)
+                    zs.append(round(float(z), 2))
+            seen = set()
+            uniq_zs = [z for z in zs if not (z in seen or seen.add(z))]
+            vecs = []
+            for z in uniq_zs:
+                key = (src_pos, z, inset)
+                v = fine_hp_cache.get(key)
+                if v is None:
+                    v = zoom_hp(thumb, z, inset).ravel()
+                    if len(fine_hp_cache) < ZOOM_CACHE_MAX:
+                        fine_hp_cache[key] = v
+                vecs.append(v)
+            if vecs:
+                flat = (np.stack(vecs) @ targets.T).max(axis=1)
+                k = int(np.argmax(flat))
+                if flat[k] > best_v:
+                    best_v = float(flat[k])
+                    best_z = uniq_zs[k]
+                    best_win = ("sq", best_z, inset, 1, 1)
         return best_v, best_z, best_win
 
     def _ext_hp(src_pos, cs, y0, y1, x0, x1):
@@ -1128,21 +1172,9 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                          ((1, 0), (1, 0)))
             dm = _mean8_from_cs(dcs, 0, dg.shape[0], 0, dg.shape[1])
             dmean = np.stack([o.ravel() for o in _orients(dm.reshape(8, 8))])
-            dst_mean_cache[dst_pos] = dmean
-        wins = []
-        for z in ZOOM_EXT_SCALES:
-            for py in (0, 1, 2):
-                for px in (0, 1, 2):
-                    if py == 1 and px == 1:
-                        continue  # 中心位置已在梯子里
-                    y0, y1, x0, x1 = _zoom_rect_sq(n, z, py, px)
-                    wins.append((("sq", z, 1.0, py, px), y0, y1, x0, x1))
-        for frac in ZOOM_RECT_FRACS:
-            for pos in (0, 1, 2):
-                y0, y1, x0, x1 = _rect_h(n, frac, pos)
-                wins.append((("rh", frac, pos), y0, y1, x0, x1))
-                y0, y1, x0, x1 = _rect_v(n, frac, pos)
-                wins.append((("rv", frac, pos), y0, y1, x0, x1))
+            if len(dst_mean_cache) < ZOOM_CACHE_MAX:
+                dst_mean_cache[dst_pos] = dmean
+        wins = _EXT_WINS_64 if n == THUMB_SIZE else _ext_windows(n)
         if not wins:
             return -2.0, None
         means = ext_means_cache.get(src_pos)
@@ -1155,20 +1187,23 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         top = np.argsort(-coarse)[:ZOOM_EXT_TOPK]
         best_v = -2.0
         best_win = None
-        for k in top:
-            win, y0, y1, x0, x1 = wins[int(k)]
-            v = float((_ext_hp(src_pos, cs, y0, y1, x0, x1)
-                       @ targets.T).max())
-            if v > best_v:
-                best_v, best_win = v, win
+        vecs = [_ext_hp(src_pos, cs, *wins[int(k)][1:]) for k in top]
+        flat = (np.stack(vecs) @ targets.T).max(axis=1)
+        k = int(np.argmax(flat))
+        best_v = float(flat[k])
+        best_win = wins[int(top[k])][0]
         if best_win is not None and best_win[0] == "sq" and best_v >= tol - 0.15:
             _, z0, _, py, px = best_win
-            for z in np.arange(z0 - 0.03, z0 + 0.0301, 0.01):
-                y0, y1, x0, x1 = _zoom_rect_sq(n, float(z), py, px)
-                v = float((_ext_hp(src_pos, cs, y0, y1, x0, x1)
-                           @ targets.T).max())
-                if v > best_v:
-                    best_v, best_win = v, ("sq", float(z), 1.0, py, px)
+            zs = [float(z) for z in np.arange(z0 - 0.03, z0 + 0.0301, 0.01)]
+            vecs = []
+            for z in zs:
+                y0, y1, x0, x1 = _zoom_rect_sq(n, z, py, px)
+                vecs.append(_ext_hp(src_pos, cs, y0, y1, x0, x1))
+            flat = (np.stack(vecs) @ targets.T).max(axis=1)
+            k = int(np.argmax(flat))
+            if flat[k] > best_v:
+                best_v = float(flat[k])
+                best_win = ("sq", zs[k], 1.0, py, px)
         return best_v, best_win
 
     def _rotation_search(src_pos, dst_pos, targets, tol, best_z):
@@ -1186,12 +1221,15 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         best_v = -2.0
         best_win = None
         best_zz = 0.0
+        combos = []
+        vecs = []
         for angle in ROT_ANGLES:
             key = (src_pos, angle)
             g = rot_gray_cache.get(key)
             if g is None:
                 g = _thumb_gray(_rot_thumb(src.thumb, angle))
-                rot_gray_cache[key] = g
+                if len(rot_gray_cache) < ZOOM_CACHE_MAX:
+                    rot_gray_cache[key] = g
             for z in (1.0, best_z):
                 if z <= 0:
                     continue
@@ -1199,10 +1237,17 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 hp = rot_hp_cache.get(hp_key)
                 if hp is None:
                     hp = zoom_hp_gray(g, z).ravel()
-                    rot_hp_cache[hp_key] = hp
-                v = float((hp @ targets.T).max())
-                if v > best_v:
-                    best_v, best_win, best_zz = v, ("rot", angle, z), z
+                    if len(rot_hp_cache) < ZOOM_CACHE_MAX:
+                        rot_hp_cache[hp_key] = hp
+                combos.append((angle, z))
+                vecs.append(hp)
+        if vecs:
+            flat = (np.stack(vecs) @ targets.T).max(axis=1)
+            k = int(np.argmax(flat))
+            best_v = float(flat[k])
+            angle, z = combos[k]
+            best_win = ("rot", angle, z)
+            best_zz = z
         return best_v, best_zz, best_win
 
     def _zoom_second_chance(src_pos, dst_pos, win, best_v):

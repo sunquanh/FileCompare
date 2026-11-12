@@ -259,11 +259,21 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         emit("photo", 0, len(todo_photos), "正在计算照片指纹…")
         tag = CACHE_TAGS["photo"]
 
+        stale_photo_lock = threading.Lock()
+        stale_photo_logged = []
+
         def photo_work(item):
             hit = cache.get(item, tag)
             if hit:
                 try:
                     return PhotoFP.from_cache(hit)
+                except ValueError as exc:
+                    if "旧格式" in str(exc):
+                        with stale_photo_lock:
+                            if not stale_photo_logged:
+                                stale_photo_logged.append(True)
+                                say("照片指纹缓存是旧格式，正在重新生成（本次会比平时慢）")
+                    ignore(__name__, exc)
                 except Exception as exc:
                     ignore(__name__, exc)
             fp = photo_fingerprint(item.path, options.max_image_edge)
