@@ -4,7 +4,6 @@
 """
 from __future__ import annotations
 
-import gc
 import json
 import math
 import os
@@ -20,36 +19,15 @@ from pathlib import Path
 from tkinter import filedialog
 
 try:
-    from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageGrab
-    from PIL import ImageOps, ImageTk
+    from PIL import Image, ImageChops, ImageGrab, ImageOps, ImageTk
 except Exception:  # pragma: no cover
     Image = None
     ImageChops = None
-    ImageColor = None
-    ImageDraw = None
     ImageGrab = None
     ImageTk = None
 
 try:
-    import ctypes
-    from ctypes import wintypes
-
-    class _MonitorInfo(ctypes.Structure):
-        """MONITORINFO：只要 rcWork 那段可用区域。"""
-
-        _fields_ = [("cbSize", wintypes.DWORD),
-                    ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT),
-                    ("dwFlags", wintypes.DWORD)]
-except Exception:  # pragma: no cover - 非 Windows 平台
-    ctypes = None
-    wintypes = None
-    _MonitorInfo = None
-
-try:
     import dedup_core as core
-    import dedup_models as models
-    import dedup_photos as photos
     import dedup_tools as tools
     from ui_kit import (
         ICON,
@@ -101,8 +79,6 @@ APP_CN = "重复文件清理器"
 VERSION = "2.6"
 SETTINGS_PATH = core.app_dir() / "dedup_settings.json"
 LEGACY_SETTINGS = Path(__file__).resolve().with_name("dedup_settings.json")
-# 「只看差异」把没差异的区域压到的亮度比例，界面上按百分比给三档
-DIM_DEFAULT = 0.62
 
 DEFAULTS = {
     "last_dir": "",
@@ -117,6 +93,7 @@ DEFAULTS = {
     "audio": True,
     "names": True,
     "names_fuzzy": False,
+    "crop_auto_select": False,
     "protect": "",
     "reference": "",
     "quick_scan": False,
@@ -171,36 +148,9 @@ def load_settings():
 
 
 def save_settings(data):
-    """写设置文件。
-
-    先写临时文件再原子替换：直接覆盖时若恰好崩溃/断电，会留下半截 JSON，
-    下次启动整份设置（含保护目录列表）就全丢了。
-    """
     try:
-        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temp = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".tmp")
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        temp.replace(SETTINGS_PATH)
-    except Exception:
-        pass
-
-
-def write_crash_log(text: str) -> None:
-    """把异常堆栈写进数据目录。
-
-    打包成 exe 后没有控制台，traceback.print_exc() 等于把错误丢掉，
-    出问题时既看不到也查不到。
-    """
-    try:
-        path = core.app_dir() / "dedup_error.log"
-        try:
-            if path.exists() and path.stat().st_size > (2 << 20):
-                path.unlink()
-        except OSError:
-            pass
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write("\n" + str(text).rstrip() + "\n")
+        SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
     except Exception:
         pass
 
@@ -799,12 +749,7 @@ class App(tk.Tk):
                 try:
                     self._handle_event(event)
                 except Exception:
-                    tb = traceback.format_exc()
-                    write_crash_log("界面事件处理失败\n" + tb)
-                    try:
-                        self.log("内部错误：" + tb.strip().splitlines()[-1], "err")
-                    except Exception:
-                        pass
+                    traceback.print_exc()
         except queue.Empty:
             pass
         self.after(45, self._poll)
@@ -1030,8 +975,17 @@ class ScanPage(tk.Frame):
             d, "完全重复", "字节完全一致的文件，零误判", "document",
             t.ACCENT, t.KIND_EXACT_DIM, bool(self.settings.get("exact", True)))
         self.sw_photo = self._detect_row(
-            d, "相似照片", "同一张图的不同尺寸、压缩或格式版本", "image",
+            d, "相似照片", "同一张图的不同压缩、格式版本", "image",
             t.AMBER, t.AMBER_DIM, bool(self.settings.get("photos", True)))
+        crop_row = tk.Frame(d, bg=t.CARD)
+        crop_row.pack(fill="x", pady=(s(2), 0), padx=(s(44), 0))
+        tk.Label(crop_row, text="裁边组也默认勾选", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(8), anchor="w").pack(side="left", fill="x",
+                                                   expand=True)
+        self.sw_crop = Switch(crop_row, t,
+                              value=bool(self.settings.get("crop_auto_select", False)),
+                              bg=t.CARD)
+        self.sw_crop.pack(side="right")
         self.sw_video = self._detect_row(
             d, "重复视频", "时长与关键帧接近的视频，速度较慢", "video",
             t.VIOLET, t.KIND_VIDEO_CHIP, bool(self.settings.get("videos", True)))
@@ -1129,7 +1083,7 @@ class ScanPage(tk.Frame):
                  bg=t.CARD, fg=t.FAINT, font=t.font(8), anchor="w").pack(
             fill="x", pady=(s(2), 0))
 
-        tk.Label(o, text="参考目录（只比对、不清理，可放在扫描目录之外）", bg=t.CARD, fg=t.TEXT_DIM,
+        tk.Label(o, text="参考目录（只比对、不清理）", bg=t.CARD, fg=t.TEXT_DIM,
                  font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         rf_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
                             highlightbackground=t.BORDER,
@@ -1347,6 +1301,7 @@ class ScanPage(tk.Frame):
             "audio": bool(self.sw_audio.value),
             "names": bool(self.sw_name.value),
             "names_fuzzy": bool(self.sw_fuzzy.value),
+            "crop_auto_select": bool(self.sw_crop.value),
         }
 
     def _save_presets(self):
@@ -1424,7 +1379,8 @@ class ScanPage(tk.Frame):
                           ("sw_exact", "exact"), ("sw_photo", "photos"),
                           ("sw_video", "videos"), ("sw_audio", "audio"),
                           ("sw_name", "names"), ("sw_fuzzy", "names_fuzzy")):
-            getattr(self, attr).set(bool(data.get(key, DEFAULTS[key])))
+            getattr(self, attr).set(bool(data.get(key, True)))
+        self.sw_crop.set(bool(data.get("crop_auto_select", False)))
         if not core.video_available():
             self.sw_video.set(False)
         self.app.log(f"已载入扫描方案：{name}", "info")
@@ -1492,6 +1448,7 @@ class ScanPage(tk.Frame):
             audio=bool(self.sw_audio.value),
             names=bool(self.sw_name.value),
             names_fuzzy=bool(self.sw_fuzzy.value),
+            crop_auto_select=bool(self.sw_crop.value),
             cache=bool(self.sw_cache.value),
             img_dist=preset_vals["img_dist"],
             img_fine=preset_vals["img_fine"],
@@ -1532,6 +1489,7 @@ class ScanPage(tk.Frame):
             "audio": opts.audio,
             "names": opts.names,
             "names_fuzzy": opts.names_fuzzy,
+            "crop_auto_select": opts.crop_auto_select,
             "cache": opts.cache,
             "keep_rule": opts.keep_rule,
         })
@@ -2376,20 +2334,9 @@ class ResultsPage(tk.Frame):
         self.app.toast(f"已保留「{group.items[index].name}」", "ok", 1800)
 
     def reset_group(self, card):
-        """恢复这一组的默认状态：保留项按当前策略重挑，勾选回到默认。"""
         group = card.group
-        root = self.result.root if self.result else None
-        group.keep = core._pick_keep(group.kind, group.items, self.keep_rule,
-                                     root)
         self.selection -= {str(i.path) for i in group.items}
         self.selection |= group.default_selection()
-        card.refresh()
-        self._update_footer()
-
-    def clear_group(self, card):
-        """只取消这一组的勾选，保留项保持不变。"""
-        group = card.group
-        self.selection -= {str(i.path) for i in group.items}
         card.refresh()
         self._update_footer()
 
@@ -2505,7 +2452,7 @@ class ResultsPage(tk.Frame):
         group = getattr(card, "group", None)
         if not group or len(group.items) < 2:
             return None
-        dialog = CompareDialog(self.app, group, options=self.options)
+        dialog = CompareDialog(self.app, group)
         self.app.log(f"对比：{group.kind} · {len(group.items)} 个文件", "info")
         return dialog
 
@@ -2661,40 +2608,6 @@ class ResultsPage(tk.Frame):
             return
         if blocked:
             self.app.log(f"已跳过 {len(blocked)} 个保护/保留/目录项", "warn")
-        if recycle:
-            # 回收站被关闭 / 卷不是 NTFS 或 ReFS / 配额不足时，系统会静默
-            # 永久删除。先预检，把这类文件单独问一遍，不能当成可还原。
-            ok, not_recyclable = core.recycle_capable(paths)
-            if not_recyclable:
-                names = "\n".join(f"{Path(p).name}：{why}"
-                                  for p, why in not_recyclable[:5])
-                more = (f"\n… 还有 {len(not_recyclable) - 5} 个"
-                        if len(not_recyclable) > 5 else "")
-                choice = confirm(
-                    self.app, self.theme,
-                    f"{len(not_recyclable)} 个文件无法进入回收站",
-                    f"这些位置没有可用的回收站：\n{names}{more}\n\n"
-                    "继续只会处理其余文件；坚持处理这些的话，它们会被永久删除"
-                    "且无法恢复。",
-                    ok_text="跳过它们", cancel_text="取消",
-                    extra_text="仍然永久删除…", danger=True, icon="warning")
-                if choice == "extra":
-                    again = confirm(
-                        self.app, self.theme, "永久删除这些文件？",
-                        f"{len(not_recyclable)} 个文件将直接删除，"
-                        "不会进入回收站，也无法恢复。",
-                        ok_text="永久删除", cancel_text="返回", danger=True,
-                        icon="warning",
-                        note="建议先移到 NTFS 盘或开启回收站后再清理。")
-                    if again == "ok":
-                        self._delete([p for p, _ in not_recyclable],
-                                     recycle=False)
-                elif choice != "ok":
-                    return
-                paths = ok
-                if not paths:
-                    self.app.toast("没有可以安全移入回收站的文件", "warn")
-                    return
         # 先按计划写一份记录：删一半被杀也能撤销已进回收站的部分
         try:
             planned = [{"act": "recycle" if recycle else "delete",
@@ -2736,28 +2649,9 @@ class ResultsPage(tk.Frame):
         self.app.set_status("引擎就绪", t.GREEN)
         deleted_set = set(deleted)
         freed = sum(self._size_map.get(p, 0) for p in deleted_set)
-        # 永久删除没有任何东西进回收站：不能默认当成可还原，
-        # 否则记录会写成 recycle、撤销按钮也会亮起来
-        recycled, gone = (set(deleted), set()) if recycle else (set(), set())
-        if deleted and recycle:
-            # SHFileOperationW 返回 0 只代表「删除成功」，不代表进了回收站
-            try:
-                recycled, gone = core.verify_recycled(deleted)
-            except Exception:
-                recycled, gone = set(deleted), set()
-        if gone:
-            self.app.log(f"注意：{len(gone)} 个文件没有进入回收站，已被永久删除",
-                         "err")
-            names = "\n".join(Path(p).name for p in list(gone)[:6])
-            try:
-                alert(self.app, t, f"{len(gone)} 个文件未进入回收站",
-                      "回收站被关闭或超出配额，这些文件已被永久删除，"
-                      "无法还原。\n\n" + names, icon="warning")
-            except Exception:
-                pass
         if deleted:
             try:
-                records = [{"act": "recycle" if p in recycled else "delete",
+                records = [{"act": "recycle" if recycle else "delete",
                             "src": p, "size": self._size_map.get(p, 0)}
                            for p in deleted]
                 if getattr(self, "_cleanup_partial", None) is not None:
@@ -2767,7 +2661,7 @@ class ResultsPage(tk.Frame):
                     self._last_cleanup = tools.save_manifest(
                         "cleanup", self.result.root if self.result else Path("."),
                         records)
-                self.btn_undo_clean.set_enabled(bool(recycled))
+                self.btn_undo_clean.set_enabled(bool(recycle))
             except Exception:
                 pass
         self._cleanup_partial = None
@@ -2958,11 +2852,10 @@ class ResultsPage(tk.Frame):
 class CompareDialog(tk.Toplevel):
     """并排对比同一组里的两个文件：同步缩放、拖拽平移、可选差异热图。"""
 
-    def __init__(self, app, group, options=None):
+    def __init__(self, app, group):
         super().__init__(app)
         t = app.theme
         self.app = app
-        self.options = options
         self.theme = t
         self.group = group
         others = [i for i in range(len(group.items)) if i != group.keep]
@@ -2971,32 +2864,19 @@ class CompareDialog(tk.Toplevel):
         self.pan = [[0.0, 0.0], [0.0, 0.0]]
         self._drag = None
         self._diff = tk.BooleanVar(value=False)
-        self._zones = tk.BooleanVar(value=False)
-        self._only = tk.BooleanVar(value=False)
-        self._zone_stats = None
-        self._zone_key = None
-        self._zone_data = []
-        self._tip = None
-        self._tip_label = None
         self._raw = [None, None]
         self._photos = [None, None]
         self._retries = 0
-        self._loading = True
-        self._loaded = None
-        self._load_job = None
-        self._load_gen = 0
         self.title(f"对比 · {group.kind} · {len(group.items)} 个文件")
         self.configure(bg=t.BG)
         self.minsize(t.s(720), t.s(520))
         self.geometry(f"{t.s(1120)}x{t.s(780)}")
         self.transient(app.winfo_toplevel())
         self._build()
-        self.after(60, lambda: enable_dark_titlebar(self, dark=(app.theme_name == "dark")))
-        self._draw_job = None
+        self.after(60, lambda: enable_dark_titlebar(self, dark=(self.theme_name == "dark")))
         self.bind("<Escape>", lambda e: self.close())
         self.bind("<Left>", lambda e: self._cycle(-1))
         self.bind("<Right>", lambda e: self._cycle(1))
-        self.bind("<Destroy>", self._cancel_all)
         self._load()
 
     # -------------------------------------------------- 构建
@@ -3016,16 +2896,6 @@ class CompareDialog(tk.Toplevel):
         self.title_right = tk.Label(head, bg=t.BG, fg=t.TEXT, font=t.font(10, "bold"),
                                     anchor="e")
         self.title_right.pack(side="right")
-        # 操作说明放这里：页脚要留给勾选框和按钮，窄窗口下最先被裁的是页脚文字
-        self.nav_hint = tk.Label(head, bg=t.BG, fg=t.MUTED, font=t.font(8),
-                                 anchor="w", text="滚轮缩放 · ←→ 切换版本")
-        self.nav_hint.pack(side="left", padx=(s(16), 0))
-        # 压暗强度：亮度百分比，越小压得越狠。只在「只看差异」开启时出现。
-        self.dim_seg = Segmented(
-            head, t,
-            options=[(0.45, "45%"), (0.62, "62%"), (0.80, "80%")],
-            value=DIM_DEFAULT, command=self._set_dim,
-            height=26, size=8, padding=10, bg=t.BG)
 
         body = tk.Frame(self, bg=t.BORDER_SOFT)
         body.pack(fill="both", expand=True, padx=s(16), pady=s(8))
@@ -3040,9 +2910,6 @@ class CompareDialog(tk.Toplevel):
                         pady=0)
             canvas.bind("<Configure>", lambda e: self._draw())
             canvas.bind("<MouseWheel>", self._wheel)
-            if side == 1:
-                canvas.bind("<Motion>", self._hover_zone)
-                canvas.bind("<Leave>", lambda e: self._hide_tip())
             canvas.bind("<ButtonPress-1>", self._press)
             canvas.bind("<B1-Motion>", self._move)
             canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
@@ -3051,101 +2918,38 @@ class CompareDialog(tk.Toplevel):
         foot = tk.Frame(self, bg=t.BG)
         foot.pack(fill="x", padx=s(16), pady=(s(4), s(14)))
         self.meta = tk.Label(foot, bg=t.BG, fg=t.MUTED, font=t.font(8), anchor="w")
-        self.zone_hint = tk.Label(foot, bg=t.BG, fg=t.MUTED,
-                                  font=t.font(8), anchor="w")
+        self.meta.pack(side="left")
         for text, command, kind in (
                 ("关闭", self.close, "ghost"),
                 ("定位", self._reveal, "ghost"),
-                ("导出对比图", self._export, "ghost"),
                 ("打开", self._open, "ghost"),
                 ("100%", lambda: self._set_zoom(1.0), "ghost"),
                 ("适应窗口", lambda: self._set_zoom(0.0), "ghost")):
             btn = CanvasButton(foot, t, text, command=command, kind=kind,
                                height=34, size=8, bg=t.BG, padding=12)
             btn.pack(side="right", padx=(s(6), 0))
-        self.only_check = tk.Checkbutton(
-            foot, text="只看差异", variable=self._only,
-            command=self._toggle_only, bg=t.BG, fg=t.MUTED,
-            activebackground=t.BG, activeforeground=t.TEXT,
-            selectcolor=t.CARD, font=t.font(8), bd=0, highlightthickness=0,
-            cursor="hand2", state="disabled")
-        self.only_check.pack(side="right", padx=(s(10), 0))
-        zones = tk.Checkbutton(foot, text="差异区域", variable=self._zones,
-                               command=self._toggle_zones, bg=t.BG,
-                               fg=t.MUTED, activebackground=t.BG,
-                               activeforeground=t.TEXT, selectcolor=t.CARD,
-                               font=t.font(8), bd=0, highlightthickness=0,
-                               cursor="hand2")
-        zones.pack(side="right", padx=(s(10), 0))
         diff = tk.Checkbutton(foot, text="差异热图", variable=self._diff,
-                              command=self._toggle_heat, bg=t.BG, fg=t.MUTED,
+                              command=self._draw, bg=t.BG, fg=t.MUTED,
                               activebackground=t.BG, activeforeground=t.TEXT,
                               selectcolor=t.CARD, font=t.font(8), bd=0,
                               highlightthickness=0, cursor="hand2")
         diff.pack(side="right", padx=(s(10), s(6)))
-        # 左侧文字最后打包：窗口太窄时裁掉的是提示文案，而不是勾选框
-        self.meta.pack(side="left")
-        self.zone_hint.pack(side="left", padx=(s(12), 0))
 
     # -------------------------------------------------- 载入
     def _load(self):
         left, right = self.pair()
         self.title_left.configure(text=left.name)
         self.title_right.configure(text=right.name)
+        self._raw[0] = self._read(left)
+        self._raw[1] = self._read(right)
+        same = (left.size == right.size)
         self.meta.configure(
             text=f"{core.human_size(left.size)} vs {core.human_size(right.size)}"
-                 + f" · 相似度 {self.group.similarity}%")
+                 + f" · 相似度 {self.group.similarity}%"
+                 + (" · 大小相同" if same else "")
+                 + " · 滚轮缩放，拖动平移，左右键切换版本")
         self.zoom = 0.0
         self.pan = [[0.0, 0.0], [0.0, 0.0]]
-        self._loading = True
-        self._load_gen += 1
-        token = self._load_gen
-        self._raw = [None, None]
-        self._draw()
-        # 大图解码要几百毫秒，放主线程会让窗口先假死（旧实现是同步读的）
-        self._loaded = None
-        threading.Thread(target=self._read_both, args=(left, right, token),
-                         daemon=True, name="compare-load").start()
-        self._wait_loaded(token)
-
-    def _read_both(self, left, right, token):
-        # 这个线程里不做循环垃圾回收：万一回收到达 Tk 对象，它的析构会去调
-        # Tcl，而解释器主循环在主线程里跑，两边互等就会一直卡在「正在读取…」。
-        gc.disable()
-        try:
-            images = [self._read(left), self._read(right)]
-        except Exception:
-            images = [None, None]
-        finally:
-            gc.enable()
-        self._loaded = (token, images)
-
-    def _wait_loaded(self, token):
-        """主线程轮询解码结果。
-
-        Tk 的 after 不能从工作线程里安全调用：主线程还没进 mainloop 时那次
-        调用会丢，窗口就永远停在「正在读取…」。轮询只碰主线程，没这个缺口。
-        """
-        if token != self._load_gen:
-            return
-        done = self._loaded
-        if done is not None and done[0] == token:
-            self._loaded = None
-            self._apply_loaded(token, done[1])
-            return
-        if self._loading:
-            self._load_job = self.after(20, lambda: self._wait_loaded(token))
-
-    def _apply_loaded(self, token, images):
-        if token != self._load_gen:
-            return          # 用户已经切到别的版本，这批结果过期
-        try:
-            if not self.winfo_exists():
-                return
-        except Exception:
-            return
-        self._raw = images
-        self._loading = False
         self._draw()
 
     @staticmethod
@@ -3169,42 +2973,12 @@ class CompareDialog(tk.Toplevel):
         return None
 
     # -------------------------------------------------- 绘制
-    def _schedule_draw(self):
-        """延迟重绘：只保留一个待执行任务，窗口关掉后不留野回调。"""
-        self._cancel_draw()
-        self._draw_job = self.after(80, self._draw)
-
-    def _cancel_draw(self, event=None):
-        if event is not None and event.widget is not self:
-            return
-        if self._draw_job is not None:
-            try:
-                self.after_cancel(self._draw_job)
-            except Exception:
-                pass
-            self._draw_job = None
-
-    def _cancel_all(self, event=None):
-        """关窗时把排队中的重绘和载入轮询一起取消。
-
-        留着它们，Tk 到点会去执行已销毁窗口的回调，逐个报「invalid command」。
-        """
-        self._cancel_draw(event)
-        if event is not None and event.widget is not self:
-            return
-        if self._load_job is not None:
-            try:
-                self.after_cancel(self._load_job)
-            except Exception:
-                pass
-            self._load_job = None
-
     def _fit_scale(self, side):
         """适应窗口时的缩放比例；画布还没完成布局时返回 0。"""
         image = self._raw[side]
+        canvas = self.canvases[side]
         if image is None:
             return 0.0
-        canvas = self.canvases[side]
         cw, ch = canvas.winfo_width(), canvas.winfo_height()
         if cw < 40 or ch < 40:
             return 0.0
@@ -3217,7 +2991,7 @@ class CompareDialog(tk.Toplevel):
                 for c in self.canvases):
             self._retries += 1
             if self._retries < 40:
-                self._schedule_draw()
+                self.after(80, self._draw)
             return
         self._retries = 0
         if self.zoom > 0:
@@ -3225,10 +2999,7 @@ class CompareDialog(tk.Toplevel):
         else:
             fits = [s for s in (self._fit_scale(0), self._fit_scale(1)) if s > 0]
             if not fits:
-                if self._loading:
-                    for side in (0, 1):
-                        self._draw_side(side, 1.0)
-                self._schedule_draw()
+                self.after(80, self._draw)
                 return
             scale = min(fits)
         for side in (0, 1):
@@ -3243,345 +3014,45 @@ class CompareDialog(tk.Toplevel):
         image = self._raw[side]
         if image is None:
             item = self.pair()[side]
-            if self._loading:
-                text = "正在读取…"
-            elif core.is_photo(item.path):
-                text = "读取失败\n可用“打开”按钮查看原文件"
-            else:
-                text = "这个格式无法直接预览\n可用“打开”按钮查看原文件"
-            canvas.create_text(cw / 2, ch / 2, text=text,
-                               fill=t.MUTED, font=t.font(9),
-                               justify="center")
+            canvas.create_text(
+                cw / 2, ch / 2,
+                text=("这个格式无法直接预览\n" if not core.is_photo(item.path)
+                      else "读取失败\n") + "可用“打开”按钮查看原文件",
+                fill=t.MUTED, font=t.font(9), justify="center")
             return
-        if side == 1 and (self._diff.get() or self._zones.get()):
-            _left, aligned = self._aligned_right()
-            if aligned is not None:
-                image = ((self._difference() or aligned)
-                         if self._diff.get() else aligned)
+        if side == 1 and self._diff.get():
+            image = self._difference() or image
         if scale is None:
             scale = self.zoom if self.zoom > 0 else (self._fit_scale(side) or 1.0)
         size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
         shown = image if size == image.size else image.resize(
             size, Image.Resampling.LANCZOS if scale < 1 else Image.Resampling.NEAREST)
-        if side == 1 and self._zones.get() and self._only.get():
-            shown = self._dim_outside_zones(shown)
         try:
-            # 显式指定 master：不指定就用 tkinter 的默认根窗口，
-            # 测试里窗口一多，默认根可能已经被销毁，图片就绑到死掉的解释器上
-            photo = ImageTk.PhotoImage(shown, master=canvas)
+            photo = ImageTk.PhotoImage(shown)
         except Exception:
             return
         self._photos[side] = photo
         canvas.create_image(cw / 2 + self.pan[side][0], ch / 2 + self.pan[side][1],
                             image=photo, anchor="center")
-        if side == 1 and self._zones.get():
-            self._draw_zone_marks(canvas, cw, ch, size, image)
-
-    def _aligned_right(self):
-        """右图等比缩放后居中贴到左图尺寸的黑底上，不拉伸变形。"""
-        left, right = self._raw[0], self._raw[1]
-        if left is None or right is None:
-            return None, None
-        if right.size == left.size:
-            return left, right
-        ratio = min(left.width / right.width, left.height / right.height)
-        scaled = right.resize(
-            (max(1, int(right.width * ratio)),
-             max(1, int(right.height * ratio))),
-            Image.Resampling.LANCZOS)
-        canvas = Image.new("RGB", left.size, (0, 0, 0))
-        canvas.paste(scaled, ((left.width - scaled.width) // 2,
-                              (left.height - scaled.height) // 2))
-        return left, canvas
-
-    def _toggle_zones(self):
-        self._zone_stats = None
-        self._zone_data = []
-        self._hide_tip()
-        if self._zones.get():
-            # 两种叠加同时开会糊成一片，打开方框就收起热图
-            self._diff.set(False)
-            self.only_check.configure(state="normal")
-        else:
-            self._only.set(False)
-            self.only_check.configure(state="disabled")
-            self.zone_hint.configure(text="")
-        self._sync_dim_seg()
-        self._draw()
-
-    def _toggle_only(self):
-        self._sync_dim_seg()
-        self._draw()
-
-    def _set_dim(self, value):
-        self._draw()
-
-    def _sync_dim_seg(self):
-        """强度预设跟着「只看差异」出现/隐藏，不占别的状态下的位置。"""
-        want = bool(self._zones.get() and self._only.get())
-        shown = bool(self.dim_seg.winfo_manager())
-        if want and not shown:
-            self.dim_seg.pack(side="left", padx=(self.theme.s(14), 0))
-        elif shown and not want:
-            self.dim_seg.pack_forget()
-
-    def _dim_outside_zones(self, image):
-        """把没有差异块的地方压暗，框住的那几块保持原样，扫视时更跳。"""
-        if Image is None or image is None:
-            return image
-        color, corr, _hot_color, _hot_corr = self._zone_maps()
-        if color is None:
-            return image
-        rows, cols = color.shape
-        color_tol, ncc_tol = self._zone_limits()
-        base = image.convert("RGB")
-        dim = base.point(lambda v: int(v * self.dim_seg.value))
-        cw, ch = base.width / cols, base.height / rows
-        for row in range(rows):
-            for col in range(cols):
-                if not (color[row, col] > color_tol or corr[row, col] < ncc_tol):
-                    continue
-                box = (int(round(col * cw)), int(round(row * ch)),
-                       int(round((col + 1) * cw)), int(round((row + 1) * ch)))
-                if box[2] > box[0] and box[3] > box[1]:
-                    dim.paste(base.crop(box), box[:2])
-        return dim
-
-    def _toggle_heat(self):
-        if self._diff.get():
-            self._zones.set(False)
-            self._only.set(False)
-            self.only_check.configure(state="disabled")
-            self._sync_dim_seg()
-            self._zone_stats = None
-            self._zone_data = []
-            self._hide_tip()
-            self.zone_hint.configure(text="")
-        self._draw()
-
-    def _zone_limits(self):
-        """叠加的阈值跟着这次扫描的方案走，宽松档才不会整片标红。"""
-        base = models.PRESETS["standard"]
-        ncc = getattr(self.options, "img_ncc", None)
-        layout = getattr(self.options, "img_layout", None)
-        return (float(base["img_layout"] if layout is None else layout),
-                float(base["img_ncc"] if ncc is None else ncc))
-
-    def _zone_maps(self):
-        limits = self._zone_limits()
-        cells = photos.zone_shape(self._raw[0])
-        key = (id(self._raw[0]), id(self._raw[1]), limits, cells)
-        if self._zone_stats is not None and self._zone_key == key:
-            return self._zone_stats
-        left, right = self._aligned_right()
-        color, corr = photos.block_diff_maps(left, right, cells=cells)
-        self._zone_key = key
-        if color is None:
-            self._zone_stats = (None, None, 0, 0)
-            return self._zone_stats
-        color_tol, ncc_tol = limits
-        self._zone_stats = (color, corr,
-                            int((color > color_tol).sum()),
-                            int((corr < ncc_tol).sum()))
-        return self._zone_stats
-
-    def _draw_zone_marks(self, canvas, cw, ch, size, image):
-        """在右图上按算法用的 8×8 网格标出明显不同的块。
-
-        红框 = 这一块颜色对不上，琥珀框 = 这一块细节对不上；几乎相同的块不画，
-        所以一眼能看出「哪里不一样」。
-        """
-        t = self.theme
-        color, corr, hot_color, hot_corr = self._zone_maps()
-        if color is None or image is None:
-            self.zone_hint.configure(text="")
-            return
-        rows, cols = color.shape
-        color_tol, ncc_tol = self._zone_limits()
-        self._zone_data = []
-        sx = size[0] / image.width
-        sy = size[1] / image.height
-        x0 = cw / 2 + self.pan[1][0] - size[0] / 2
-        y0 = ch / 2 + self.pan[1][1] - size[1] / 2
-        bw = image.width / cols * sx
-        bh = image.height / rows * sy
-        for row in range(rows):
-            for col in range(cols):
-                hot_solid = bool(color[row, col] > color_tol)
-                hot_shape = bool(corr[row, col] < ncc_tol)
-                if not (hot_solid or hot_shape):
-                    continue
-                bx0, by0 = x0 + col * bw, y0 + row * bh
-                bx1, by1 = bx0 + bw, by0 + bh
-                canvas.create_rectangle(
-                    bx0, by0, bx1, by1,
-                    outline=t.RED if hot_solid else t.AMBER, width=2)
-                self._zone_data.append(((bx0, by0, bx1, by1), row, col,
-                                        float(color[row, col]),
-                                        float(corr[row, col])))
-        if not (hot_color or hot_corr):
-            text = "没有明显差异"
-        else:
-            text = f"颜色差 {hot_color} · 细节差 {hot_corr}"
-        self.zone_hint.configure(text=text)
-
-    def export_snapshot(self, path=None):
-        """把左右两张图拼成一张图存下来，开着「差异区域」时把框一起画上。
-
-        导出用的是原图分辨率（不像屏幕那样受缩放影响），所以存档或发给别人
-        时细节还在；单边超过 1200 像素时等比收小，避免文件过大。
-        """
-        if Image is None or ImageDraw is None:
-            return None
-        left, right = self._aligned_right()
-        if left is None or right is None:
-            return None
-        if path is None:
-            path = filedialog.asksaveasfilename(
-                parent=self, title="导出对比图", defaultextension=".png",
-                initialfile=f"对比_{Path(self.pair()[0].path).stem}"
-                            f"_vs_{Path(self.pair()[1].path).stem}.png",
-                filetypes=[("PNG 图片", "*.png"), ("JPEG 图片", "*.jpg")])
-            if not path:
-                return None
-        try:
-            scale = min(1.0, 1200.0 / max(left.width, right.width))
-            panels = []
-            for image in (left, right):
-                size = (max(1, int(image.width * scale)),
-                        max(1, int(image.height * scale)))
-                panels.append(image if size == image.size else image.resize(
-                    size, Image.Resampling.LANCZOS))
-            gap = 8
-            shot = Image.new("RGB", (panels[0].width + gap + panels[1].width,
-                                     max(p.height for p in panels)), (0, 0, 0))
-            shot.paste(panels[0], (0, 0))
-            offset = panels[0].width + gap
-            shot.paste(panels[1], (offset, 0))
-            if self._zones.get():
-                self._draw_export_zones(shot, panels[1], offset)
-            shot.save(path)
-        except Exception as exc:
-            alert(self.app, self.theme, "导出失败",
-                  f"{Path(path).name}\n\n{exc}", icon="warning")
-            return None
-        return path
-
-    def _draw_export_zones(self, shot, panel, offset):
-        """在导出的右图上按同一套阈值画出差异块。"""
-        color, corr, _hot_color, _hot_corr = self._zone_maps()
-        if color is None:
-            return
-        rows, cols = color.shape
-        color_tol, ncc_tol = self._zone_limits()
-        draw = ImageDraw.Draw(shot)
-        bw, bh = panel.width / cols, panel.height / rows
-        for row in range(rows):
-            for col in range(cols):
-                solid = bool(color[row, col] > color_tol)
-                shape = bool(corr[row, col] < ncc_tol)
-                if not (solid or shape):
-                    continue
-                outline = self.theme.RED if solid else self.theme.AMBER
-                draw.rectangle(
-                    (offset + col * bw, row * bh,
-                     offset + (col + 1) * bw, (row + 1) * bh),
-                    outline=self._rgb(outline), width=2)
-
-    def _rgb(self, color):
-        """主题里的颜色是 #rrggbb，画到 PIL 上要先转成三元组。"""
-        try:
-            return ImageColor.getrgb(color)
-        except Exception:
-            return (255, 0, 0)
-
-    def _export(self):
-        path = self.export_snapshot()
-        if path:
-            self.app.toast(f"已导出对比图：{Path(path).name}", "ok")
-            self.app.log(f"导出对比图：{path}", "info")
-
-    def _zone_at(self, x, y):
-        """鼠标下的差异块：(行, 列, 颜色差, 细节相关)；没落在块上就 None。
-
-        矩形只有描边，画布的 find_overlapping 命中不到块内部，所以按记下的
-        坐标判断。
-        """
-        for (bx0, by0, bx1, by1), row, col, color, corr in reversed(self._zone_data):
-            if bx0 <= x <= bx1 and by0 <= y <= by1:
-                return (row, col, color, corr)
-        return None
-
-    def _hover_zone(self, event):
-        """悬停时显示这一块的具体数值——框只说明位置，数值说明差多少。"""
-        hit = self._zone_at(event.x, event.y) if self._zones.get() else None
-        if hit is None:
-            self._hide_tip()
-            return
-        self._show_tip(event.x_root, event.y_root, hit)
-
-    def _show_tip(self, x, y, hit):
-        text = f"颜色差 {hit[2]:.1f} · 细节相关 {hit[3]:.2f}"
-        if self._tip is None:
-            self._tip = tk.Toplevel(self)
-            self._tip.overrideredirect(True)
-            self._tip.attributes("-topmost", True)
-            self._tip_label = tk.Label(self._tip, bg=self.theme.CARD,
-                                       fg=self.theme.TEXT,
-                                       font=self.theme.font(8), bd=1,
-                                       relief="solid", padx=6, pady=2)
-            self._tip_label.pack()
-        self._tip_label.configure(text=text)
-        # 先量出气泡尺寸再定位：贴边时翻到光标另一侧，再夹回这块显示器内
-        gap, margin = 14, 4
-        width = max(self._tip_label.winfo_reqwidth(), 1)
-        height = max(self._tip_label.winfo_reqheight(), 1)
-        left, top, right, bottom = self._tip_bounds(x, y)
-        px = int(x) + gap
-        if px + width > right - margin:
-            px = int(x) - width - gap
-        px = max(left + margin, min(px, right - width - margin))
-        py = int(y) + 18
-        if py + height > bottom - margin:
-            py = int(y) - height - 18
-        py = max(top + margin, min(py, bottom - height - margin))
-        self._tip.geometry(f"+{px}+{py}")
-        self._tip.deiconify()
-
-    def _tip_bounds(self, x, y):
-        """气泡可用区域：光标所在显示器的工作区（多屏时别按主屏算）。
-
-        坐标口径与 Tk 一致——进程不是 DPI 感知的，Windows 会把两者都换算成
-        同一套逻辑坐标，所以把鼠标坐标直接喂给 MonitorFromPoint 就行。
-        """
-        if ctypes is not None and _MonitorInfo is not None:
-            try:
-                user32 = ctypes.windll.user32
-                point = wintypes.POINT(int(x), int(y))
-                monitor = user32.MonitorFromPoint(point, 2)   # NEAREST
-                info = _MonitorInfo()
-                info.cbSize = ctypes.sizeof(_MonitorInfo)
-                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-                    area = info.rcWork
-                    return (area.left, area.top, area.right, area.bottom)
-            except Exception:
-                pass
-        return (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
-
-    def _hide_tip(self):
-        if self._tip is not None:
-            try:
-                self._tip.withdraw()
-            except Exception:
-                pass
 
     def _difference(self):
         if not (Image and ImageChops) or self._raw[0] is None or self._raw[1] is None:
             return None
-        left, right = self._aligned_right()
-        if left is None:
-            return None
+        left = self._raw[0]
         try:
+            right = self._raw[1]
+            if right.size != left.size:
+                # 等比缩放后居中放到左图尺寸的黑底上，不拉伸变形
+                ratio = min(left.width / right.width,
+                            left.height / right.height)
+                scaled = right.resize(
+                    (max(1, int(right.width * ratio)),
+                     max(1, int(right.height * ratio))),
+                    Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", left.size, (0, 0, 0))
+                canvas.paste(scaled, ((left.width - scaled.width) // 2,
+                                      (left.height - scaled.height) // 2))
+                right = canvas
             diff = ImageChops.difference(left.convert("RGB"), right.convert("RGB"))
             gray = diff.convert("L")
             # 重压缩造成的差异本身很淡，按 98% 分位归一化后映射成热图：
@@ -3597,11 +3068,9 @@ class CompareDialog(tk.Toplevel):
             red, green, blue = [], [], []
             for value in range(256):
                 ratio = min(1.0, value / scale)
-                # 绿通道在 45%~100% 之间线性拉开：差异最大的像素才真正发黄，
-                # 旧公式到 1.0 也只到橙色，配色说明里的「黄」画不出来
                 red.append(int(255 * min(1.0, ratio * 2.2)))
-                green.append(int(255 * max(0.0, (ratio - 0.45) / 0.55)))
-                blue.append(0)
+                green.append(int(255 * max(0.0, ratio - 0.45) ** 1.4))
+                blue.append(int(255 * max(0.0, ratio - 0.75) ** 1.4))
             return Image.merge("RGB", (gray.point(red), gray.point(green),
                                        gray.point(blue)))
         except Exception:
@@ -3948,8 +3417,7 @@ class GroupCard(tk.Canvas):
             ("设为保留项", "check", lambda: self.app.results_page.set_keep(self, index)),
             ("对比这个文件", "compare",
              lambda: self.app.results_page.open_compare(self)),
-            ("取消本组选择", "refresh",
-             lambda: self.app.results_page.clear_group(self)),
+            ("取消本组选择", "refresh", lambda: self.app.results_page.reset_group(self)),
             None,
             ("打开文件", "open", lambda: self.app.open_file(item.path)),
             ("在资源管理器中显示", "open_folder", lambda: self.app.reveal_file(item.path)),
