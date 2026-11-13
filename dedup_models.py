@@ -149,12 +149,52 @@ def should_skip_dir(name: str, depth: int) -> bool:
 
 KIND_EXACT = "完全重复"
 KIND_PHOTO = "相似照片"
+KIND_FORMAT = "格式副本"
 KIND_VIDEO = "重复视频"
 KIND_AUDIO = "重复音乐"
 KIND_NAME = "同名相似"
 KIND_DIR = "重复目录"
-KIND_ORDER = (KIND_EXACT, KIND_PHOTO, KIND_VIDEO, KIND_AUDIO, KIND_NAME,
-              KIND_DIR)
+KIND_ARCHIVE = "重复压缩包"
+KIND_ORDER = (KIND_EXACT, KIND_PHOTO, KIND_FORMAT, KIND_VIDEO, KIND_AUDIO,
+              KIND_NAME, KIND_ARCHIVE, KIND_DIR)
+
+# 同样一张照片的两种存法：RAW 与 JPEG、HEIC 与 JPG。字节不同、内容同一张，
+# 既不是「完全重复」也不是「相似照片」（后者要求两边的像素能对上，而 RAW 的
+# 解码结果跟机内 JPEG 的色调本来就不一样）。
+FORMAT_CLASS_RAW = "raw"
+FORMAT_CLASS_HEIC = "heic"
+FORMAT_CLASS_JPEG = "jpg"
+
+# 截图文件名特征：系统/工具默认名都是这些，内容命中率低、误判代价也低。
+SCREENSHOT_NAME_RE = re.compile(
+    r"(screen[ _-]?shot|screenshot|snipaste|snipping|屏幕截图|屏幕快照|截图"
+    r"|螢幕擷取|截屏|fireShot|\bScreenshot_\d{8})",
+    re.IGNORECASE)
+
+
+# 能直接读目录结构（不需要解压）的归档格式：zip 家族。7z/rar 要外部命令，
+# 所以不入这个表。
+ARCHIVE_EXT = {".zip", ".jar", ".whl", ".apk", ".epub", ".xpi", ".vsix",
+               ".cbz", ".ipa"}
+
+
+def is_archive(path) -> bool:
+    return Path(path).suffix.lower() in ARCHIVE_EXT
+
+
+def format_class(path) -> str:
+    """照片的存储格式类别：raw / heic / jpg（其余一律归 jpg）。"""
+    suffix = Path(path).suffix.lower()
+    if suffix in RAW_EXT:
+        return FORMAT_CLASS_RAW
+    if suffix in {".heic", ".heif", ".hif"}:
+        return FORMAT_CLASS_HEIC
+    return FORMAT_CLASS_JPEG
+
+
+def is_screenshot(path) -> bool:
+    """按文件名判断这张图是不是截图。只认系统/工具默认名，宁可漏也不误判。"""
+    return bool(SCREENSHOT_NAME_RE.search(Path(path).name))
 
 # 保留策略
 KEEP_RULES = ("best", "oldest", "newest", "largest", "shortest", "folder")
@@ -278,20 +318,48 @@ def check_cancel(cancel):
         raise ScanCancelled
 
 
+def program_dir() -> Path:
+    """程序所在目录：打包成 exe 后是 exe 同级，源码运行则是本文件所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def is_portable() -> bool:
+    """便携模式：程序目录里有一个 portable.ini 文件，数据就留在那儿。
+
+    这样把整个文件夹拷到别的电脑（或 U 盘）就能连设置、缓存一起搬走，
+    删掉文件夹也不留残留；没有这个文件时行为跟以前一样用 %APPDATA%\\Dedup。
+    """
+    return (program_dir() / "portable.ini").exists()
+
+
 def app_dir() -> Path:
-    """可写的数据目录：优先 %APPDATA%\\Dedup，失败时退回脚本目录。"""
+    """可写的数据目录：便携模式用程序目录\\用户数据，否则 %APPDATA%\\Dedup。"""
+    if is_portable():
+        portable = program_dir() / "用户数据"
+        try:
+            _probe_writable(portable)
+            return portable
+        except Exception:
+            pass  # 比如放在只读位置，退回下面的 APPDATA
     base = (os.environ.get("APPDATA")
             or os.environ.get("XDG_CONFIG_HOME")
             or str(Path.home()))
     candidate = Path(base) / "Dedup"
     try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe = candidate / ".write-test"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
+        _probe_writable(candidate)
         return candidate
     except Exception:
         return Path(__file__).resolve().parent
+
+
+def _probe_writable(target: Path) -> None:
+    """目录能建、能写才能当数据目录；不能写就抛异常让调用方退位。"""
+    target.mkdir(parents=True, exist_ok=True)
+    probe = target / ".write-test"
+    probe.write_text("", encoding="utf-8")
+    probe.unlink()
 
 
 def norm_path(path) -> str:
@@ -316,6 +384,7 @@ class FileItem:
     audio_artist: str = ""
     audio_title: str = ""
     audio_album: str = ""
+    is_screenshot: bool = False
 
     @property
     def name(self) -> str:
@@ -595,8 +664,10 @@ __all__ = [
     "CACHE_TAGS",
     "KEEP_RULES",
     "KEEP_RULE_LABELS",
+    "KIND_ARCHIVE",
     "KIND_AUDIO",
     "KIND_EXACT",
+    "KIND_FORMAT",
     "KIND_NAME",
     "KIND_ORDER",
     "KIND_PHOTO",
@@ -622,14 +693,18 @@ __all__ = [
     "clusters_complete_link",
     "clusters_union",
     "cv2",
+    "format_class",
     "format_date",
     "format_duration",
     "find_tool",
     "hidden_subprocess_kwargs",
     "human_size",
     "ignore",
+    "ARCHIVE_EXT",
+    "is_archive",
     "is_audio",
     "is_photo",
+    "is_screenshot",
     "is_video",
     "norm_path",
     "np",

@@ -36,6 +36,7 @@ SCAN_STAGE_LABELS = {
     "video": "重复视频",
     "audio": "重复音乐",
     "name": "同名相似",
+    "archive": "重复压缩包",
 }
 
 
@@ -190,6 +191,45 @@ def find_duplicate_dirs(files):
             key=lambda x: str(x.path))
         groups.append(items)
     groups.sort(key=lambda g: -g[0].size)
+    return groups
+
+
+def find_duplicate_archives(files, cancel=None, on_progress=None):
+    """找出内容一致的压缩包（zip 家族：zip/jar/apk/whl/epub…）。
+
+    只读中央目录，不解压：条目名 + CRC32 + 解压后大小完全相同的两个包，
+    解压出来就是同一份东西；差异只在压缩级别、注释或时间戳。7z/rar 需要外部
+    命令才能读目录，不入这一项。
+
+    返回 [[FileItem, ...], ...]，每组 ≥2 个；调用方应默认不勾选（删掉哪个包
+    是使用者的选择，不是工具该替他决定的事）。
+    """
+    import zipfile
+
+    from dedup_models import is_archive
+
+    cand = [f for f in files if is_archive(f.path)]
+    if len(cand) < 2:
+        return []
+    sigs: dict[tuple, list[FileItem]] = {}
+    for pos, item in enumerate(cand, 1):
+        check_cancel(cancel)
+        if on_progress:
+            on_progress(pos, len(cand), f"读取压缩包 {pos:,}/{len(cand):,}")
+        try:
+            with zipfile.ZipFile(item.path) as zf:
+                entries = tuple(sorted(
+                    (info.filename, info.CRC, info.file_size)
+                    for info in zf.infolist() if not info.is_dir()))
+        except Exception as exc:
+            ignore(__name__, exc)
+            continue
+        if not entries:
+            continue
+        sigs.setdefault(entries, []).append(item)
+    groups = [sorted(items, key=lambda x: str(x.path))
+              for items in sigs.values() if len(items) > 1]
+    groups.sort(key=lambda g: -sum(i.size for i in g))
     return groups
 
 

@@ -58,6 +58,10 @@ PREFILTER_ZOOM_SLACK = 30
 # 缩放路径的布局阈值：差异集中在被裁掉的外圈，中心区仍会到 13 上下，而
 # 「换个人」是 26.6，两者之间有足够空隙
 ZOOM_LAYOUT_TOL = 16.0
+# 偏心/矩形/旋转窗口的布局门单独放宽一档：窗口一挪，8×8 布局的外圈就换成了
+# 别的内容，真对实测会到 16.6（右移裁切 30%）、旋转 5° 到 19 上下；假对仍在
+# 26 以上，两档不重叠。中心窗口（整幅/内缩）继续用 16.0。
+ZOOM_LAYOUT_TOL_EXT = 21.0
 # 缩放搜索档位：中心保留 1/z。z=1.43 ≈ 四边各裁 15%，1.67 ≈ 20%。
 # 先按 6% 粗扫，再在最好的两档附近按 1% 细扫：粗扫单档最坏错位 3%（相关
 # 值只剩 0.76~0.86），细扫一轮就能回到 0.95 以上。
@@ -1228,7 +1232,11 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             y0, y1, x0, x1 = _rect_v(n, win[1], win[2])
             grid = zoom_grid_rect(thumb, y0, y1, x0, x1)
         lay = layout_distance_inner(grid, dst.grid[0])
-        return lay if lay <= ZOOM_LAYOUT_TOL else None
+        # 内缩窗口也换了外圈（向内缩 10%），与偏心窗口同一档
+        centered = (win[0] == "sq" and win[2] == 1.0
+                    and win[3] == 1 and win[4] == 1)
+        return lay if lay <= (ZOOM_LAYOUT_TOL if centered
+                              else ZOOM_LAYOUT_TOL_EXT) else None
 
     def _best_ladder(src_pos, targets, tol, inset):
         """中心梯子（某一个 inset）上最好的 (相关, z, 窗口)。

@@ -45,9 +45,11 @@ DARK = {
     "AMBER": "#F5B544", "AMBER_DIM": "#2C2515",
     "RED": "#E5484D", "RED_HOVER": "#F0616D", "RED_DIM": "#2A161C",
     "KIND_AUDIO": "#F472B6", "KIND_NAME": "#38BDF8",
+    "KIND_FORMAT": "#5EEAD4", "KIND_ARCHIVE": "#FB923C",
     # 分类底色
     "KIND_EXACT_DIM": "#1A2240", "KIND_PHOTO_DIM": "#2B2415",
     "KIND_VIDEO_DIM": "#241E38", "KIND_AUDIO_DIM": "#2A1524",
+    "KIND_FORMAT_DIM": "#122A27", "KIND_ARCHIVE_DIM": "#2B2116",
     "KIND_NAME_DIM": "#12263A", "KIND_OTHER_DIM": "#1A1F2A",
     "KIND_VIDEO_CHIP": "#261E3B",
     # 控件
@@ -82,9 +84,11 @@ DAY = {
     "AMBER": "#B8791A", "AMBER_DIM": "#FCF1DA",
     "RED": "#D22F35", "RED_HOVER": "#B8262C", "RED_DIM": "#FBE7E8",
     "KIND_AUDIO": "#C2287C", "KIND_NAME": "#0B7FA5",
+    "KIND_FORMAT": "#0D9488", "KIND_ARCHIVE": "#C2410C",
     # 分类底色
     "KIND_EXACT_DIM": "#E6EBFE", "KIND_PHOTO_DIM": "#FCF1DA",
     "KIND_VIDEO_DIM": "#F0EAFB", "KIND_AUDIO_DIM": "#FCE7F1",
+    "KIND_FORMAT_DIM": "#D9F5F0", "KIND_ARCHIVE_DIM": "#FDECDD",
     "KIND_NAME_DIM": "#E1F2F9", "KIND_OTHER_DIM": "#EEF1F6",
     "KIND_VIDEO_CHIP": "#F0EAFB",
     # 控件
@@ -250,13 +254,15 @@ class Theme:
     def kind_color(self, kind):
         return {KIND_EXACT: self.ACCENT, KIND_PHOTO: self.AMBER,
                 KIND_VIDEO: self.VIOLET, KIND_AUDIO: self.KIND_AUDIO,
-                KIND_NAME: self.KIND_NAME,
+                KIND_NAME: self.KIND_NAME, KIND_FORMAT: self.KIND_FORMAT,
+                KIND_ARCHIVE: self.KIND_ARCHIVE,
                 KIND_DIR: self.GREEN}.get(kind, self.TEXT_DIM)
 
     def kind_dim(self, kind):
         return {KIND_EXACT: self.KIND_EXACT_DIM, KIND_PHOTO: self.KIND_PHOTO_DIM,
                 KIND_VIDEO: self.KIND_VIDEO_DIM, KIND_AUDIO: self.KIND_AUDIO_DIM,
-                KIND_NAME: self.KIND_NAME_DIM,
+                KIND_NAME: self.KIND_NAME_DIM, KIND_FORMAT: self.KIND_FORMAT_DIM,
+                KIND_ARCHIVE: self.KIND_ARCHIVE_DIM,
                 KIND_DIR: self.KIND_OTHER_DIM}.get(kind, self.KIND_OTHER_DIM)
 
 
@@ -266,9 +272,11 @@ for _key, _value in DARK.items():
 
 KIND_EXACT = "完全重复"
 KIND_PHOTO = "相似照片"
+KIND_FORMAT = "格式副本"
 KIND_VIDEO = "重复视频"
 KIND_AUDIO = "重复音乐"
 KIND_NAME = "同名相似"
+KIND_ARCHIVE = "重复压缩包"
 KIND_DIR = "重复目录"
 
 ICON = {

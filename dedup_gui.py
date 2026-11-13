@@ -49,6 +49,8 @@ except Exception:  # pragma: no cover - 非 Windows 平台
 try:
     import dedup_core as core
     import dedup_models as models
+    import dedup_watermark as wmark
+    import dedup_watermark_lama as wlama
     import dedup_photos as photos
     import dedup_tools as tools
     from ui_kit import (
@@ -56,9 +58,11 @@ try:
         PALETTES,
         apply_palette,
         remap_tree,
+        KIND_ARCHIVE,
         KIND_AUDIO,
         KIND_DIR,
         KIND_EXACT,
+        KIND_FORMAT,
         KIND_NAME,
         KIND_PHOTO,
         KIND_VIDEO,
@@ -607,7 +611,8 @@ class App(tk.Tk):
             self._nav_item(key, label, icon)
         self._nav_header("工 具 箱")
         for key, label, icon in (("organize", "文件整理", "clock"),
-                                 ("rename", "批量重命名", "edit")):
+                                 ("rename", "批量重命名", "edit"),
+                                 ("watermark", "照片去水印", "image")):
             self._nav_item(key, label, icon)
 
         # 最近扫描（有记录时才显示）
@@ -820,9 +825,11 @@ class App(tk.Tk):
         self.log_page = LogPage(self.main, self)
         self.organize_page = OrganizePage(self.main, self)
         self.rename_page = RenamePage(self.main, self)
+        self.watermark_page = WatermarkPage(self.main, self)
         self.pages = {"scan": self.scan_page, "results": self.results_page,
                       "logs": self.log_page, "organize": self.organize_page,
-                      "rename": self.rename_page}
+                      "rename": self.rename_page,
+                      "watermark": self.watermark_page}
         self.results = self.results_page
 
     def show_page(self, name):
@@ -895,6 +902,12 @@ class App(tk.Tk):
             self.rename_page.on_undo_done(*event[1])
         elif kind == "ren_plan":
             self.rename_page.on_plan(*event[1])
+        elif kind == "wm_progress":
+            self.watermark_page.on_progress(*event[1])
+        elif kind == "wm_done":
+            self.watermark_page.on_done(*event[1])
+        elif kind == "wm_model":
+            self.watermark_page.on_model(*event[1])
         elif kind == "cleanup_restored":
             self.results_page.on_cleanup_restored(*event[1])
         elif kind == "thumb":
@@ -3963,8 +3976,9 @@ class GroupCard(tk.Canvas):
         kind_color = t.kind_color(g.kind)
         dim = t.kind_dim(g.kind)
         icons = {KIND_EXACT: "document", KIND_PHOTO: "image",
-                 KIND_VIDEO: "video", KIND_AUDIO: "audio", KIND_NAME: "copy",
-                 KIND_DIR: "folder"}
+                 KIND_FORMAT: "copy", KIND_VIDEO: "video",
+                 KIND_AUDIO: "audio", KIND_NAME: "copy",
+                 KIND_ARCHIVE: "layers", KIND_DIR: "folder"}
         f = t.font(8, "bold")
         bw = f.measure(g.kind) + s(28)
         by = pad
@@ -5262,6 +5276,653 @@ class RenamePage(ToolPage):
 
 
 # ---------------------------------------------------------------- 启动
+# ---------------------------------------------------------------- 去水印对照
+class LightPreviewDialog(tk.Toplevel):
+    """一键抠完后弹的前后对照：左边原图、右边结果，同步缩放拖动。"""
+
+    def __init__(self, parent, theme, theme_name, before, after, note=""):
+        super().__init__(parent)
+        self.theme = theme
+        self._title_name = theme_name
+        t = theme
+        self.before_path = Path(before)
+        self.after_path = Path(after)
+        self.zoom = 0.0
+        self.pan = [[0.0, 0.0], [0.0, 0.0]]
+        self._drag = None
+        self._raw = [None, None]
+        self._photos = [None, None]
+        self._shown = [[0, 0], [0, 0]]      # 每个窗格各自记缩略图尺寸
+        self.title(f"前后对照 · {self.after_path.name}")
+        self.configure(bg=t.BG)
+        self.minsize(t.s(760), t.s(520))
+        self.geometry(f"{t.s(1120)}x{t.s(720)}")
+        self.transient(parent)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<MouseWheel>", lambda e: self._wheel(e.delta))
+        self._build(note)
+        self.after(60, lambda: enable_dark_titlebar(
+            self, dark=(theme_name == "dark")))
+        self.after(30, self._load)
+
+    def _build(self, note):
+        t = self.theme
+        s = t.s
+        head = tk.Frame(self, bg=t.BG)
+        head.pack(fill="x", padx=s(16), pady=(s(12), s(6)))
+        tk.Label(head, text="处理前", bg=t.BG, fg=t.TEXT,
+                 font=t.font(10, "bold")).pack(side="left")
+        tk.Label(head, text="处理后", bg=t.BG, fg=t.GREEN,
+                 font=t.font(10, "bold")).pack(side="right")
+        if note:
+            tk.Label(head, text=note, bg=t.BG, fg=t.MUTED,
+                     font=t.font(8)).pack(side="left", padx=(s(14), 0))
+
+        body = tk.Frame(self, bg=t.BORDER_SOFT)
+        body.pack(fill="both", expand=True, padx=s(16), pady=s(4))
+        body.columnconfigure(0, weight=1, uniform="pane")
+        body.columnconfigure(1, weight=1, uniform="pane")
+        body.rowconfigure(0, weight=1)
+        self.canvases = []
+        for col in range(2):
+            canvas = tk.Canvas(body, bg=t.INPUT, highlightthickness=0, bd=0)
+            canvas.grid(row=0, column=col, sticky="nsew",
+                        padx=(0 if col == 0 else s(1), 0))
+            canvas.bind("<Configure>", lambda e: self._draw())
+            canvas.bind("<Button-1>", lambda e, c=col: self._drag_start(e, c))
+            canvas.bind("<B1-Motion>", lambda e: self._drag_move(e))
+            canvas.bind("<ButtonRelease-1>", lambda e: self._drag_end())
+            self.canvases.append(canvas)
+
+        foot = tk.Frame(self, bg=t.BG)
+        foot.pack(fill="x", padx=s(16), pady=(s(6), s(12)))
+        tk.Label(foot, text="滚轮缩放 · 拖动平移 · Esc 关闭", bg=t.BG,
+                 fg=t.MUTED, font=t.font(8)).pack(side="left")
+        CanvasButton(foot, t, "关闭", command=self.destroy, kind="secondary",
+                     height=32, size=9, padding=16, bg=t.BG).pack(side="right")
+
+    # -------------------------------------------------- 图像
+    def _load(self):
+        if Image is None:
+            return
+        try:
+            for index, path in enumerate((self.before_path, self.after_path)):
+                with Image.open(path) as im:
+                    self._raw[index] = ImageOps.exif_transpose(im).convert("RGB")
+        except Exception as exc:
+            self.destroy()
+            return
+        self._draw()
+
+    def _wheel(self, delta):
+        step = 0.15 if delta > 0 else -0.15
+        self.zoom = max(0.0, min(3.0, self.zoom + step))
+        self._draw()
+
+    def _drag_start(self, event, col):
+        self._drag = (event.x, event.y, list(self.pan[0]), list(self.pan[1]))
+
+    def _drag_move(self, event):
+        if not self._drag:
+            return
+        x0, y0, p0, p1 = self._drag
+        dx = (event.x - x0) / 100.0
+        dy = (event.y - y0) / 100.0
+        self.pan[0] = [p0[0] - dx, p0[1] - dy]
+        self.pan[1] = [p1[0] - dx, p1[1] - dy]
+        self._draw()
+
+    def _drag_end(self):
+        self._drag = None
+
+    def _draw(self):
+        if ImageTk is None or self._raw[0] is None:
+            return
+        for index, canvas in enumerate(self.canvases):
+            width = max(int(canvas.winfo_width()), 60)
+            height = max(int(canvas.winfo_height()), 60)
+            base = self._raw[index]
+            if base is None:
+                continue
+            scale = 1.0 + self.zoom
+            fit = min((width - 8) / base.width, (height - 8) / base.height)
+            scale = max(0.02, fit * scale)
+            size = (max(1, int(base.width * scale)),
+                    max(1, int(base.height * scale)))
+            if list(size) != self._shown[index]:
+                self._photos[index] = ImageTk.PhotoImage(base.resize(size))
+                self._shown[index] = list(size)
+            canvas.delete("all")
+            cx = width // 2 + int(self.pan[index][0] * width * 0.5)
+            cy = height // 2 + int(self.pan[index][1] * height * 0.5)
+            canvas.create_image(cx, cy, image=self._photos[index])
+
+
+# ---------------------------------------------------------------- 去水印页
+class WatermarkPage(ToolPage):
+    """照片去水印：框出水印位置，批量用四周内容补上，另存不覆盖原图。"""
+
+    PRESET_VALUES = {
+        "rb": (70.0, 86.0, 28.5, 12.5),
+        "lb": (1.5, 86.0, 28.5, 12.5),
+        "bottom": (0.0, 90.0, 100.0, 10.0),
+    }
+
+    def __init__(self, master, app):
+        super().__init__(master, app)
+        self.busy = False
+        self._cancel = None
+        self._preview_img = None
+        # 照片列表只在真正需要时扫（页面首次显示 / 手动刷新），
+        # 不在构建界面时去 rglob 用户目录
+        self._photos_cache = None
+        # 要补的区域（归一化坐标），在预览上拖框就能加，一张图可以有多个
+        self.boxes = []
+        self._drag = None
+        self._thumb_rect = None
+        self._warm_started = False
+        self._last_mode = ""
+        self._build()
+
+    # ------------------------------------------------------------ 界面
+    def _build(self):
+        t = self.theme
+        s = t.s
+        self._page_setup(("照片去水印",
+                          "框出水印位置，用四周内容补上；另存新文件，原图不动。"))
+        self.btn_run = CanvasButton(self.header_right, t, "开始处理",
+                                    command=self.start, kind="primary",
+                                    icon="edit", height=38, size=9,
+                                    bg=t.BG)
+        self.btn_run.pack()
+
+        self.path_var = tk.StringVar(value=self.settings.get("wm_dir")
+                                     or self.settings.get("last_dir", ""))
+        entry = self._path_card(self.page, "照片所在文件夹", self.path_var,
+                                self._browse,
+                                "处理结果默认存到「_去水印」子文件夹")
+        entry.bind("<Return>", lambda e: self.refresh_preview())
+
+        body = tk.Frame(self.page, bg=t.BG)
+        body.pack(fill="x", pady=(s(16), 0))
+        body.grid_columnconfigure(0, weight=2, uniform="wm")
+        body.grid_columnconfigure(1, weight=3, uniform="wm")
+
+        card = Card(body, t, padding=18)
+        card.grid(row=0, column=0, sticky="n", padx=(0, s(8)))
+        d = card.body
+        self._section_title(d, "水印位置", "image", "预设不合适就手填百分比")
+        preset = self.settings.get("wm_preset", "rb")
+        self.seg_preset = Segmented(
+            d, t, [("rb", "右下角"), ("lb", "左下角"), ("bottom", "底部整条")],
+            value=preset, command=self._apply_preset, bg=t.CARD, padding=10)
+        self.seg_preset.pack(anchor="w", pady=(s(12), 0))
+
+        default = self.PRESET_VALUES.get(preset, self.PRESET_VALUES["rb"])
+        grid = tk.Frame(d, bg=t.CARD)
+        grid.pack(fill="x", pady=(s(14), 0))
+        self.vars = {}
+        for idx, (key, label, value) in enumerate((
+                ("left", "左边距 %", default[0]),
+                ("top", "上边距 %", default[1]),
+                ("width", "宽度 %", default[2]),
+                ("height", "高度 %", default[3]))):
+            cell = tk.Frame(grid, bg=t.CARD)
+            cell.grid(row=idx // 2, column=idx % 2, sticky="ew",
+                      padx=(0, s(10)), pady=(0, s(8)))
+            tk.Label(cell, text=label, bg=t.CARD, fg=t.MUTED,
+                     font=t.font(8), anchor="w").pack(fill="x")
+            var = tk.StringVar(
+                value=str(self.settings.get("wm_" + key, value)))
+            field = self._field(cell, var, font=10)
+            field.pack(fill="x", pady=(s(4), 0))
+            field.entry.bind("<Return>", lambda e: self.refresh_preview())
+            self.vars[key] = var
+        grid.grid_columnconfigure(0, weight=1, uniform="wmg")
+        grid.grid_columnconfigure(1, weight=1, uniform="wmg")
+
+        opt = tk.Frame(d, bg=t.CARD)
+        opt.pack(fill="x", pady=(s(6), 0))
+        box = tk.Frame(opt, bg=t.CARD)
+        box.pack(side="left", fill="x", expand=True)
+        tk.Label(box, text="存到「_去水印」子文件夹", bg=t.CARD, fg=t.TEXT,
+                 font=t.font(9), anchor="w").pack(fill="x")
+        tk.Label(box, text="关掉就存在原图旁边，仍不会覆盖原图",
+                 bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w").pack(
+            fill="x", pady=(s(2), 0))
+        self.sw_subdir = Switch(opt, t, bg=t.CARD,
+                                value=bool(self.settings.get("wm_subdir", True)))
+        self.sw_subdir.pack(side="right")
+
+        # 高质量开关：只有装了 onnxruntime 且放了模型才能开
+        hq_opt = tk.Frame(d, bg=t.CARD)
+        hq_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(hq_opt, text="高质量（LaMa 模型）\r\n水印压在人物/结构上时更自然，每处约 7 秒",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.hq_ready = wlama.available()
+        self.sw_hq = Switch(hq_opt, t, bg=t.CARD,
+                            value=bool(self.settings.get("wm_hq", False))
+                            and self.hq_ready,
+                            command=self._hq_toggled)
+        self.sw_hq.pack(side="right")
+        if not self.hq_ready:
+            self.sw_hq.set_enabled(False)
+        self.hq_hint = tk.Label(d, text=wlama.status_text(), bg=t.CARD,
+                                fg=t.MUTED if self.hq_ready else t.FAINT,
+                                font=t.font(8), anchor="w")
+        self.hq_hint.pack(fill="x", pady=(s(4), 0))
+
+        tools_row = tk.Frame(d, bg=t.CARD)
+        tools_row.pack(fill="x", pady=(s(14), 0))
+        CanvasButton(tools_row, t, "按数值添加", command=self._add_from_fields,
+                     kind="secondary", height=34, size=9, padding=14,
+                     bg=t.CARD).pack(side="left")
+        CanvasButton(tools_row, t, "清空区域", command=self._clear_boxes,
+                     kind="ghost", height=34, size=9, padding=14,
+                     bg=t.CARD).pack(side="left", padx=(s(8), 0))
+
+        auto_card = tk.Frame(d, bg=t.CARD)
+        auto_card.pack(fill="x", pady=(s(14), 0))
+        self.btn_light = CanvasButton(
+            auto_card, t, "一键抠浅色水印", command=self.start_light,
+            kind="secondary", height=36, size=10, padding=16, bg=t.CARD)
+        self.btn_light.pack(fill="x")
+        tk.Label(d, bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w",
+                 justify="left", wraplength=s(330),
+                 text="不用拖框：自动找白底上的浅黄/浅色平铺水印并反解掉，"
+                      "适合表格、文档截图。不透明贴纸、彩色 logo 请用上面的"
+                      "拖框 + 高质量模式。"
+                 ).pack(fill="x", pady=(s(6), 0))
+        self.box_hint = tk.Label(d, text="区域：0 个（在右边预览上直接拖框）",
+                                 bg=t.CARD, fg=t.MUTED, font=t.font(8),
+                                 anchor="w")
+        self.box_hint.pack(fill="x", pady=(s(10), 0))
+
+        prev_card = Card(body, t, padding=18)
+        prev_card.grid(row=0, column=1, sticky="n", padx=(s(8), 0))
+        p = prev_card.body
+        self._section_title(p, "预览", "image", "红框罩住的范围会被重画")
+        self.canvas = tk.Canvas(p, bg=t.INPUT, height=s(230),
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(fill="x", pady=(s(12), 0))
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+        self.canvas.bind("<Button-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
+        self.canvas.bind("<ButtonRelease-1>", self._drag_end)
+        self.status = tk.Label(p, text="选一个文件夹，自动预览第一张",
+                               bg=t.CARD, fg=t.MUTED, font=t.font(8),
+                               anchor="w", justify="left")
+        self.status.pack(fill="x", pady=(s(8), 0))
+
+        self._update_box_hint()
+
+        tk.Label(self.page,
+                 text="只用于处理你自己有版权的照片：补上去的内容来自画面本身，"
+                      "水印压在主体或文字上时不可能完全无痕，处理完记得看一眼。",
+                 bg=t.BG, fg=t.FAINT, font=t.font(8), anchor="w",
+                 justify="left", wraplength=s(760)).pack(
+            fill="x", pady=(s(14), 0))
+
+    # ------------------------------------------------------------ 取值
+    def _box(self):
+        def num(key, fallback):
+            try:
+                return float(self.vars[key].get())
+            except Exception:
+                return fallback
+
+        left = min(max(num("left", 70.0), 0.0), 99.0)
+        top = min(max(num("top", 86.0), 0.0), 99.0)
+        width = min(max(num("width", 28.5), 0.5), 100.0 - left)
+        height = min(max(num("height", 12.5), 0.5), 100.0 - top)
+        return (left / 100.0, top / 100.0,
+                (left + width) / 100.0, (top + height) / 100.0)
+
+    def _apply_preset(self, key):
+        values = self.PRESET_VALUES.get(key)
+        if not values:
+            return
+        for name, value in zip(("left", "top", "width", "height"),
+                               values):
+            self.vars[name].set(str(value))
+        self.settings["wm_preset"] = key
+        save_settings(self.settings)
+        self._add_from_fields()
+
+    # ------------------------------------------------------------ 区域
+    def _update_box_hint(self):
+        n = len(self.boxes)
+        self.box_hint.configure(
+            text=(f"区域：{n} 个（每个水印拖一个框，可以多个）"
+                  if n else "区域：0 个（在右边预览上直接拖框，或点上面的预设）"))
+
+    def _add_from_fields(self):
+        box = self._box()
+        if box[2] - box[0] < 0.01 or box[3] - box[1] < 0.01:
+            self.app.toast("区域太小了，宽高至少 1%", "warn")
+            return
+        self.boxes.append(box)
+        self._update_box_hint()
+        self._redraw()
+
+    def _clear_boxes(self):
+        self.boxes = []
+        self._update_box_hint()
+        self._redraw()
+
+    # ------------------------------------------------------------ 拖框
+    def _canvas_to_box(self, x0, y0, x1, y1):
+        """画布坐标 → 图片归一化坐标（取小值/大值，保证 x0<x1）。"""
+        if not self._thumb_rect:
+            return None
+        left, top, width, height = self._thumb_rect
+        if width <= 0 or height <= 0:
+            return None
+
+        def clamp(value):
+            return min(max(value, 0.0), 1.0)
+
+        ax = clamp((x0 - left) / float(width))
+        bx = clamp((x1 - left) / float(width))
+        ay = clamp((y0 - top) / float(height))
+        by = clamp((y1 - top) / float(height))
+        return (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+
+    def _drag_start(self, event):
+        self._drag = (event.x, event.y)
+
+    def _drag_move(self, event):
+        if not self._drag or not self._thumb_rect:
+            return
+        self._draw_boxes(temp=(self._drag, (event.x, event.y)))
+
+    def _drag_end(self, event):
+        if not self._drag:
+            return
+        start = self._drag
+        self._drag = None
+        box = self._canvas_to_box(start[0], start[1], event.x, event.y)
+        if box and (box[2] - box[0]) * (box[3] - box[1]) > 0.0004:
+            self.boxes.append(box)
+            self._update_box_hint()
+        self._redraw()
+
+    def _browse(self):
+        self._browse_into(self.path_var, "选择照片文件夹")
+        self.refresh_preview()
+
+    def _refresh_dir(self):
+        folder = self.path_var.get().strip().strip('"')
+        if folder and os.path.isdir(folder):
+            self.settings["wm_dir"] = folder
+
+    def _photos(self):
+        folder = self.path_var.get().strip().strip('"')
+        if not folder or not os.path.isdir(folder):
+            return []
+        try:
+            return list(wmark.iter_photos(folder))
+        except Exception:
+            return []
+
+    def _placeholder(self, text):
+        self.canvas.delete("all")
+        self._preview_img = None
+        w = max(self.canvas.winfo_width(), 200)
+        h = max(self.canvas.winfo_height(), 120)
+        self.canvas.create_text(w // 2, h // 2, text=text, fill=self.theme.MUTED,
+                                font=self.theme.font(9), width=w - self.theme.s(30))
+
+    # ------------------------------------------------------------ 预览
+    def on_show(self):
+        """切到本页时才真的去列文件。"""
+        if self._photos_cache is None:
+            self.refresh_preview()
+        else:
+            self._redraw()
+
+    def refresh_preview(self):
+        self._photos_cache = self._photos()
+        self._redraw()
+
+    def _redraw(self):
+        """只用已缓存的文件列表重画（窗口缩放时会被反复触发）。"""
+        if self._photos_cache is None:
+            self._placeholder("选一个文件夹，自动预览第一张")
+            return
+        self.render_preview()
+
+    def render_preview(self):
+        if Image is None or ImageTk is None:
+            return
+        photos = self._photos_cache or []
+        if not photos:
+            self._placeholder("选一个文件夹，自动预览第一张")
+            return
+        first = photos[0]
+        width = max(int(self.canvas.winfo_width()), 200)
+        height = max(int(self.canvas.winfo_height()), 120)
+        try:
+            with Image.open(first) as im:
+                thumb = ImageOps.exif_transpose(im).convert("RGB").copy()
+            thumb.thumbnail((width - 8, height - 8))
+        except Exception:
+            self._placeholder("这张图读不出来，换一张试试")
+            return
+        self._preview_img = ImageTk.PhotoImage(thumb)
+        self.canvas.delete("all")
+        self._thumb_rect = ((width - thumb.width) // 2,
+                            (height - thumb.height) // 2,
+                            thumb.width, thumb.height)
+        self.canvas.create_image(width // 2, height // 2,
+                                 image=self._preview_img)
+        self._draw_boxes()
+        self.status.configure(
+            text=f"共 {len(photos):,} 张 · 预览：{Path(first).name}")
+
+    def _draw_boxes(self, temp=None):
+        """把已选区域（和正在拖的临时框）画到预览图上。"""
+        self.canvas.delete("box")
+        if not self._thumb_rect:
+            return
+        left, top, width, height = self._thumb_rect
+
+        def rect(box, color, width_px=2, tag="box"):
+            self.canvas.create_rectangle(
+                left + box[0] * width, top + box[1] * height,
+                left + box[2] * width, top + box[3] * height,
+                outline=color, width=width_px, tags=tag)
+
+        for one in self.boxes:
+            rect(one, "#EB484D")
+        if temp:
+            box = self._canvas_to_box(temp[0][0], temp[0][1],
+                                      temp[1][0], temp[1][1])
+            if box:
+                rect(box, "#F5B544", width_px=1, tag="box")
+
+    # ------------------------------------------------------------ 执行
+    def _hq_toggled(self, value):
+        if value:
+            self.prewarm_model()
+        self.settings["wm_hq"] = bool(value)
+        save_settings(self.settings)
+
+    def prewarm_model(self):
+        """后台把模型会话建好：首次加载要几十秒，别让用户点“开始”后才等。"""
+        if not self.hq_ready or self._warm_started:
+            return
+        self._warm_started = True
+
+        def work():
+            try:
+                wlama.warmup()
+                self.app.post(("wm_model", (True, wlama.status_text())))
+            except Exception as exc:
+                self.app.post(("wm_model", (False, f"模型加载失败：{exc}")))
+
+        threading.Thread(target=work, daemon=True, name="lama-warm").start()
+
+    def on_model(self, ok, text):
+        try:
+            self.hq_hint.configure(text=text,
+                                   fg=self.theme.MUTED if ok else self.theme.FAINT)
+        except Exception:
+            pass
+
+    def on_show(self):
+        """进页就把模型会话建起来（首次加载要几十秒）。"""
+        if self.sw_hq.value:
+            self.prewarm_model()
+
+    def start_light(self):
+        """一键抠浅色水印：不靠框，自动识别 + 反解。"""
+        if self.busy:
+            return
+        photos = self._photos_cache
+        if photos is None:
+            photos = self._photos()
+        if not photos:
+            self.app.toast("先选一个有照片的文件夹", "warn")
+            return
+        self._refresh_dir()
+        out_dir = None
+        if self.sw_subdir.value:
+            out_dir = Path(photos[0]).parent / "_去水印"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.app.toast(f"建不了输出目录：{exc}", "err")
+                return
+        self.busy = True
+        self._last_mode = "light"
+        self._cancel = threading.Event()
+        self.btn_light.set_text("处理中…")
+        self.btn_light.set_enabled(False)
+        self.btn_run.set_enabled(False)
+        self.app.set_status("正在抠浅色水印…", self.theme.ACCENT)
+        total = len(photos)
+        cancel = self._cancel
+        where = str(out_dir) if out_dir else "原图目录"
+
+        def work():
+            def prog(index, count, _path):
+                if index % 5 == 0 or index == count:
+                    self.app.post(("wm_progress",
+                                   (index, count, os.path.basename(_path))))
+            try:
+                result = wmark.batch_remove_light(
+                    photos, out_dir=out_dir, cancel=cancel, on_progress=prog)
+            except Exception as exc:
+                result = {"done": 0, "skipped": 0, "total": total,
+                          "failed": [(str(exc), str(exc))]}
+            self.app.post(("wm_done", (result, where)))
+
+        threading.Thread(target=work, daemon=True,
+                         name="watermark-light").start()
+
+    def start(self):
+        if self.busy:
+            return
+        photos = self._photos_cache
+        if photos is None:
+            photos = self._photos()
+        if not photos:
+            self.app.toast("先选一个有照片的文件夹", "warn")
+            return
+        self._refresh_dir()
+        box = list(self.boxes) or [self._box()]
+        out_dir = None
+        if self.sw_subdir.value:
+            out_dir = Path(photos[0]).parent / "_去水印"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.app.toast(f"建不了输出目录：{exc}", "err")
+                return
+        for key in ("left", "top", "width", "height"):
+            self.settings["wm_" + key] = self.vars[key].get()
+        self.settings["wm_subdir"] = bool(self.sw_subdir.value)
+        self.settings["wm_hq"] = bool(self.sw_hq.value)
+        save_settings(self.settings)
+        method = "lama" if self.sw_hq.value else "auto"
+
+        self.busy = True
+        self._last_mode = "box"
+        self._cancel = threading.Event()
+        self.btn_run.set_text("处理中…")
+        self.btn_run.set_enabled(False)
+        self.app.set_status("正在去水印…", self.theme.ACCENT)
+        total = len(photos)
+        cancel = self._cancel
+        where = str(out_dir) if out_dir else "原图目录"
+
+        def work():
+            def prog(index, count, _path):
+                if index % 5 == 0 or index == count:
+                    self.app.post(("wm_progress",
+                                   (index, count, os.path.basename(_path))))
+            try:
+                result = wmark.batch_remove(photos, box, out_dir=out_dir,
+                                            cancel=cancel, on_progress=prog,
+                                            method=method)
+            except Exception as exc:
+                result = {"done": 0, "skipped": 0, "total": total,
+                          "failed": [(str(exc), str(exc))]}
+            self.app.post(("wm_done", (result, where)))
+
+        threading.Thread(target=work, daemon=True, name="watermark").start()
+
+    def on_progress(self, index, total, name):
+        self.status.configure(text=f"处理中 {index:,}/{total:,} · {name}")
+
+    def on_done(self, result, where):
+        t = self.theme
+        self.busy = False
+        self._cancel = None
+        self.btn_run.set_text("开始处理")
+        self.btn_run.set_enabled(True)
+        self.btn_light.set_text("一键抠浅色水印")
+        self.btn_light.set_enabled(True)
+        done = result.get("done", 0)
+        skipped = result.get("skipped", 0)
+        failed = result.get("failed") or []
+        self.app.set_status("引擎就绪", t.GREEN)
+        parts = [f"完成 {done} 张"]
+        if skipped:
+            parts.append(f"跳过 {skipped} 张（已处理过）")
+        if failed:
+            parts.append(f"失败 {len(failed)} 张")
+            self.app.log(f"去水印失败 {len(failed)} 张：{failed[0][0]}", "warn")
+        text = " · ".join(parts)
+        self.status.configure(text=f"{text} → {where}")
+        self.app.log(f"去水印{text}，输出：{where}",
+                     "warn" if failed else "ok")
+        self.app.toast(text, "warn" if failed else "ok")
+        if done and self._last_mode == "light":
+            self._show_light_preview(where, done)
+
+    def _show_light_preview(self, where, done):
+        """处理完直接弹出前后对照，省得自己去文件夹里翻。"""
+        photos = self._photos_cache or []
+        if not photos:
+            return
+        out_dir = None if where == "原图目录" else Path(where)
+        try:
+            after = wmark.output_path(photos[0], out_dir, unique=False)
+        except Exception:
+            return
+        if not Path(after).is_file():
+            return
+        note = f"{done:,} 张已完成" if done > 1 else "1 张已完成"
+        try:
+            LightPreviewDialog(self.app, self.theme, self.app.theme_name,
+                              photos[0], after, note)
+        except Exception as exc:
+            self.app.log(f"前后对照打开失败：{exc}", "warn")
+
+
 def set_dpi_awareness():
     if os.name != "nt":
         return
@@ -5343,7 +6004,8 @@ def main():
     parser = argparse.ArgumentParser(description="重复文件清理器（图形界面）")
     parser.add_argument("dir", nargs="?", default=None, help="启动后预填的文件夹")
     parser.add_argument("--page", default="scan",
-                        choices=["scan", "results", "logs", "organize", "rename"])
+                        choices=["scan", "results", "logs", "organize",
+                                 "rename", "watermark"])
     parser.add_argument("--scan", default=None, help="启动后自动扫描该目录（调试用）")
     parser.add_argument("--screenshot", default=None, help="截图后退出（调试用）")
     parser.add_argument("--shot-delay", type=int, default=2200)

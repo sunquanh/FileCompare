@@ -13,6 +13,7 @@ dedup_video / dedup_audio / dedup_names / dedup_files 里。
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from dedup_files import (
     collect_files,
     export_report,
     export_report_json,
+    find_duplicate_archives,
     find_duplicate_dirs,
     hardlink_replace,
     make_thumbnail,
@@ -53,13 +55,18 @@ from dedup_models import (
     CACHE_TAGS,
     KEEP_RULE_LABELS,
     KEEP_RULES,
+    KIND_ARCHIVE,
     KIND_AUDIO,
     KIND_DIR,
     KIND_EXACT,
+    KIND_FORMAT,
     KIND_NAME,
     KIND_ORDER,
     KIND_PHOTO,
     KIND_VIDEO,
+    FORMAT_CLASS_RAW,
+    format_class,
+    is_screenshot,
     PHOTO_EXT,
     PRESETS,
     SKIP_DIRS,
@@ -76,6 +83,7 @@ from dedup_models import (
     app_dir,
     check_cancel,
     clusters_complete_link,
+    clusters_union,
     cv2,
     format_date,
     format_duration,
@@ -220,6 +228,98 @@ def scan_folder(options: ScanOptions, on_progress=None, on_log=None,
         cache.close()
 
 
+def _trailing_digits(path) -> str:
+    """文件名主干尾部的数字（IMG_0001 → "0001"）；没有就返回空串。
+
+    EXIF 判据靠它区分「同一个编号的两种格式」和「同一秒内的两张不同照片」：
+    连拍时两张不同照片的 EXIF 时间也可能落在同一秒，只看时间会把它们强行
+    归成一组；编号不同就不认。
+    """
+    m = re.search(r"(\d+)$", Path(path).stem)
+    return m.group(1) if m else ""
+
+
+def find_format_pairs(valid):
+    """同一张照片的不同格式副本（RAW+JPEG、HEIC+JPG）。
+
+    valid: [(FileItem, 帧号, PhotoFP)]，返回 [(items, 依据), ...]。
+    两条判据，任一命中即算同一张：
+      ① 同目录、同名不同后缀、格式类不同：IMG_1234.CR2 + IMG_1234.JPG；
+      ② EXIF 机型相同、拍摄时间相差 ≤1 秒、格式类不同、长宽比一致
+         （导出时改了文件名的情形，判据① 接不住）。
+    两条判据用并查集合并，最后要求整组里仍有两种格式——否则只是链式
+    传递（A 与 B 同名、B 与 C 同秒）拼出来的一堆普通副本。
+    """
+    nodes: list[FileItem] = []
+    index: dict[str, int] = {}
+    reasons: dict[frozenset, str] = {}
+    links: list[tuple[int, int]] = []
+
+    def node(item) -> int:
+        key = str(item.path)
+        if key not in index:
+            index[key] = len(nodes)
+            nodes.append(item)
+        return index[key]
+
+    by_stem: dict[tuple, list] = {}
+    for item, _fi, _fp in valid:
+        by_stem.setdefault((str(item.path.parent).lower(),
+                            item.path.stem.lower()), []).append(item)
+    for items in by_stem.values():
+        if len(items) < 2:
+            continue
+        if len({format_class(i.path) for i in items}) < 2:
+            continue
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                if format_class(items[i].path) == format_class(items[j].path):
+                    continue
+                a, b = node(items[i]), node(items[j])
+                links.append((a, b))
+                reasons[frozenset((a, b))] = "同名不同格式"
+
+    shots = []
+    for item, _fi, fp in valid:
+        if fp.exif_time and fp.exif_model:
+            shots.append((fp.exif_model.lower(), int(fp.exif_time),
+                          format_class(item.path), item))
+    shots.sort(key=lambda s: (s[0], s[1]))
+    for i, (model, t0, cls0, item0) in enumerate(shots):
+        for model1, t1, cls1, item1 in shots[i + 1:]:
+            if model1 != model or t1 - t0 > 1:
+                break
+            if cls0 == cls1 or str(item0.path) == str(item1.path):
+                continue
+            digits0 = _trailing_digits(item0.path)
+            if not digits0 or digits0 != _trailing_digits(item1.path):
+                continue
+            if item0.width and item1.width and item0.height and item1.height:
+                r0 = item0.width / float(item0.height)
+                r1 = item1.width / float(item1.height)
+                if abs(r0 - r1) > 0.02 * max(r0, r1):
+                    continue
+            a, b = node(item0), node(item1)
+            links.append((a, b))
+            reasons.setdefault(frozenset((a, b)), "EXIF 同一秒")
+
+    if not links:
+        return []
+    out = []
+    for cluster in clusters_union(len(nodes), links):
+        if len(cluster) < 2:
+            continue
+        items = [nodes[i] for i in cluster]
+        if len({format_class(i.path) for i in items}) < 2:
+            continue
+        member = set(cluster)
+        stem_hit = any(reasons.get(frozenset((a, b))) == "同名不同格式"
+                       for a, b in links if a in member and b in member)
+        out.append((items, "同名不同格式" if stem_hit else "EXIF 同一秒"))
+    out.sort(key=lambda x: -sum(i.size for i in x[0]))
+    return out
+
+
 def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                cancel=None, cache=None):
     """on_progress(stage, done, total, detail) / on_log(message)"""
@@ -266,6 +366,14 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     photos = [f for f in files if is_photo(f.path)]
     videos = [f for f in files if is_video(f.path)]
     audios = [f for f in files if is_audio(f.path)]
+    # 截图标记：只看文件名，不读像素（系统/工具默认名很固定，宁可漏也不误判）
+    shots = 0
+    for f in photos:
+        if is_screenshot(f.path):
+            f.is_screenshot = True
+            shots += 1
+    if shots:
+        say(f"其中截图 {shots:,} 张（截图组会在说明里标出来）")
     say(f"发现 {len(files):,} 个文件（照片 {len(photos):,} / 视频 {len(videos):,}"
         f" / 音乐 {len(audios):,}），共 {human_size(total_size)}")
     emit("collect", len(files), len(files), f"共 {len(files):,} 个文件")
@@ -369,6 +477,32 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         for item, fi, fp in valid:
             if fi == 0:
                 item.width, item.height = fp.width, fp.height
+
+        # ---- 同一张照片的不同格式副本：先成组并移出相似照片比对，
+        # 否则它们会以「相似照片」的身份出现，RAW 还有被当副本删掉的风险
+        fmt_pairs = find_format_pairs(valid)
+        if fmt_pairs:
+            dropped = set()
+            for items, why in fmt_pairs:
+                items = sorted(items, key=lambda x: (
+                    format_class(x.path) != FORMAT_CLASS_RAW, str(x.path)))
+                group = DupGroup(
+                    KIND_FORMAT, items, 90,
+                    f"{why}：同一张照片的两种存法，内容相同、体积不同（默认不勾选）")
+                group.keep = pick_keep(group.kind, items, keep_rule, root)
+                if keep_rule == "best" and format_class(
+                        items[group.keep].path) != FORMAT_CLASS_RAW:
+                    for idx, it in enumerate(items):
+                        if format_class(it.path) == FORMAT_CLASS_RAW:
+                            group.keep = idx
+                            break
+                group.select_by_default = False
+                groups.append(group)
+                dropped |= {str(i.path) for i in items}
+            consumed |= dropped
+            valid = [v for v in valid if str(v[0].path) not in dropped]
+            say(f"格式副本：{len(fmt_pairs)} 组（RAW+JPEG / HEIC+JPG 等，共 "
+                f"{len(dropped)} 个文件，默认不勾选）")
         n_files = len({str(v[0].path) for v in valid})
         n_frames = len(valid)
         frame_note = (f"（共 {n_frames:,} 帧）" if n_frames != n_files else "")
@@ -447,6 +581,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 if len({b for b in _bids if b is not None}) < len(
                         [b for b in _bids if b is not None]):
                     group.note += "（连拍序列）"
+                if all(it.is_screenshot for it in items):
+                    group.note += "（截图）"
                 if group.similarity < SIMILARITY_AUTO_SELECT:
                     group.select_by_default = False
                     group.note += "（相似度低于 95%，默认不勾选）"
@@ -635,6 +771,28 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
     else:
         say("已跳过同名相似检测")
         emit("name", 1, 1, "已跳过")
+
+    # ---- 重复压缩包（同内容、不同压缩级别/时间戳）
+    if options.exact and not quick:
+        emit("archive", 0, 1, "正在核对压缩包内容…")
+        todo_arch = [f for f in files if str(f.path) not in consumed]
+        arch_groups = find_duplicate_archives(
+            todo_arch, cancel=cancel,
+            on_progress=lambda d, t, m: emit("archive", d, t, m))
+        for items in arch_groups:
+            group = DupGroup(
+                KIND_ARCHIVE, items, 99,
+                "压缩包内条目名、CRC 与大小完全一致，解压后是同一份内容（默认不勾选）",
+                select_by_default=False)
+            group.keep = pick_keep(group.kind, items, keep_rule, root)
+            groups.append(group)
+            consumed |= {str(i.path) for i in items}
+        if arch_groups:
+            say(f"重复压缩包：{len(arch_groups)} 组")
+        emit("archive", 1, 1,
+             f"完成，发现 {len(arch_groups)} 组")
+    else:
+        emit("archive", 1, 1, "已跳过")
 
     if cache is not None and cache.enabled:
         say(f"指纹缓存：复用 {cache.hits:,} 条，新算 {cache.misses:,} 条")
