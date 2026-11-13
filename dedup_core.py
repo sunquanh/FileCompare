@@ -91,7 +91,9 @@ from dedup_models import (
 )
 from dedup_names import find_name_groups, name_key
 from dedup_photos import PhotoFP, match_photos, pair_similarity, probe_size
-from dedup_photos import fingerprint as photo_fingerprint
+from dedup_photos import frame_fingerprints as photo_frame_fingerprints
+from dedup_photos import _frames_from_cache, _frames_to_cache
+from dedup_models import detect_bursts
 from dedup_video import (
     match_videos,
     signature_from_cache,
@@ -255,6 +257,11 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
 
     # ---- 相似照片
     todo_photos = [f for f in photos if str(f.path) not in consumed]
+    _bursts = detect_bursts([str(f.path) for f in todo_photos])
+    burst_of = {}
+    for _bi, _b in enumerate(_bursts):
+        for _p in _b:
+            burst_of[_p] = _bi
     if options.photos and todo_photos and not quick:
         emit("photo", 0, len(todo_photos), "正在计算照片指纹…")
         tag = CACHE_TAGS["photo"]
@@ -266,7 +273,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             hit = cache.get(item, tag)
             if hit:
                 try:
-                    return PhotoFP.from_cache(hit)
+                    return _frames_from_cache(hit)
                 except ValueError as exc:
                     if "旧格式" in str(exc):
                         with stale_photo_lock:
@@ -276,28 +283,37 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                     ignore(__name__, exc)
                 except Exception as exc:
                     ignore(__name__, exc)
-            fp = photo_fingerprint(item.path, options.max_image_edge)
-            if fp is not None:
-                cache.put(item, tag, fp.to_cache())
-            return fp
+            fps_list = photo_frame_fingerprints(item.path,
+                                                options.max_image_edge)
+            if fps_list:
+                cache.put(item, tag, _frames_to_cache(fps_list))
+            return fps_list
 
         throttle = ProgressThrottle(
             lambda d, t, m: emit("photo", d, t, f"照片指纹 {d:,}/{t:,}"))
-        fps = parallel_map(photo_work, todo_photos, options.workers,
-                           cancel=cancel,
-                           on_progress=lambda d, t, m: throttle(d, t, m))
-        valid = [(todo_photos[i], fps[i]) for i in range(len(todo_photos))
-                 if fps[i]]
-        bad_photos = len(todo_photos) - len(valid)
+        fps_nested = parallel_map(photo_work, todo_photos, options.workers,
+                                cancel=cancel,
+                                on_progress=lambda d, t, m: throttle(d, t, m))
+        valid = []
+        for item, fps_list in zip(todo_photos, fps_nested):
+            if not fps_list:
+                continue
+            for fi, fp in enumerate(fps_list):
+                valid.append((item, fi, fp))
         invalid = [todo_photos[i] for i in range(len(todo_photos))
-                   if not fps[i]]
+                   if not fps_nested[i]]
+        bad_photos = len(invalid)
         for item in invalid:
             size = probe_size(item.path)
             if size and (size[0] < 16 or size[1] < 16):
                 tiny_photos.append(str(item.path))
-        for item, fp in valid:
-            item.width, item.height = fp.width, fp.height
-        say(f"照片指纹完成：{len(valid):,} 张可用，{bad_photos} 张跳过"
+        for item, fi, fp in valid:
+            if fi == 0:
+                item.width, item.height = fp.width, fp.height
+        n_files = len({str(v[0].path) for v in valid})
+        n_frames = len(valid)
+        frame_note = (f"（共 {n_frames:,} 帧）" if n_frames != n_files else "")
+        say(f"照片指纹完成：{n_files:,} 张可用{frame_note}，{bad_photos} 张跳过"
             + (f"（其中 {len(tiny_photos)} 张小于 16px）" if tiny_photos else ""))
         if tiny_photos:
             shown = "、".join(tiny_photos[:10])
@@ -307,7 +323,7 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
         if len(valid) >= 2:
             emit("photo", 0, 1, "正在比对相似照片…")
             pairs = match_photos(
-                [v[1] for v in valid],
+                [v[2] for v in valid],
                 dist=getattr(options, "img_dist", 8),
                 fine=getattr(options, "img_fine", 42),
                 hist_tol=getattr(options, "img_hist", 0.26),
@@ -316,11 +332,50 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 cancel=cancel,
                 on_progress=lambda d, t, m: emit("photo", d, t, "照片比对"))
             edges = [(a, b, pair_similarity(fine, ncc))
-                     for a, b, _c, fine, _h, ncc, _l in pairs]
+                     for a, b, _c, fine, _h, ncc, _l in pairs
+                     if str(valid[a][0].path) != str(valid[b][0].path)]
             clusters = clusters_complete_link(len(valid), edges)
-            clusters.sort(key=lambda c: -sum(valid[i][0].size for i in c))
+            # 多帧：同一文件可能出现在多个帧簇里，先把文件集合
+            # 有交集的帧簇合并（并查集），保证每文件最多进一个组。
+            # 注意：合并后组的相似度取簇内所有帧对的最小值，多帧文件
+            # 只要有一对帧较弱，整组就可能默认不勾选（有意为之，保守）。
+            # 另注意：并查集合并把完全连接聚类改成文件级单连接——
+            # 同一组里可能出现从未直接配对过的两个文件（都与第三个
+            # 文件配对），是有意设计（保证每文件最多进一个组）。
+            _parent = list(range(len(clusters)))
+            def _find(x):
+                while _parent[x] != x:
+                    _parent[x] = _parent[_parent[x]]
+                    x = _parent[x]
+                return x
+            def _union(a, b):
+                ra, rb = _find(a), _find(b)
+                if ra != rb:
+                    _parent[rb] = ra
+            _file_to_cluster = {}
+            for _ci, _c in enumerate(clusters):
+                for _fi in _c:
+                    _p = str(valid[_fi][0].path)
+                    if _p in _file_to_cluster:
+                        _union(_ci, _file_to_cluster[_p])
+                    else:
+                        _file_to_cluster[_p] = _ci
+            _merged_map = {}
+            for _ci, _c in enumerate(clusters):
+                _merged_map.setdefault(_find(_ci), set()).update(_c)
+            clusters = [sorted(s) for s in _merged_map.values()]
+            clusters.sort(key=lambda c: -sum(
+                {str(valid[i][0].path): valid[i][0].size for i in c}.values()))
             for cluster in clusters:
-                items = [valid[i][0] for i in cluster]
+                items = []
+                _seen = set()
+                for i in cluster:
+                    _p = str(valid[i][0].path)
+                    if _p not in _seen:
+                        _seen.add(_p)
+                        items.append(valid[i][0])
+                if len(items) < 2:
+                    continue
                 member = set(cluster)
                 sel = [p for p in pairs if p[0] in member and p[1] in member]
                 fine = max((p[3] for p in sel), default=0)
@@ -330,6 +385,10 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 group = DupGroup(
                     KIND_PHOTO, items, max(0, sim),
                     f"结构吻合 {ncc:.0%} · 细节差 {fine}/256")
+                _bids = [burst_of.get(str(it.path)) for it in items]
+                if len({b for b in _bids if b is not None}) < len(
+                        [b for b in _bids if b is not None]):
+                    group.note += "（连拍序列）"
                 if group.similarity < SIMILARITY_AUTO_SELECT:
                     group.select_by_default = False
                     group.note += "（相似度低于 95%，默认不勾选）"
@@ -337,6 +396,9 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                 groups.append(group)
                 consumed |= {str(i.path) for i in items}
             say(f"相似照片：{len(clusters)} 组")
+            if _bursts:
+                _n = sum(len(b) for b in _bursts)
+                say(f"连拍序列：{len(_bursts)} 组，共 {_n} 张")
             emit("photo", 1, 1, f"完成，发现 {len(clusters)} 组")
         else:
             emit("photo", 1, 1, "没有足够的照片")

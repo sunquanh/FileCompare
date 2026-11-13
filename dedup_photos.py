@@ -17,6 +17,7 @@ import io
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime
 
 try:
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
     Image = None
     ImageOps = None
 
-from dedup_models import check_cancel, enable_heif, ignore
+from dedup_models import RAW_EXT, check_cancel, enable_heif, ignore
 
 enable_heif()  # 可选：装了 pillow-heif 就能读 HEIC/HEIF
 
@@ -801,12 +802,105 @@ class PhotoFP:
                    str(data.get("exif_model") or ""))
 
 
+def _jpeg_end(data, soi):
+    """从 soi（FFD8 位置）按 JPEG 标记结构解析，返回 EOI 结束位置
+    （含 FFD9 的后一字节）；结构不对返回 None。"""
+    n = len(data)
+    pos = soi + 2
+    while pos + 1 < n:
+        if data[pos] != 0xFF:
+            return None
+        m = data[pos + 1]
+        if m == 0xFF:
+            pos += 1
+            continue
+        if m == 0x00:
+            pos += 2
+            continue
+        if m == 0xD9:
+            return pos + 2
+        if m == 0xD8 or m == 0x01 or 0xD0 <= m <= 0xD7:
+            pos += 2
+            continue
+        if pos + 3 >= n:
+            return None
+        seg_len = (data[pos + 2] << 8) | data[pos + 3]
+        if seg_len < 2 or pos + 2 + seg_len > n:
+            return None
+        if m == 0xDA:
+            pos = pos + 2 + seg_len
+            while pos + 1 < n:
+                if data[pos] == 0xFF:
+                    nxt = data[pos + 1]
+                    if nxt == 0x00:
+                        pos += 2
+                        continue
+                    if 0xD0 <= nxt <= 0xD7:
+                        pos += 2
+                        continue
+                    if nxt == 0xD9:
+                        return pos + 2
+                    # 非 RST/非 EOI 标记：熵数据到此为止，恢复语义——
+                    # 外层把它当普通段头按长度跳过（不是严格解析；
+                    # 候选段随后由 Pillow im.load() 校验，错段会被丢弃）。
+                    break
+                pos += 1
+            continue
+        pos += 2 + seg_len
+    return None
+
+
+def extract_jpeg_preview(path):
+    """RAW 文件里的内嵌 JPEG 预览字节串；没有返回 None。
+
+    注意：整文件读进内存（大 RAW + 多 worker 并行时峰值可观）；
+    RAW 的 EXIF 时间/机型读不到（exif_shot 打不开 CR2），走不到
+    EXIF 同机型+2 秒那条救援路径，只能靠 NCC/layout/缩放。
+    """
+    try:
+        data = Path(path).read_bytes()
+    except Exception:
+        return None
+    cands = []
+    pos = 0
+    for _ in range(50):
+        soi = data.find(b"\xff\xd8", pos)
+        if soi < 0:
+            break
+        end = _jpeg_end(data, soi)
+        if end is None:
+            pos = soi + 2
+            continue
+        seg = data[soi:end]
+        if len(seg) >= 1024:
+            cands.append(seg)
+        pos = end
+    cands.sort(key=len, reverse=True)
+    for seg in cands[:3]:
+        try:
+            with Image.open(io.BytesIO(seg)) as im:
+                im.load()
+            return seg
+        except Exception:
+            continue
+    return None
+
+
 def open_small(path, max_edge=1024):
     """按 EXIF 转正、缩到长边 max_edge 的 RGB 图（JPEG 会走 draft 加速）。
 
     没有方向标记就跳过 exif_transpose（省一次全图拷贝），RGB 图直接 copy。
     """
-    with Image.open(path) as im:
+    try:
+        src = Image.open(path)
+    except Exception:
+        if Path(path).suffix.lower() not in RAW_EXT:
+            raise
+        preview = extract_jpeg_preview(path)
+        if preview is None:
+            raise
+        src = Image.open(io.BytesIO(preview))
+    with src as im:
         try:
             im.draft("RGB", (max_edge, max_edge))
         except Exception as exc:
@@ -834,49 +928,90 @@ def probe_size(path):
         return None
 
 
+def _fp_from_rgb(rgb, shot_time=0, shot_model="") -> PhotoFP | None:
+    """RGB 图 → PhotoFP（fingerprint 与 frame_fingerprints 共用）。"""
+    width, height = rgb.size
+    if width < 16 or height < 16:
+        return None
+    mid = rgb.resize((256, 256), Image.Resampling.BOX)
+    small = rgb.resize((64, 64), Image.Resampling.BOX)
+    mat = _dct_matrix(DCT_SIZE)
+    dh: list[list[int]] = []
+    ph: list[list[np.ndarray]] = []
+    hps: list[np.ndarray] = []
+    grids: list[np.ndarray] = []
+    energies: list[float] = []
+    for keep in CROP_LEVELS:
+        side = max(48, int(round(256 * keep)))
+        off = (256 - side) // 2
+        piece = mid.crop((off, off, off + side, off + side))
+        gray = piece.convert("L")
+        hp_unit, energy = _highpass(gray)
+        hps.append(hp_unit)
+        energies.append(energy)
+        grids.append(color_grid(piece))
+        row_dh, row_ph = [], []
+        for big_arr, small_arr in _orientation_grids(gray, DCT_SIZE):
+            row_dh.append(_dhash_grid(small_arr))
+            row_ph.append(_phash_array(big_arr, mat))
+        dh.append(row_dh)
+        ph.append(row_ph)
+    dh_arr = np.array(dh, dtype=np.uint64).reshape(LEVELS, ORIENTS)
+    ph_arr = np.array(ph, dtype=np.uint64).reshape(LEVELS, ORIENTS, 4)
+    thumb = np.asarray(rgb.resize((THUMB_SIZE, THUMB_SIZE),
+                                  Image.Resampling.BOX), dtype=np.uint8)
+    return PhotoFP(dh_arr, ph_arr, histogram(small), width, height,
+                   int(dh_arr[0].min()), np.stack(hps), np.stack(grids),
+                   np.array(energies, dtype=np.float32), thumb,
+                   shot_time, shot_model)
+
+
 def fingerprint(path, max_edge=1024) -> PhotoFP | None:
+    """单帧指纹（第一帧），行为与原来一致。"""
     try:
         rgb = open_small(path, max_edge)
-        width, height = rgb.size
-        if width < 16 or height < 16:
-            return None
-        # 裁边层级从 256×256 中间图里切：直接在 64×64 上切会让「裁边版」和
-        # 「整幅版」的视频域重采样差太多（实测结构相关只有 0.84~0.94，余量不够
-        # 区分误判），从 256 切再缩到 32 就接近真正对齐。
-        mid = rgb.resize((256, 256), Image.Resampling.BOX)
-        small = rgb.resize((64, 64), Image.Resampling.BOX)
-        mat = _dct_matrix(DCT_SIZE)
-        dh: list[list[int]] = []
-        ph: list[list[np.ndarray]] = []
-        hps: list[np.ndarray] = []
-        grids: list[np.ndarray] = []
-        energies: list[float] = []
-        for keep in CROP_LEVELS:
-            side = max(48, int(round(256 * keep)))
-            off = (256 - side) // 2
-            piece = mid.crop((off, off, off + side, off + side))
-            gray = piece.convert("L")
-            hp_unit, energy = _highpass(gray)
-            hps.append(hp_unit)
-            energies.append(energy)
-            grids.append(color_grid(piece))
-            row_dh, row_ph = [], []
-            for big_arr, small_arr in _orientation_grids(gray, DCT_SIZE):
-                row_dh.append(_dhash_grid(small_arr))
-                row_ph.append(_phash_array(big_arr, mat))
-            dh.append(row_dh)
-            ph.append(row_ph)
-        dh_arr = np.array(dh, dtype=np.uint64).reshape(LEVELS, ORIENTS)
-        ph_arr = np.array(ph, dtype=np.uint64).reshape(LEVELS, ORIENTS, 4)
-        thumb = np.asarray(rgb.resize((THUMB_SIZE, THUMB_SIZE),
-                                      Image.Resampling.BOX), dtype=np.uint8)
         shot_time, shot_model = exif_shot(path)
-        return PhotoFP(dh_arr, ph_arr, histogram(small), width, height,
-                       int(dh_arr[0].min()), np.stack(hps), np.stack(grids),
-                       np.array(energies, dtype=np.float32), thumb,
-                       shot_time, shot_model)
+        return _fp_from_rgb(rgb, shot_time, shot_model)
     except Exception:
         return None
+
+
+def frame_fingerprints(path, max_edge=1024, max_frames=16) -> list:
+    """多帧指纹：每帧各一个 PhotoFP（最多前 max_frames 帧）。
+    单帧文件返回 1 元列表；全帧不可用返回 []。"""
+    try:
+        shot_time, shot_model = exif_shot(path)
+        out = []
+        with Image.open(path) as im:
+            n = int(getattr(im, "n_frames", 1) or 1)
+            for fi in range(min(n, max_frames)):
+                try:
+                    if fi:
+                        im.seek(fi)
+                    frame = im.copy() if im.mode == "RGB" else im.convert("RGB")
+                    if frame.width > max_edge or frame.height > max_edge:
+                        frame.thumbnail((max_edge, max_edge),
+                                      Image.Resampling.LANCZOS)
+                    fp = _fp_from_rgb(frame, shot_time, shot_model)
+                except Exception:
+                    fp = None
+                if fp is not None:
+                    out.append(fp)
+        return out
+    except Exception:
+        return []
+
+
+def _frames_to_cache(fps_list):
+    """帧指纹列表 → 缓存值（{"v": 3, "frames": [...]}）。"""
+    return {"v": 3, "frames": [fp.to_cache() for fp in fps_list]}
+
+
+def _frames_from_cache(data):
+    """缓存值 → 帧指纹列表；兼容老格式（单个 fp dict → 1 元列表）。"""
+    if isinstance(data, dict) and isinstance(data.get("frames"), list):
+        return [PhotoFP.from_cache(d) for d in data["frames"]]
+    return [PhotoFP.from_cache(data)]
 
 
 # ---------------------------------------------------------------- 匹配

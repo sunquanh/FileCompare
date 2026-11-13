@@ -104,8 +104,10 @@ def enable_heif() -> bool:
 
 
 # ---------------------------------------------------------------- 常量
+RAW_EXT = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2",
+           ".raf", ".pef", ".srw", ".x3f", ".iiq"}
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".bmp", ".webp",
-             ".tif", ".tiff", ".gif"}
+             ".tif", ".tiff", ".gif"} | RAW_EXT
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".3gp", ".wmv",
              ".flv", ".ts", ".webm", ".mpg", ".mpeg"}
 AUDIO_EXT = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".ogg", ".wma",
@@ -234,6 +236,41 @@ def is_video(path) -> bool:
 
 def is_audio(path) -> bool:
     return Path(path).suffix.lower() in AUDIO_EXT
+
+
+def burst_key(path):
+    """连拍/序列键：文件名尾随数字 → (stem, 数字)，否则 None。"""
+    stem = Path(path).stem
+    m = re.match(r"^(.*?)(\d+)$", stem)
+    if not m or not m.group(1):
+        return None
+    return (m.group(1), int(m.group(2)))
+
+
+def detect_bursts(paths):
+    """按 stem 分组、按数字排序、连续号成组；返回 ≥2 文件的组列表。"""
+    by_stem = {}
+    for p in paths:
+        k = burst_key(p)
+        if k is None:
+            continue
+        _dir = str(Path(p).parent)
+        by_stem.setdefault((_dir, k[0]), []).append((k[1], str(p)))
+    bursts = []
+    for stem, items in by_stem.items():
+        items.sort()
+        run = [items[0]]
+        for prev, cur in zip(items, items[1:]):
+            if cur[0] == prev[0] + 1:
+                run.append(cur)
+            else:
+                if len(run) >= 2:
+                    bursts.append([p for _n, p in run])
+                run = [cur]
+        if len(run) >= 2:
+            bursts.append([p for _n, p in run])
+    bursts.sort(key=lambda b: (len(b), b[0]))
+    return bursts
 
 
 def check_cancel(cancel):
