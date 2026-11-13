@@ -108,6 +108,54 @@ _pick_keep = pick_keep
 # 相似类（照片/视频）低于该相似度时默认不勾选，需人工对比确认后再删
 SIMILARITY_AUTO_SELECT = 95
 
+def _photo_explain(valid, member):
+    """给照片重复组一句人话解释：为什么算重复。
+
+    依据（按优先级）：
+      1) 同机型且拍摄时间相差 ≤2 秒 → EXIF 路径：同一相机、同一时间拍的；
+      2) 长宽比近似互为倒数（差 10% 内）→ 旋转 90°：其中一张旋转了角度；
+      3) 组内图片长宽比差 >10% → 缩放/裁切路径：其中一张是另一张的裁切或缩放版本；
+      4) 否则 → 同尺度路径：内容相同。
+    返回不含相似度数字的短句；相似度由调用方另行拼接。
+    """
+    # N3：按文件路径去重再判——多帧文件两帧共享同一 EXIF，不去重会把
+    # 同一文件的两帧误判成“同一相机、同一时间拍的两张照片”。
+    fps = {}
+    for idx in member:
+        try:
+            _path = str(valid[idx][0].path)
+            if _path not in fps:
+                fps[_path] = valid[idx][2]
+        except Exception:
+            pass
+    # EXIF：同机型 + 时间 ≤2 秒
+    _times = [(f.exif_time, f.exif_model) for f in fps.values()
+              if getattr(f, "exif_time", 0) and getattr(f, "exif_model", "")]
+    for a in range(len(_times)):
+        for b in range(a + 1, len(_times)):
+            if (_times[a][1] == _times[b][1]
+                    and abs(_times[a][0] - _times[b][0]) <= 2):
+                return "同一相机、同一时间拍的"
+    # 长宽比
+    def _ratio(fp):
+        w = getattr(fp, "width", 0) or 0
+        h = getattr(fp, "height", 0) or 0
+        return (w / h) if w and h else 0.0
+    _ratios = [_ratio(f) for f in fps.values() if _ratio(f) > 0]
+    for a in range(len(_ratios)):
+        for b in range(a + 1, len(_ratios)):
+            lo, hi = min(_ratios[a], _ratios[b]), max(_ratios[a], _ratios[b])
+            if hi <= 0:
+                continue
+            # N4：先确认长宽比确实差 >10%（同比例不是旋转也不是裁切），
+            # 再看是否互为倒数——90° 旋转后长宽比取倒数，别说成裁切。
+            if (hi / lo - 1.0) <= 0.10:
+                continue
+            if abs(lo * hi - 1.0) <= 0.10:
+                return "其中一张旋转了角度"
+            return "其中一张是另一张的裁切或缩放版本"
+    return "内容相同"
+
 
 # 只在盘符根 / UNC 根 / POSIX 根下直接出现时才算系统区；
 # “windows”“recovery”这类名字用户也可能给普通文件夹起，深处出现不算。
@@ -378,13 +426,12 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                     continue
                 member = set(cluster)
                 sel = [p for p in pairs if p[0] in member and p[1] in member]
-                fine = max((p[3] for p in sel), default=0)
-                ncc = min((p[5] for p in sel), default=1.0)
                 sim = min((pair_similarity(p[3], p[5]) for p in sel),
                           default=0)
+                _why = _photo_explain(valid, member)
                 group = DupGroup(
                     KIND_PHOTO, items, max(0, sim),
-                    f"结构吻合 {ncc:.0%} · 细节差 {fine}/256")
+                    f"{_why}，相似度 {max(0, sim)}%")
                 _bids = [burst_of.get(str(it.path)) for it in items]
                 if len({b for b in _bids if b is not None}) < len(
                         [b for b in _bids if b is not None]):
@@ -452,9 +499,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             member = set(cluster)
             sel = [p for p in pairs if p[0] in member and p[1] in member]
             ratio = max((p[4] for p in sel), default=0.0)
-            fine = max((p[3] for p in sel), default=0.0)
             group = DupGroup(KIND_VIDEO, items, round(ratio * 100),
-                             f"匹配 {ratio:.0%} 帧 · 位差 {fine:.0f}/256")
+                             f"内容相同，{ratio:.0%} 的关键帧一致")
             if group.similarity < SIMILARITY_AUTO_SELECT:
                 group.select_by_default = False
                 group.note += "（相似度低于 95%，默认不勾选）"

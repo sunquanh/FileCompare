@@ -541,6 +541,10 @@ class App(tk.Tk):
             threading.Thread(target=lambda: check_for_update(self),
                              daemon=True, name="update-check").start()
         self.bind("<Control-o>", lambda e: self.show_page("scan"))
+        # R22 快捷键：Delete 删已选、Ctrl+A 全选当前页、Ctrl+F 聚焦搜索。
+        self.bind("<Delete>", lambda e: self._shortcut_delete())
+        self.bind("<Control-a>", lambda e: self._shortcut_select_all())
+        self.bind("<Control-f>", lambda e: self._shortcut_focus_search())
         self.bind("<Control-Key-1>", lambda e: self.show_page("scan"))
         self.bind("<Control-Key-2>", lambda e: self.show_page("results"))
         self.bind("<Control-Key-3>", lambda e: self.show_page("logs"))
@@ -647,6 +651,54 @@ class App(tk.Tk):
         self.main = tk.Frame(self, bg=t.BG)
         self.main.pack(side="left", fill="both", expand=True)
 
+    def _focus_in_text_input(self):
+        """焦点是否落在文本输入控件里（Entry/Text/Combobox/Spinbox）。
+        R22 B1：根窗口快捷键（Delete/Ctrl+A）在搜索框里打字时也会触发，
+        焦点在输入框时必须让位给文本编辑，三个 handler 开头都调它。"""
+        try:
+            w = self.focus_get()
+        except Exception:
+            return False
+        if w is None:
+            return False
+        try:
+            return w.winfo_class() in (
+                "Entry", "Text", "TEntry", "TCombobox", "Spinbox")
+        except Exception:
+            return False
+
+    def _shortcut_delete(self):
+        """Delete：结果页有已选文件时弹出删除确认（等同点“移入回收站”）。"""
+        if self._focus_in_text_input():
+            return
+        try:
+            page = self.pages.get("results")
+            if page is not None and getattr(page, "selection", None):
+                page.ask_delete()
+        except Exception:
+            pass
+
+    def _shortcut_select_all(self):
+        """Ctrl+A：结果页全选当前页除保留项（等同“全选除保留项”）。"""
+        if self._focus_in_text_input():
+            return
+        try:
+            page = self.pages.get("results")
+            if page is not None:
+                page.pick_all_but_keep()
+        except Exception:
+            pass
+
+    def _shortcut_focus_search(self):
+        """Ctrl+F：切到结果页并把焦点放到搜索框。"""
+        try:
+            self.show_page("results")
+            page = self.pages.get("results")
+            if page is not None and getattr(page, "search", None) is not None:
+                page.search.entry.focus_set()
+        except Exception:
+            pass
+
     def _on_check_update_toggle(self, value):
         # 下次启动生效：关掉后不再后台查新版
         self.settings["check_update"] = bool(value)
@@ -682,8 +734,10 @@ class App(tk.Tk):
             if w is not None:
                 w.destroy()
                 setattr(self, attr, None)
+        # R22 侧栏脏记录：只过滤显示，不写回设置。U盘拔掉、网盘断开时
+        # 条目只是暂时不显示，盘回来还在；写回会把临时不可用的路径永久删掉。
         recent = [p for p in self.settings.get("recent_dirs", [])
-                  if p][:5]
+                  if p and Path(p).exists()][:5]
         if not recent:
             return
         self._recent_header = tk.Label(
@@ -976,7 +1030,7 @@ class ScanPage(tk.Frame):
         left = tk.Frame(header, bg=t.BG)
         left.pack(side="left")
         tk.Label(left, text="扫描文件夹", bg=t.BG, fg=t.TEXT,
-                 font=t.font(21, "bold"), anchor="w").pack(fill="x")
+                 font=t.font(16, "bold"), anchor="w").pack(fill="x")
         tk.Label(left, text="在本地比对文件内容。先看清楚，再决定清理哪些。",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(10), anchor="w").pack(
             fill="x", pady=(s(3), 0))
@@ -1559,7 +1613,7 @@ class LogPage(tk.Frame):
         left = tk.Frame(header, bg=t.BG)
         left.pack(side="left")
         tk.Label(left, text="运行日志", bg=t.BG, fg=t.TEXT,
-                 font=t.font(21, "bold"), anchor="w").pack(fill="x")
+                 font=t.font(16, "bold"), anchor="w").pack(fill="x")
         tk.Label(left, text="扫描过程中的步骤、跳过项和清理记录都在这里。",
                  bg=t.BG, fg=t.TEXT_DIM, font=t.font(10), anchor="w").pack(
             fill="x", pady=(s(5), 0))
@@ -1733,7 +1787,7 @@ class ResultsPage(tk.Frame):
         left = tk.Frame(self.header, bg=t.BG)
         left.pack(side="left", fill="x", expand=True)
         tk.Label(left, text="扫描结果", bg=t.BG, fg=t.TEXT,
-                 font=t.font(21, "bold"), anchor="w").pack(fill="x")
+                 font=t.font(16, "bold"), anchor="w").pack(fill="x")
         self.subtitle = tk.Label(left, text="还没有扫描结果", bg=t.BG,
                                  fg=t.TEXT_DIM, font=t.font(10), anchor="w")
         self.subtitle.pack(fill="x", pady=(s(5), 0))
@@ -1896,7 +1950,7 @@ class ResultsPage(tk.Frame):
                                  font=t.font(9, "bold"))
         self.sel_size.pack(side="left")
         self.btn_delete = CanvasButton(inner, t, "移入回收站",
-                                       command=self.ask_delete, kind="danger",
+                                       command=self.ask_delete, kind="secondary",
                                        icon="trash", width=142, height=38,
                                        size=9, bg=t.BG_SOFT)
         self.btn_delete.pack(side="right")
@@ -2311,6 +2365,11 @@ class ResultsPage(tk.Frame):
             self.cards.append(card)
         if end < len(groups):
             self.after(1, lambda: self._render_batch(groups, end, token))
+        else:
+            # 底栏留白：最后一张卡片与底栏之间留一段空，滚动到底时
+            # 最后一行不再贴着底栏（R22 底栏遮挡）。
+            tk.Frame(self.scroll.inner, bg=t.BG,
+                     height=t.s(28)).pack(fill="x")
 
     def _change_page(self, delta):
         total = len(self._visible_groups())
@@ -3422,7 +3481,12 @@ class CompareDialog(tk.Toplevel):
         if not (hot_color or hot_corr):
             text = "没有明显差异"
         else:
-            text = f"颜色差 {hot_color} · 细节差 {hot_corr}"
+            _parts = []
+            if hot_color:
+                _parts.append(f"{hot_color} 处颜色不同")
+            if hot_corr:
+                _parts.append(f"{hot_corr} 处细节不同")
+            text = " · ".join(_parts)
         self.zone_hint.configure(text=text)
 
     def export_snapshot(self, path=None):
@@ -3706,7 +3770,7 @@ class GroupCard(tk.Canvas):
         gap = s(12)
         tw = s(148)
         th = s(96)
-        label_h = s(42)
+        label_h = s(58)  # 文件名 + 父目录 + 元信息三行（R22 卡片路径）
         note_lines = (wrap_lines(t.font(8), self.group.note,
                                  max(s(40), w - pad * 2))
                       if self.group.note else [])
@@ -3787,10 +3851,7 @@ class GroupCard(tk.Canvas):
         self.tag_bind("act_reset", "<Leave>", lambda e: self._action_hover("act_reset", False))
 
         right -= rw + s(16)
-        wasted_text = f"可释放 {core.human_size(g.wasted)}"
-        self.create_text(right, by + s(12) + 0.5, text=wasted_text,
-                         font=t.font(8, "bold"), fill=t.GREEN, anchor="e")
-        right -= t.font(8, "bold").measure(wasted_text) + s(16)
+        # R22 统计重复：卡片头不再重复显示“可释放”，底栏已汇总。
 
         info = f"{len(g.items)} 个版本"
         avail = max(s(40), right - (pad + bw + s(10)))
@@ -3864,14 +3925,18 @@ class GroupCard(tk.Canvas):
             self.tag_bind(kb, "<Enter>", lambda e: self.configure(cursor="hand2"))
             self.tag_bind(kb, "<Leave>", lambda e: self.configure(cursor="arrow"))
 
-        # 文件名 / 信息
+        # 文件名 / 所在目录 / 信息（R22：卡片要显示路径，至少给父目录）
         fname = ellipsize(t.font(9), item.name, tw - s(4))
         self.create_text(x, y + th + s(8), text=fname, font=t.font(9),
                          fill=t.TEXT if not selected else t.TEXT_ON_RED,
                          anchor="nw", tags=(tile_tag,))
+        parent = str(item.path.parent)
+        parent = ellipsize(t.font(8), parent, tw - s(4))
+        self.create_text(x, y + th + s(24), text=parent, font=t.font(8),
+                         fill=t.MUTED, anchor="nw", tags=(tile_tag,))
         meta = self._meta_text(item)
         meta = ellipsize(t.font(8), meta, tw - s(4))
-        self.create_text(x, y + th + s(25), text=meta, font=t.font(8),
+        self.create_text(x, y + th + s(40), text=meta, font=t.font(8),
                          fill=t.MUTED, anchor="nw", tags=(tile_tag,))
 
         # 事件
@@ -3879,10 +3944,42 @@ class GroupCard(tk.Canvas):
             self.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._single(idx))
             self.tag_bind(tag, "<Double-Button-1>", lambda e, idx=i: self._double(idx))
             self.tag_bind(tag, "<Button-3>", lambda e, idx=i: self._menu(e, idx))
-            self.tag_bind(tag, "<Enter>", lambda e: self.configure(cursor="hand2"))
-            self.tag_bind(tag, "<Leave>", lambda e: self.configure(cursor="arrow"))
+            self.tag_bind(tag, "<Enter>",
+                        lambda e, idx=i: self._tile_enter(idx))
+            self.tag_bind(tag, "<Leave>",
+                        lambda e: self._tile_leave())
 
         self._request_thumb(i, tw, th)
+
+    def _tile_enter(self, idx):
+        """R22：瓦片悬停时弹小提示显示完整路径；离开即关。"""
+        self.configure(cursor="hand2")
+        self._tile_leave()
+        try:
+            item = self.group.items[idx]
+            tip = tk.Toplevel(self)
+            self._tip = tip  # 先赋值再配置：中途异常也能被 _tile_leave 关掉
+            tip.wm_overrideredirect(True)
+            tip.attributes("-topmost", True)
+            label = tk.Label(tip, text=str(item.path), bg="#FFFFE0",
+                             fg="#333333", font=self.theme.font(8),
+                             padx=6, pady=3)
+            label.pack()
+            x = self.winfo_pointerx() + 12
+            y = self.winfo_pointery() + 12
+            tip.wm_geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    def _tile_leave(self):
+        self.configure(cursor="arrow")
+        tip = getattr(self, "_tip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
     def _meta_text(self, item):
         parts = [core.human_size(item.size)]
@@ -4094,7 +4191,7 @@ class ToolPage(tk.Frame):
         left = tk.Frame(header, bg=t.BG)
         left.pack(side="left")
         tk.Label(left, text=subtitle[0], bg=t.BG, fg=t.TEXT,
-                 font=t.font(21, "bold"), anchor="w").pack(fill="x")
+                 font=t.font(16, "bold"), anchor="w").pack(fill="x")
         tk.Label(left, text=subtitle[1], bg=t.BG, fg=t.TEXT_DIM,
                  font=t.font(10), anchor="w").pack(fill="x",
                                                    pady=(s(5), 0))
