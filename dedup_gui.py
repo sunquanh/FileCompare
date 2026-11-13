@@ -5494,6 +5494,18 @@ class WatermarkPage(ToolPage):
                                 value=bool(self.settings.get("wm_subdir", True)))
         self.sw_subdir.pack(side="right")
 
+        # 中档：纯 numpy 纹理合成，不用模型，重复纹理比自动几何填充自然
+        pm_opt = tk.Frame(d, bg=t.CARD)
+        pm_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(pm_opt, text="纹理合成（中档）\r\n草地/布料/砖墙等重复纹理更自然，不需要模型",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_pm = Switch(pm_opt, t, bg=t.CARD,
+                            value=bool(self.settings.get("wm_pm", False))
+                            and not bool(self.settings.get("wm_hq", False)),
+                            command=self._pm_toggled)
+        self.sw_pm.pack(side="right")
+
         # 高质量开关：只有装了 onnxruntime 且放了模型才能开
         hq_opt = tk.Frame(d, bg=t.CARD)
         hq_opt.pack(fill="x", pady=(s(12), 0))
@@ -5508,6 +5520,10 @@ class WatermarkPage(ToolPage):
         self.sw_hq.pack(side="right")
         if not self.hq_ready:
             self.sw_hq.set_enabled(False)
+        # 高质量优先：开着 LaMa 就不让中档同时生效，避免用户以为叠了两层
+        if self.sw_hq.value:
+            self.sw_pm.set(False)
+            self.sw_pm.set_enabled(False)
         self.hq_hint = tk.Label(d, text=wlama.status_text(), bg=t.CARD,
                                 fg=t.MUTED if self.hq_ready else t.FAINT,
                                 font=t.font(8), anchor="w")
@@ -5745,8 +5761,17 @@ class WatermarkPage(ToolPage):
     # ------------------------------------------------------------ 执行
     def _hq_toggled(self, value):
         if value:
+            self.sw_pm.set(False)
+            self.sw_pm.set_enabled(False)
             self.prewarm_model()
+        else:
+            self.sw_pm.set_enabled(True)
         self.settings["wm_hq"] = bool(value)
+        self.settings["wm_pm"] = bool(self.sw_pm.value)
+        save_settings(self.settings)
+
+    def _pm_toggled(self, value):
+        self.settings["wm_pm"] = bool(value)
         save_settings(self.settings)
 
     def prewarm_model(self):
@@ -5845,8 +5870,15 @@ class WatermarkPage(ToolPage):
             self.settings["wm_" + key] = self.vars[key].get()
         self.settings["wm_subdir"] = bool(self.sw_subdir.value)
         self.settings["wm_hq"] = bool(self.sw_hq.value)
+        self.settings["wm_pm"] = bool(getattr(self, "sw_pm", None)
+                                      and self.sw_pm.value)
         save_settings(self.settings)
-        method = "lama" if self.sw_hq.value else "auto"
+        if self.sw_hq.value:
+            method = "lama"
+        elif getattr(self, "sw_pm", None) and self.sw_pm.value:
+            method = "patchmatch"
+        else:
+            method = "auto"
 
         self.busy = True
         self._last_mode = "box"

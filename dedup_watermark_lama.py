@@ -151,13 +151,132 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
+def _reflect_index(length: int, before: int, after: int) -> np.ndarray:
+    """反射填充用的索引序列，支持补边比原尺寸还长（np.pad 也能，但这样更可控）。"""
+    pos = np.arange(-before, length + after, dtype=np.int64)
+    if length == 1:
+        return np.zeros_like(pos)
+    period = 2 * length - 2
+    idx = np.mod(pos, period)
+    return np.where(idx >= length, period - idx, idx)
+
+
+def _reflect_pad_to(rgb: np.ndarray, height: int, width: int,
+                    off_y: int, off_x: int) -> np.ndarray:
+    """把 (h,w,3) 原样贴进 height×width 画布的 (off_y,off_x)，四周反射补边。
+
+    关键是不做 resize：窗口小于 512 时原来是「先放大 → 推理 → 再缩回」，
+    两次重采样把框内细节糊掉；现在只是补上下文，输出仍按原像素取回。
+    """
+    h, w = rgb.shape[:2]
+    iy = _reflect_index(h, off_y, height - h - off_y)
+    ix = _reflect_index(w, off_x, width - w - off_x)
+    return rgb[iy][:, ix]
+
+
+def _neutralize_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """反射补边前把掩膜内换成左右最近的框外像素均值。
+
+    掩膜内本来就要被模型替换，输入值无所谓；但如果不处理，反射平铺会把
+    白块水印复制到画布上好几个位置，模型会把白色当成「周围纹理」学过去
+    （实测小图上水印反而被补得更白）。中和后镜像出去的仍是连续纹理。
+    """
+    if not mask.any():
+        return rgb
+    height, width = mask.shape
+    if not (~mask).any():
+        return np.broadcast_to(rgb.mean(axis=(0, 1)), rgb.shape).copy()
+    xx = np.broadcast_to(np.arange(width), (height, width))
+    left = np.maximum.accumulate(np.where(~mask, xx, -1), axis=1)
+    right = np.minimum.accumulate(np.where(~mask, xx, width)[:, ::-1],
+                                  axis=1)[:, ::-1]
+    left = np.clip(left, 0, width - 1)
+    right = np.clip(right, 0, width - 1)
+    rows = np.arange(height)[:, None]
+    out = rgb.copy()
+    out[mask] = ((rgb[rows, left] + rgb[rows, right]) * 0.5)[mask]
+    return out
+
+
+def _run_tile(session, rgb: np.ndarray, mask: np.ndarray,
+              dilate: int = 4) -> np.ndarray:
+    """单个 512 推理单元，返回与输入窗口同尺寸、按原像素对齐的预测（0~255）。
+
+    crop 居中贴进 512 画布、掩膜同步平移；推理完只裁回 crop 那一块。
+    全程没有一次缩放，窗口 ≤512 时框内细节保持原分辨率。
+    """
+    h, w = mask.shape
+    if h > SIZE or w > SIZE:
+        raise ValueError("窗口超过 512，请先滑窗分块")
+    off_y, off_x = (SIZE - h) // 2, (SIZE - w) // 2
+    source = np.asarray(rgb, dtype=np.float32)
+    if h < SIZE or w < SIZE:
+        source = _neutralize_mask(source, mask)   # 只有需要补边时才镜像
+    canvas = _reflect_pad_to(source, SIZE, SIZE, off_y, off_x)
+    image = (canvas / 255.0)[None].transpose(0, 3, 1, 2)   # NCHW, RGB, 0~1
+    m512 = np.zeros((SIZE, SIZE), dtype=bool)
+    m512[off_y:off_y + h, off_x:off_x + w] = mask
+    if dilate > 0:
+        m512 = _dilate(m512, dilate)
+    pred = session.run(["output"],
+                       {"image": image,
+                        "mask": m512.astype(np.float32)[None, None]})[0]
+    # 输出已是 0~255，不要再乘 255
+    pred = np.clip(pred[0].transpose(1, 2, 0), 0, 255)
+    return pred[off_y:off_y + h, off_x:off_x + w].astype(np.float32)
+
+
+def _feather(mask: np.ndarray, radius: float) -> np.ndarray:
+    """0/1 掩膜 → 羽化 alpha（框内 1、框外 0、边界渐变），避免硬贴方框。"""
+    from PIL import Image, ImageFilter
+    if radius <= 0:
+        return mask.astype(np.float32)
+    img = Image.fromarray(mask.astype(np.uint8) * 255)
+    blurred = img.filter(ImageFilter.GaussianBlur(radius))
+    return np.asarray(blurred, dtype=np.float32) / 255.0
+
+
+def _tiled_inpaint(session, rgb_roi: np.ndarray, mask_roi: np.ndarray,
+                   stride: int = 256, dilate: int = 4,
+                   feather: float = 3.0) -> np.ndarray:
+    """ROI 超过 512 时带重叠地滑 512 窗口，重叠区按羽化权重平均。
+
+    不把大框整体缩小成 512（那样大框必糊）；每个窗口都在原生分辨率上
+    推理，只把掩膜内的结果贴回去。跳过完全不含掩膜的窗口省推理时间。
+    """
+    h, w = mask_roi.shape
+    th, tw = min(SIZE, h), min(SIZE, w)
+    step = max(32, min(stride, th, tw))
+    ys = list(range(0, max(1, h - th + 1), step))
+    if ys[-1] != h - th:
+        ys.append(h - th)
+    xs = list(range(0, max(1, w - tw + 1), step))
+    if xs[-1] != w - tw:
+        xs.append(w - tw)
+    acc = np.zeros((h, w, 3), dtype=np.float32)
+    weight = np.zeros((h, w, 1), dtype=np.float32)
+    for y0 in ys:
+        for x0 in xs:
+            y1, x1 = y0 + th, x0 + tw
+            sub = mask_roi[y0:y1, x0:x1]
+            if not sub.any():
+                continue
+            filled = _run_tile(session, rgb_roi[y0:y1, x0:x1], sub, dilate)
+            a = _feather(sub, feather)[..., None]
+            acc[y0:y1, x0:x1] += filled * a
+            weight[y0:y1, x0:x1] += a
+    return np.where(weight > 0, acc / np.maximum(weight, 1e-6), rgb_roi)
+
+
 def inpaint(rgb: np.ndarray, boxes, pad_ratio: float = 1.8,
-            blur: int = 6) -> np.ndarray:
+            blur: int = 6, tile_stride: int = 256,
+            dilate: int = 4) -> np.ndarray:
     """用 LaMa 补掉所有框，返回新的 uint8 RGB 数组。
 
-    pad_ratio 决定给模型多少上下文（框越大需要的周围信息越多），blur 是
-    贴回时边缘的羽化像素数——模型输出和原图在框外会有细微色差，硬贴会
-    看到方框。
+    小窗口（含上下文后 ≤512）直接贴进 512 画布做推理，不缩放；大框改用
+    带重叠的滑窗，在原生分辨率上逐块修，不再整体缩小成 512。
+    pad_ratio 决定给模型多少上下文，blur 是贴回时边缘的羽化像素数，
+    tile_stride 是滑窗步长（越小重叠越多、越慢但接缝越干净）。
     """
     path = model_path()
     if path is None:
@@ -166,51 +285,47 @@ def inpaint(rgb: np.ndarray, boxes, pad_ratio: float = 1.8,
         boxes = [boxes]
     session = _session_for(path)
     height, width = rgb.shape[:2]
-    out = np.array(rgb, dtype=np.uint8, copy=True)
-    from PIL import Image, ImageFilter
+    out = np.array(rgb, dtype=np.float32)
     for box in boxes:
         px0, py0, px1, py1 = _box_pixels(box, width, height)
-        win = _crop_window(px0, py0, px1, py1, width, height, pad_ratio)
-        wx0, wy0, wx1, wy1 = win
-        crop = Image.fromarray(out[wy0:wy1, wx0:wx1])
-        crop512 = crop.resize((SIZE, SIZE), Image.BILINEAR)
-        image = np.asarray(crop512, dtype=np.float32) / 255.0
-        image = image[None].transpose(0, 3, 1, 2)  # NCHW, RGB, 0~1
-
-        mask = np.zeros((wy1 - wy0, wx1 - wx0), dtype=np.uint8)
-        mask[py0 - wy0:py1 - wy0, px0 - wx0:px1 - wx0] = 1
-        mask_img = Image.fromarray(mask * 255).resize((SIZE, SIZE),
-                                                      Image.NEAREST)
-        m512 = (np.asarray(mask_img) > 127).astype(np.float32)
-        m512 = _dilate(m512 > 0, 4).astype(np.float32)
-        mask_in = m512[None, None]
-
-        pred = session.run(["output"], {"image": image, "mask": mask_in})[0]
-        # 输出已是 0~255，不要再乘 255
-        pred = np.clip(pred[0].transpose(1, 2, 0), 0, 255).astype(np.uint8)
-        filled = Image.fromarray(pred).resize((wx1 - wx0, wy1 - wy0),
-                                              Image.BILINEAR)
-
-        # 只贴回框内（边缘羽化），框外像素保持原样
-        alpha = np.zeros(mask.shape, dtype=np.float32)
-        alpha[py0 - wy0:py1 - wy0, px0 - wx0:px1 - wx0] = 1.0
-        alpha_img = Image.fromarray((alpha * 255).astype(np.uint8))
-        if blur > 0:
-            alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(blur))
-        a = (np.asarray(alpha_img, dtype=np.float32) / 255.0)[..., None]
-        region = out[wy0:wy1, wx0:wx1].astype(np.float32)
-        blended = region * (1.0 - a) + np.asarray(filled, dtype=np.float32) * a
-        out[wy0:wy1, wx0:wx1] = np.clip(blended, 0, 255).astype(np.uint8)
-    return out
+        box_mask = np.zeros((height, width), dtype=bool)
+        box_mask[py0:py1, px0:px1] = True
+        # 上下文只随框大小适度增长；封顶避免大框滑出一堆没必要的窗口
+        context = max(24, min(192,
+                              int(max(px1 - px0, py1 - py0)
+                                  * (pad_ratio - 1.0) * 0.5)))
+        wy0, wy1 = max(0, py0 - context), min(height, py1 + context)
+        wx0, wx1 = max(0, px0 - context), min(width, px1 + context)
+        # 图够大且框装得下时，直接取原图的 512×512 原生窗口：比把小 crop
+        # 镜像平铺到 512 更真实（不会把水印复制成周围纹理），也不用缩放
+        cx, cy = (px0 + px1) // 2, (py0 + py1) // 2
+        if (width >= SIZE and height >= SIZE
+                and px1 - px0 <= SIZE - 128 and py1 - py0 <= SIZE - 128):
+            wx0 = min(max(cx - SIZE // 2, 0), width - SIZE)
+            wy0 = min(max(cy - SIZE // 2, 0), height - SIZE)
+            wx1, wy1 = wx0 + SIZE, wy0 + SIZE
+        roi = out[wy0:wy1, wx0:wx1]
+        local_mask = box_mask[wy0:wy1, wx0:wx1]
+        if roi.shape[0] <= SIZE and roi.shape[1] <= SIZE:
+            filled = _run_tile(session, roi, local_mask, dilate)
+        else:
+            filled = _tiled_inpaint(session, roi, local_mask,
+                                    tile_stride, dilate)
+        # 羽化会渗到框边外几像素；框外一律换回原图，保证框外一个像素不动，
+        # 框内边缘仍有 alpha 渐变（不会出现硬方框）
+        a = _feather(local_mask, blur)[..., None]
+        filled = np.where(local_mask[..., None], filled, roi)
+        out[wy0:wy1, wx0:wx1] = roi * (1.0 - a) + filled * a
+    # rint 而不是截断：alpha=0 处的浮点往返误差不该把 128 变成 127
+    return np.rint(np.clip(out, 0, 255)).astype(np.uint8)
 
 
 def inpaint_mask(rgb: np.ndarray, mask: np.ndarray, stride: int = 256,
                  feather: int = 3) -> np.ndarray:
     """按像素掩膜修（不是框）：适合逐字抠出来的水印笔画。
 
-    做法：把掩膜的外接框扩一圈，用 512×512 的窗口带重叠地滑过去，每个
-    窗口只把模型生成的“掩膜内”像素贴回去——窗口重叠区靠重叠平均，不会
-    出现拼缝。窗口比整张小就是为了保住分辨率，不要把整页缩成一团。
+    掩膜外接框扩一圈后，用 512 窗口带重叠地滑过去；每个窗口同样不缩放，
+    重叠区按羽化权重真正做累加平均（旧版是后一个窗口直接覆盖）。
     """
     path = model_path()
     if path is None:
@@ -219,48 +334,21 @@ def inpaint_mask(rgb: np.ndarray, mask: np.ndarray, stride: int = 256,
     if not mask.any():
         return np.array(rgb, dtype=np.uint8, copy=True)
     session = _session_for(path)
-    from PIL import Image, ImageFilter
     height, width = rgb.shape[:2]
-    out = np.array(rgb, dtype=np.float32)
-    weight = np.zeros((height, width, 1), dtype=np.float32)
     ys, xs = np.nonzero(mask)
     pad = SIZE // 3
-    top = max(0, ys.min() - pad)
-    left = max(0, xs.min() - pad)
-    bottom = min(height, ys.max() + pad)
-    right = min(width, xs.max() + pad)
-    step = max(32, min(stride, SIZE))
-    for y0 in range(top, bottom, step):
-        for x0 in range(left, right, step):
-            y1 = min(y0 + SIZE, height)
-            x1 = min(x0 + SIZE, width)
-            if y1 - y0 < 32 or x1 - x0 < 32:
-                continue
-            sub_mask = mask[y0:y1, x0:x1]
-            if not sub_mask.any():
-                continue
-            crop = Image.fromarray(np.asarray(rgb[y0:y1, x0:x1]))
-            img512 = crop.resize((SIZE, SIZE), Image.BILINEAR)
-            image = (np.asarray(img512, dtype=np.float32) / 255.0)[None]
-            image = image.transpose(0, 3, 1, 2)
-            m = Image.fromarray((sub_mask * 255).astype(np.uint8))
-            m512 = np.asarray(m.resize((SIZE, SIZE), Image.NEAREST)) > 127
-            m512 = _dilate(m512, 2).astype(np.float32)
-            pred = session.run(["output"],
-                               {"image": image,
-                                "mask": m512[None, None]})[0]
-            pred = np.clip(pred[0].transpose(1, 2, 0), 0, 255)
-            filled = np.asarray(Image.fromarray(pred.astype(np.uint8)).resize(
-                (x1 - x0, y1 - y0), Image.BILINEAR), dtype=np.float32)
-            alpha = Image.fromarray((sub_mask * 255).astype(np.uint8))
-            if feather > 0:
-                alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
-            a = (np.asarray(alpha, dtype=np.float32) / 255.0)[..., None]
-            region = out[y0:y1, x0:x1]
-            out[y0:y1, x0:x1] = region * (1 - a) + filled * a
-            weight[y0:y1, x0:x1] += a
-    out = np.where(weight > 0, out, rgb.astype(np.float32))
-    return np.clip(out, 0, 255).astype(np.uint8)
+    top, left = max(0, ys.min() - pad), max(0, xs.min() - pad)
+    bottom = min(height, ys.max() + pad + 1)
+    right = min(width, xs.max() + pad + 1)
+    roi = np.asarray(rgb[top:bottom, left:right], dtype=np.float32)
+    sub_mask = mask[top:bottom, left:right]
+    filled = _tiled_inpaint(session, roi, sub_mask, stride,
+                            dilate=2, feather=feather)
+    a = _feather(sub_mask, feather)[..., None]
+    filled = np.where(sub_mask[..., None], filled, roi)
+    out = np.array(rgb, dtype=np.float32)
+    out[top:bottom, left:right] = roi * (1.0 - a) + filled * a
+    return np.rint(np.clip(out, 0, 255)).astype(np.uint8)
 
 
 def remove_watermark_file(src, box, dst=None, pad_ratio: float = 1.8):

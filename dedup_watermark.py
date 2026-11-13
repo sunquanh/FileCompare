@@ -37,10 +37,12 @@ PRESETS = {
 }
 
 METHOD_LABELS = {
-    "auto": "自动（条形走竖列复制，方形走反射）",
+    "auto": "自动（横条走竖列复制、竖条走横行复制、方形走反射）",
     "lama": "LaMa 模型修复（最自然，慢）",
     "mirror": "四方向中位数反射",
-    "strip": "竖列复制（条形水印最好）",
+    "strip": "竖列复制（横向水印条最好）",
+    "strip_v": "横行复制（左右侧边栏式竖条最好）",
+    "patchmatch": "纹理合成（重复纹理比反射自然，纯 numpy）",
     "smooth": "平滑填充（纯色/渐变背景更干净）",
 }
 
@@ -67,28 +69,131 @@ def box_pixels(box, width, height) -> tuple:
     return py0, py1, px0, px1
 
 
-def _diffuse(arr: np.ndarray, known: np.ndarray, rounds: int = 4096) -> None:
-    """把 known 之外的值由外向内逐圈用邻居均值填上（就地修改）。"""
+def _resize_bilinear(a: np.ndarray, height: int, width: int) -> np.ndarray:
+    """双线性缩放到任意尺寸（纯 numpy，对齐角点；同尺寸时是恒等变换）。
+
+    金字塔上下采样都走这里：不用 PIL 是为了保持 float32 精度，也避免
+    每次推理都倒一遍 uint8 丢小数。
+    """
+    src_h, src_w = a.shape[:2]
+    if (src_h, src_w) == (height, width):
+        return a
+    ys = np.linspace(0.0, src_h - 1, height)
+    xs = np.linspace(0.0, src_w - 1, width)
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    y1 = np.minimum(y0 + 1, src_h - 1)
+    x1 = np.minimum(x0 + 1, src_w - 1)
+    wy = (ys - y0).astype(np.float32)[:, None]
+    wx = (xs - x0).astype(np.float32)[None, :]
+    top = a[y0][:, x0] * (1.0 - wx[..., None]) + a[y0][:, x1] * wx[..., None]
+    bot = a[y1][:, x0] * (1.0 - wx[..., None]) + a[y1][:, x1] * wx[..., None]
+    return top * (1.0 - wy[..., None]) + bot * wy[..., None]
+
+
+def _relax_laplace(arr: np.ndarray, fixed: np.ndarray,
+                   known: np.ndarray, rounds: int) -> np.ndarray:
+    """矩形区域上解 Laplace：unknown 取四邻均值，known 处锁死为 fixed。
+
+    用 edge padding 取邻居，绝不像 np.roll 那样把对边的像素卷绕进来；
+    裁剪区最外一圈本来就是 known，边界怎么处理都不影响框内结果。
+
+    这里刻意保持 ω=1 的纯 Jacobi：加权 Jacobi(ω>1) 会把棋盘格高频模态
+    （特征值接近 -1）放大到发散，实测会填出 NaN。加速完全交给金字塔层数。
+    """
     height, width = known.shape
-    steps = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    padded = np.empty((height + 2, width + 2, arr.shape[2]), dtype=np.float32)
+    inner = padded[1:-1, 1:-1]
+    cur = arr
     for _ in range(rounds):
-        total = np.zeros_like(arr)
-        count = np.zeros((height, width), dtype=np.float32)
-        for dy, dx in steps:
-            shifted = np.roll(arr, (dy, dx), axis=(0, 1))
-            shifted_known = np.roll(known, (dy, dx), axis=(0, 1))
-            # 卷绕到另一侧的行列不算邻居
-            if dy:
-                shifted_known[0 if dy == 1 else height - 1, :] = False
-            else:
-                shifted_known[:, 0 if dx == 1 else width - 1] = False
-            total += shifted * shifted_known[..., None]
-            count += shifted_known
-        ready = (~known) & (count > 0)
-        if not ready.any():
-            break
-        arr[ready] = total[ready] / count[ready][:, None]
-        known |= ready
+        # 自己拼 edge padding 比每轮 np.pad(mode="edge") 少一层 Python 开销
+        inner[:] = cur
+        padded[0, 1:-1] = cur[0]
+        padded[-1, 1:-1] = cur[-1]
+        padded[1:-1, 0] = cur[:, 0]
+        padded[1:-1, -1] = cur[:, -1]
+        padded[0, 0] = cur[0, 0]
+        padded[0, -1] = cur[0, -1]
+        padded[-1, 0] = cur[-1, 0]
+        padded[-1, -1] = cur[-1, -1]
+        avg = (padded[:-2, 1:-1] + padded[2:, 1:-1]
+               + padded[1:-1, :-2] + padded[1:-1, 2:]) * 0.25
+        avg[known] = fixed[known]
+        cur = avg
+    return cur
+
+
+def _diffuse_pyramid(arr: np.ndarray, known: np.ndarray,
+                     rounds: int = 4096) -> None:
+    """coarse-to-fine 多重网格：先在 1/8 分辨率解，上采样作初值，再逐级细化。
+
+    纯 Jacobi 要把边界信息传进框中心，轮数得跟框的边长同量级（几千轮）；
+    在 1/8 图上同样的信息只要一两百轮就能铺满，再把这个「已经大致对」的
+    解放大回去做几十轮局部松弛即可。总计算量从「全图 × 4096」降到
+    「小区域 × 几百」，视觉上都是同一个 Dirichlet 问题的平滑解。
+    """
+    height, width = known.shape
+    if not known.any():
+        return                      # 无边界条件时保持原值（和旧实现一致）
+    kf_full = known.astype(np.float32)[..., None]
+    weighted_full = arr.astype(np.float32) * kf_full
+
+    sizes = [(height, width)]
+    # 最多减半三次（1/8）；太小的区域再降采样就没意义了
+    while len(sizes) < 4 and min(sizes[-1]) >= 32:
+        sizes.append((max(1, sizes[-1][0] // 2),
+                      max(1, sizes[-1][1] // 2)))
+
+    coarse = None
+    for level, (h, w) in enumerate(reversed(sizes)):
+        if (h, w) == (height, width):
+            kc = known              # 最细层用精确掩码，保证框外一个像素不动
+            fixed = arr.astype(np.float32)
+        else:
+            kf = _resize_bilinear(kf_full, h, w)[..., 0]
+            kv = _resize_bilinear(weighted_full, h, w)
+            kc = kf > 1e-4
+            fixed = kv / np.maximum(kf[..., None], 1e-4)
+        if coarse is None:
+            seed = (fixed[kc].mean(axis=0) if kc.any()
+                    else arr.mean(axis=(0, 1)))
+            guess = np.where(kc[..., None], fixed,
+                             np.broadcast_to(seed, (h, w, arr.shape[2])))
+        else:
+            guess = np.where(kc[..., None], fixed,
+                             _resize_bilinear(coarse, h, w))
+        # 粗层多松弛几轮，细层只做局部修正；rounds 仍作为调用方的上限
+        budget = min(rounds, (160, 64, 24, 12)[min(level, 3)])
+        coarse = _relax_laplace(guess, fixed, kc, budget)
+    arr[~known] = coarse[~known]
+
+
+def _diffuse(arr: np.ndarray, known: np.ndarray, rounds: int = 4096) -> None:
+    """把 known 之外的值由外向内扩散填上（就地修改）。
+
+    两处性能关键：只在「待补区域包围盒 + 少量边距」的裁剪块里求解，
+    不再对整张 4000×3000 的图反复 np.roll；块内改用金字塔由粗到细。
+    签名与旧版一致，调用方（_smooth_fill / inpaint 兜底）无需改动。
+    """
+    # 两次布尔归约就能框出待补区域，比全图 np.nonzero 便宜一个数量级
+    rows = np.flatnonzero(~known.all(axis=1))
+    if not rows.size:
+        return
+    cols = np.flatnonzero(~known.all(axis=0))
+    height, width = known.shape
+    margin = 16                    # 外圈留一圈已知像素当 Dirichlet 边界
+    gy0 = max(0, int(rows[0]) - margin)
+    gy1 = min(height, int(rows[-1]) + 1 + margin)
+    gx0 = max(0, int(cols[0]) - margin)
+    gx1 = min(width, int(cols[-1]) + 1 + margin)
+    sub_arr = np.ascontiguousarray(arr[gy0:gy1, gx0:gx1], dtype=np.float32)
+    sub_known = known[gy0:gy1, gx0:gx1]
+    if not sub_known.any():
+        return
+    _diffuse_pyramid(sub_arr, sub_known, rounds)
+    local_unknown = ~sub_known
+    region = arr[gy0:gy1, gx0:gx1]
+    region[local_unknown] = sub_arr[local_unknown]
 
 
 def _smooth_fill(arr: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> None:
@@ -98,8 +203,91 @@ def _smooth_fill(arr: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> None:
     _diffuse(arr, known)
 
 
+def _smooth_edge(values: np.ndarray, window: int) -> np.ndarray:
+    """沿边方向做盒式平滑，只留下低频亮度/颜色渐变。
+
+    边界差里混着纹理的高频起伏（草叶、字边），直接铺进整块会把反射
+    出来的纹理抹成色带；平滑后相当于只校正「框外整体比框内亮一点」
+    这类渐变台阶。edge padding 保证首尾不会被补零拉低。
+    """
+    length = values.shape[0]
+    if length <= 2 or window <= 1:
+        return values
+    w = min(window, length)
+    w = w if w % 2 else w - 1
+    if w <= 1:
+        return values
+    pad = (w - 1) // 2
+    ext = np.pad(values, ((pad, pad), (0, 0)), mode="edge")
+    kernel = np.full(w, 1.0 / w, dtype=np.float32)
+    cols = [np.convolve(ext[:, c], kernel, mode="valid")
+            for c in range(values.shape[1])]
+    return np.stack(cols, axis=1).astype(np.float32)
+
+
+def _reflect_seam_correction(arr: np.ndarray, block: np.ndarray,
+                             good: np.ndarray, y0: int, y1: int,
+                             x0: int, x1: int) -> None:
+    """四边接缝校正：把「外侧实际值 − 填充值」按到各边的距离插回框内。
+
+    _strip_fill 只做了上下两道的线性校正；这里推广到四条边，用 Coons
+    双线性片（等价于给矩形边界做一次廉价的 Poisson/调和插值）：边界上
+    精确等于该边的差值，向框内平滑过渡。天空、逆光这种整体渐变背景上，
+    四边反射回来的内容不再在框边出现一圈台阶。
+    只作用于确实由反射填好的像素；没填到的留给后面的扩散，避免把水印
+    残值也一起抬亮。
+    """
+    height, width = arr.shape[:2]
+    rows, cols = block.shape[:2]
+    channels = block.shape[2]
+    zeros_x = np.zeros((cols, channels), dtype=np.float32)
+    zeros_y = np.zeros((rows, channels), dtype=np.float32)
+
+    # 外侧紧邻一圈的实际像素 − 框内对应边界行的填充值
+    top = (arr[y0 - 1, x0:x1].astype(np.float32) - block[0]
+           if y0 > 0 else zeros_x.copy())
+    bottom = (arr[y1, x0:x1].astype(np.float32) - block[-1]
+              if y1 < height else zeros_x.copy())
+    left = (arr[y0:y1, x0 - 1].astype(np.float32) - block[:, 0]
+            if x0 > 0 else zeros_y.copy())
+    right = (arr[y0:y1, x1].astype(np.float32) - block[:, -1]
+             if x1 < width else zeros_y.copy())
+    if not any(v.any() for v in (top, bottom, left, right)):
+        return
+
+    wx = max(3, min(61, cols // 4))
+    wy = max(3, min(61, rows // 4))
+    top, bottom = _smooth_edge(top, wx), _smooth_edge(bottom, wx)
+    left, right = _smooth_edge(left, wy), _smooth_edge(right, wy)
+    # 边界本来就贴合（理想线性渐变上反射能精确复原）时不要再动：量到的
+    # 0.1 级差只是离散采样噪声，插回去反而会把完美渐变推出一点误差。
+    if float(np.mean([np.abs(v).mean() for v in
+                      (top, bottom, left, right)])) < 1.0:
+        return
+
+    ty = np.linspace(0.0, 1.0, rows, dtype=np.float32)[:, None]
+    tx = np.linspace(0.0, 1.0, cols, dtype=np.float32)[None, :]
+    # 四个角点的共识值：相邻两条边各报一个数，取平均保证 Coons 片不自相矛盾
+    c_tl = (top[0] + left[0]) * 0.5
+    c_tr = (top[-1] + right[0]) * 0.5
+    c_bl = (bottom[0] + left[-1]) * 0.5
+    c_br = (bottom[-1] + right[-1]) * 0.5
+
+    corr = ((1.0 - ty)[..., None] * top[None, :, :]
+            + ty[..., None] * bottom[None, :, :]
+            + (1.0 - tx)[..., None] * left[:, None, :]
+            + tx[..., None] * right[:, None, :])
+    corr -= (((1.0 - ty) * (1.0 - tx))[..., None] * c_tl
+             + ((1.0 - ty) * tx)[..., None] * c_tr
+             + (ty * (1.0 - tx))[..., None] * c_bl
+             + (ty * tx)[..., None] * c_br)
+    corr = np.clip(corr, -48.0, 48.0)     # 极端边缘（框边压着强反差）不许带跑整块
+    corr[~good] = 0.0
+    block += corr
+
+
 def _reflect_fill(arr: np.ndarray, y0: int, y1: int,
-                  x0: int, x1: int) -> np.ndarray:
+                  x0: int, x1: int, correct: bool = True) -> np.ndarray:
     """四条边各反射一份候选，逐像素取中位数，返回已填好的像素掩码。
 
     为什么不是「取最近那条边」：那等于把框分成四块斜向区域，每块复制一条
@@ -137,9 +325,12 @@ def _reflect_fill(arr: np.ndarray, y0: int, y1: int,
         warnings.simplefilter("ignore", RuntimeWarning)
         filled = np.nanmedian(np.stack(stack), axis=0)
     good = ~np.isnan(filled[..., 0])
-    block = arr[y0:y1, x0:x1].copy()
+    block = arr[y0:y1, x0:x1].astype(np.float32)
     block[good] = filled[good]
-    arr[y0:y1, x0:x1] = block
+    if correct:
+        # arr 此刻还是原图，四条边外侧的实际值可以直接拿来当边界条件
+        _reflect_seam_correction(arr, block, good, y0, y1, x0, x1)
+    arr[y0:y1, x0:x1] = np.clip(block, 0, 255)
     return good
 
 
@@ -177,6 +368,222 @@ def _strip_fill(arr: np.ndarray, y0: int, y1: int,
     return np.ones((rows, x1 - x0), dtype=bool)
 
 
+def _strip_fill_v(arr: np.ndarray, y0: int, y1: int,
+                  x0: int, x1: int) -> np.ndarray:
+    """竖长条水印（左右侧边栏式）：_strip_fill 转置一下就是横行复制版本。
+
+    transpose 返回的是视图而不是副本，写进去就是写回原图；横纵参数互换后，
+    「上方/下方」自然变成「左侧/右侧」，接缝的线性校正也跟着沿 x 方向走。
+    返回的掩码同样要转置回 (rows, cols)，供上层判断哪些像素还需要扩散兜底。
+    """
+    ok = _strip_fill(arr.transpose(1, 0, 2), x0, x1, y0, y1)
+    return ok.T
+
+
+def _patchmatch_fill(arr: np.ndarray, y0: int, y1: int,
+                     x0: int, x1: int,
+                     iterations: int = 2) -> np.ndarray:
+    """简化版 PatchMatch：在框周围找最像的 patch，由外向内一圈圈长进去。
+
+    反射中位数是「每个像素各问一条边」，这里改成「整块一起问周围」：草地、
+    布料、砖墙这类重复纹理能保住颗粒走向，不会把四个方向平均成糊块。纯
+    numpy、不引新依赖，代价是比反射慢一个数量级，所以只作为显式档位，
+    不进 auto 分派。
+
+    步骤：
+      1. 框内铺锚点网格，按到框边的距离分环，从最外环往里逐环合成，
+         上一环的结果就是下一环的已知上下文；
+      2. 每个锚点先扫一组结构化平移（覆盖常见纹理周期的整倍数），再做
+         propagation（上/左邻居的最优偏移）+ random search（半径逐轮减半）。
+         候选是任意整数坐标、不吸附到网格，周期纹理能找到精确相位；
+      3. 匹配只在「已知像素」上算 7×7 采样点的 SSD；源块只要碰到还没填的
+         框内像素就一票否决，绝不让水印白块被当成上下文学回去；
+      4. 重叠 patch 用抬高的三角窗加权平均，最后复用四边接缝校正。
+    返回已填好的像素掩码；没盖到的洞给个中性初值，交给 _diffuse 兜底。
+    """
+    height, width = arr.shape[:2]
+    rows, cols = y1 - y0, x1 - x0
+    if rows <= 0 or cols <= 0:
+        return np.zeros((max(0, rows), max(0, cols)), dtype=bool)
+    # 锚点间距越大，总锚点数越少；patch 取 2*step+1 保证相邻锚点的块有重叠
+    step = int(np.clip(np.sqrt(rows * cols) / 40.0, 2, 12))
+    ps = min(2 * step + 1, min(height, width))
+    max_y, max_x = height - ps, width - ps
+    if ps < 3 or max_y < 0 or max_x < 0:
+        return _reflect_fill(arr, y0, y1, x0, x1)
+    # 框几乎铺满整张图：上下或左右总有一侧找不到够大的已知源块
+    if (y0 < ps and y1 > max_y) or (x0 < ps and x1 > max_x):
+        return _reflect_fill(arr, y0, y1, x0, x1)
+
+    rng = np.random.default_rng(20240617)  # 固定种子，同样输入给同样结果
+    work = np.asarray(arr, dtype=np.float32)  # float32 时是视图，只写框内
+    known = np.ones((height, width), dtype=bool)
+    known[y0:y1, x0:x1] = False
+    block = np.ascontiguousarray(work[y0:y1, x0:x1]).copy()
+    filled = np.zeros((rows, cols), dtype=bool)
+
+    # ---- 锚点网格与分环 ----
+    ays = np.arange(y0, y1, step, dtype=np.int64)
+    axs = np.arange(x0, x1, step, dtype=np.int64)
+    na_y, na_x = int(ays.size), int(axs.size)
+    gy_idx = np.broadcast_to(np.arange(na_y)[:, None], (na_y, na_x))
+    gx_idx = np.broadcast_to(np.arange(na_x)[None, :], (na_y, na_x))
+    ring_a = np.minimum(np.minimum(gy_idx, gx_idx),
+                        np.minimum(na_y - 1 - gy_idx, na_x - 1 - gx_idx))
+    n_rings = int(ring_a.max()) + 1
+    ring_p = np.minimum(
+        np.minimum(np.arange(rows)[:, None] // step,
+                   np.arange(cols)[None, :] // step),
+        np.minimum((rows - 1 - np.arange(rows))[:, None] // step,
+                   (cols - 1 - np.arange(cols))[None, :] // step))
+
+    field = np.full((na_y, na_x, 2), -1, dtype=np.int64)
+    win1 = 0.15 + 0.85 * (1.0 - np.abs(np.linspace(-1.0, 1.0, ps)))
+    win = np.outer(win1, win1).astype(np.float32)
+    half, center = ps // 2, step // 2
+    ii, jj = np.arange(ps)[:, None], np.arange(ps)[None, :]
+    si = np.linspace(0, ps - 1, 7).astype(np.int64)
+    sy, sx = si[:, None], si[None, :]
+
+    # 结构化平移：近处细扫 + 远处按 1/4 跨度扫，覆盖常见纹理周期的整倍数
+    radius = int(max(3 * ps, 32))
+    vals = np.unique(np.concatenate([
+        np.array([-ps, 0, ps], dtype=np.int64),
+        np.linspace(-radius, radius, 5).astype(np.int64)]))
+    oy, ox = np.meshgrid(vals, vals, indexing="ij")
+    offsets = np.stack([oy.ravel(), ox.ravel()], axis=1)
+    chunk = 96
+
+    def _clip_pos(pos: np.ndarray) -> np.ndarray:
+        pos[..., 0] = np.clip(pos[..., 0], 0, max_y)
+        pos[..., 1] = np.clip(pos[..., 1], 0, max_x)
+        return pos
+
+    def _cost(ay, ax, pos, bad_box) -> np.ndarray:
+        """(na, m, 2) 个源块左上角 → (na, m) 的 masked SSD。"""
+        ty = np.clip(ay[:, None, None] + sy, 0, height - 1)
+        tx = np.clip(ax[:, None, None] + sx, 0, width - 1)
+        target = work[ty, tx]
+        valid = known[ty, tx]
+        cnt = np.maximum(valid.sum(axis=(1, 2)).astype(np.float32), 3.0)
+        py = pos[..., 0][..., None, None] + sy
+        px = pos[..., 1][..., None, None] + sx
+        diff = target[:, None] - work[py, px]
+        cost = np.sum(diff * diff * valid[:, None, :, :, None],
+                      axis=(2, 3, 4)) / cnt[:, None]
+        # 源块只要和「还没填的区域」相交就作废：水印白块绝不能进上下文
+        by0, by1, bx0, bx1 = bad_box
+        sy0, sx0 = pos[..., 0], pos[..., 1]
+        cost[(sy0 < by1) & (sy0 + ps > by0)
+             & (sx0 < bx1) & (sx0 + ps > bx0)] = np.inf
+        return cost
+
+    for ring in range(n_rings):
+        bad_rows = np.flatnonzero((~known).any(axis=1))
+        bad_cols = np.flatnonzero((~known).any(axis=0))
+        if not bad_rows.size:
+            break
+        bad_box = (int(bad_rows[0]), int(bad_rows[-1]) + 1,
+                   int(bad_cols[0]), int(bad_cols[-1]) + 1)
+        by0, by1 = bad_box[0], bad_box[1]
+        # 所有候选都失效时的安全源：贴着待填区上沿或下沿取一块纯已知内容
+        safe_y = (int(np.clip(by0 - ps, 0, max_y)) if y0 >= ps
+                  else int(np.clip(by1, 0, max_y)))
+        safe = np.array([safe_y, int(np.clip(x0, 0, max_x))], dtype=np.int64)
+        sel = np.argwhere(ring_a == ring)
+        if not sel.size:
+            continue
+        na = int(sel.shape[0])
+        # patch 以锚点格子的中心为原点，最外环因此有一半落在框外当上下文
+        ay = y0 + sel[:, 0] * step + center - half
+        ax = x0 + sel[:, 1] * step + center - half
+        base = np.stack([ay, ax], axis=1)
+        up = field[np.maximum(sel[:, 0] - 1, 0), sel[:, 1]].copy()
+        left = field[sel[:, 0], np.maximum(sel[:, 1] - 1, 0)].copy()
+        up_ok = (sel[:, 0] > 0) & (up[:, 0] >= 0)
+        left_ok = (sel[:, 1] > 0) & (left[:, 0] >= 0)
+        idx = np.arange(na)
+
+        def _pick(cost, pos):
+            k = np.argmin(cost, axis=1)
+            best = pos[idx[:cost.shape[0]], k]
+            dead = np.isinf(cost[idx[:cost.shape[0]], k])
+            best[dead] = safe
+            return best
+
+        # pass 1：结构化平移粗搜，分块控制峰值内存
+        cur = np.empty((na, 2), dtype=np.int64)
+        for s in range(0, na, chunk):
+            e = min(s + chunk, na)
+            pos = _clip_pos(base[s:e, None, :] + offsets[None, :, :])
+            cur[s:e] = _pick(_cost(ay[s:e], ax[s:e], pos, bad_box), pos)
+        # pass 2：propagation + random search
+        for it in range(max(1, iterations)):
+            r = max(2 * ps, 16) * (0.5 ** it)
+            rand = cur[:, None, :] + rng.uniform(-r, r, (na, 3, 2)).astype(np.int64)
+            up_c = np.where(up_ok[:, None, None],
+                            (up + np.array([step, 0]))[:, None, :],
+                            cur[:, None, :])
+            left_c = np.where(left_ok[:, None, None],
+                              (left + np.array([0, step]))[:, None, :],
+                              cur[:, None, :])
+            cand = _clip_pos(np.concatenate(
+                [cur[:, None, :], up_c, left_c, rand], axis=1))
+            cur = _pick(_cost(ay, ax, cand, bad_box), cand)
+        field[sel[:, 0], sel[:, 1]] = cur
+
+        # 重叠 patch 加权平均，只写当前环，保证由外向内生长
+        ring_mask = ring_p == ring
+        acc = np.zeros((rows, cols, 3), dtype=np.float32)
+        wsum = np.zeros((rows, cols, 1), dtype=np.float32)
+        patches = work[cur[:, 0, None, None] + ii,
+                       cur[:, 1, None, None] + jj]
+        for k in range(na):
+            gy0, gx0 = int(ay[k]) - y0, int(ax[k]) - x0
+            py0, px0 = max(0, -gy0), max(0, -gx0)
+            ly0, lx0 = max(0, gy0), max(0, gx0)
+            ly1, lx1 = min(rows, gy0 + ps), min(cols, gx0 + ps)
+            if ly1 <= ly0 or lx1 <= lx0:
+                continue
+            h, w = ly1 - ly0, lx1 - lx0
+            ww = win[py0:py0 + h, px0:px0 + w] * ring_mask[ly0:ly1, lx0:lx1]
+            acc[ly0:ly1, lx0:lx1] += patches[k, py0:py0 + h,
+                                            px0:px0 + w] * ww[..., None]
+            wsum[ly0:ly1, lx0:lx1] += ww[..., None]
+        have = (wsum[..., 0] > 1e-6) & ring_mask
+        if have.any():
+            block[have] = acc[have] / wsum[have]
+            filled |= have
+            known[y0:y1, x0:x1] = filled
+            work[y0:y1, x0:x1] = block
+
+    if not filled.all():
+        # 洞里别留着水印本身的颜色，给后面的扩散一个中性初值
+        if filled.any():
+            neutral = np.median(block[filled], axis=0)
+        else:
+            # 没填到任何像素时取框外紧邻一圈，别对整张图取中位数（大图几百 MB）
+            strips = []
+            if y0 > 0:
+                strips.append(work[y0 - 1, x0:x1])
+            if y1 < height:
+                strips.append(work[y1, x0:x1])
+            if x0 > 0:
+                strips.append(work[y0:y1, x0 - 1])
+            if x1 < width:
+                strips.append(work[y0:y1, x1])
+            neutral = (np.median(np.concatenate(strips), axis=0) if strips
+                       else np.full(3, 128.0, dtype=np.float32))
+        block[~filled] = neutral
+    if filled.any():
+        _reflect_seam_correction(arr, block, filled, y0, y1, x0, x1)
+    result = np.clip(block, 0, 255)
+    if np.issubdtype(arr.dtype, np.integer):
+        result = np.rint(result)
+    arr[y0:y1, x0:x1] = result
+    return filled
+
+
 def as_box_list(box) -> list:
     """把「一个框」或「一批框」统一成 [(x0, y0, x1, y1), ...]。
 
@@ -194,20 +601,25 @@ def as_box_list(box) -> list:
 
 
 def pick_method(box, width: int, height: int, method: str = "auto") -> str:
-    """auto：扁长框（水印字那种横带）走竖列复制，接近方/竖长的框走中位数反射。"""
+    """auto：横带走竖列复制，竖条走横行复制，接近方形的框走中位数反射。"""
     if method != "auto":
         return method
     y0, y1, x0, x1 = box_pixels(box, width, height)
     rows = max(1, y1 - y0)
     cols = max(1, x1 - x0)
-    return "strip" if cols >= rows * 2 else "mirror"
+    if cols >= rows * 2:
+        return "strip"
+    if rows >= cols * 2:
+        return "strip_v"
+    return "mirror"
 
 
 def inpaint(rgb: np.ndarray, box, method: str = "auto") -> np.ndarray:
     """把框覆盖的区域补掉，返回新的 uint8 RGB 数组。
 
     box 可以是一个 (x0, y0, x1, y1) 比例框，也可以是多个框的列表。
-    框内内容完全丢弃；框外像素一个都不动。method 取 auto / strip / mirror / smooth。
+    框内内容完全丢弃；框外像素一个都不动。
+    method 取 auto / strip / strip_v / mirror / patchmatch / smooth / lama。
     """
     if method == "lama":
         # 模型级修复单独一层：装不了/没模型时直接报错，让界面提示用户
@@ -221,8 +633,13 @@ def inpaint(rgb: np.ndarray, box, method: str = "auto") -> np.ndarray:
         chosen = pick_method(one, width, height, method)
         if chosen == "smooth":
             _smooth_fill(arr, y0, y1, x0, x1)
-        elif chosen == "strip":
-            ok = _strip_fill(arr, y0, y1, x0, x1)
+        elif chosen in ("strip", "strip_v", "patchmatch"):
+            if chosen == "strip":
+                ok = _strip_fill(arr, y0, y1, x0, x1)
+            elif chosen == "strip_v":
+                ok = _strip_fill_v(arr, y0, y1, x0, x1)
+            else:
+                ok = _patchmatch_fill(arr, y0, y1, x0, x1)
             if not ok.all():
                 known = np.ones((height, width), dtype=bool)
                 known[y0:y1, x0:x1] = ok
@@ -322,16 +739,24 @@ TINT_REFS = {
 }
 
 
-def _tint_scores(rgb: np.ndarray) -> dict:
-    """各色系的“偏向程度”：正数越大表示越像那种淡色。"""
-    arr = rgb.astype(np.float32)
+def _tint_score(arr: np.ndarray, name: str) -> np.ndarray:
+    """单个色系的“偏向程度”：正数越大表示越像那种淡色。"""
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    return {
-        "黄": (r + g) * 0.5 - b,
-        "蓝": b - (r + g) * 0.5,
-        "粉": r - g,
-        "绿": g - (r + b) * 0.5,
-    }
+    if name == "黄":
+        return (r + g) * 0.5 - b
+    if name == "蓝":
+        return b - (r + g) * 0.5
+    if name == "粉":
+        return r - g
+    if name == "绿":
+        return g - (r + b) * 0.5
+    return np.zeros(arr.shape[:2], dtype=np.float32)
+
+
+def _tint_scores(rgb: np.ndarray) -> dict:
+    arr = rgb.astype(np.float32)
+    return {name: _tint_score(arr, name)
+            for name in ("黄", "蓝", "粉", "绿")}
 
 
 def _robust_threshold(score: np.ndarray, floor: float = 3.0,
@@ -381,6 +806,72 @@ def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
     score = _tint_scores(rgb)[name]
     limit = float(diff) if diff is not None else _robust_threshold(score[pale])
     return (score > limit) & pale
+
+
+def estimate_tint_ref(rgb: np.ndarray, mask: np.ndarray,
+                      fallback=None, tint=None,
+                      top_pct: float = 5.0) -> tuple:
+    """从掩膜里最亮的一小撮像素自估水印参考色，替代写死的 TINT_REFS。
+
+    取掩膜内亮度最高 5% 像素的中位色 —— 它们是「最淡的水印压在白底」，
+    偏色方向可信、离群少（抗锯齿/黑字边缘被排除），但色度被 α 稀释过：
+    直接拿它当 W 会让 (I-B)/(W-B) 系统性偏大，实测蓝色水印被过矫正到
+    比原来更蓝。所以先估纸面亮度（浅色水印总有一个通道几乎不衰减，用
+    观测色的最大通道近似），再把这一点偏色按固定参考色的色度幅度还原。
+    结果是：色相方向跟图走（各家 App 水印色自适应），色度幅度与反解公式
+    的标定保持一致（α 不漂移）。
+
+    护栏：偏色太弱、放大倍数离谱、色相方向与固定色系相反、结果过暗时，
+    一律退回固定参考色。
+    """
+    if fallback is None:
+        fallback = TINT_REFS.get(tint, LIGHT_REF) if tint else LIGHT_REF
+    base = np.asarray(fallback, dtype=np.float32)
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return tuple(float(v) for v in base)
+    arr = np.asarray(rgb, dtype=np.float32)
+    luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    vals, lum = arr[mask], luma[mask]
+    k = min(vals.shape[0], max(1, int(np.ceil(vals.shape[0] * top_pct / 100.0))))
+    obs = np.median(vals[np.argpartition(lum, -k)[-k:]], axis=0).astype(np.float32)
+    paper = float(obs.max())
+    delta = obs - paper                       # 相对纸面的偏色（各通道 ≤0）
+    chroma_obs = float(-delta.min())
+    chroma_base = float(base.max() - base.min())
+    if chroma_obs < 2.0 or chroma_base < 2.0:
+        return tuple(float(v) for v in base)
+    scale = float(np.clip(chroma_base / chroma_obs, 0.5, 12.0))
+    base_delta = base - float(base.max())
+    denom = float(np.linalg.norm(delta) * np.linalg.norm(base_delta))
+    if denom > 0 and float(np.dot(delta, base_delta) / denom) < 0.3:
+        return tuple(float(v) for v in base)   # 偏色方向反了，多半是误检
+    ref = np.clip(paper + delta * scale, 0.0, 255.0)
+    if float(ref.min()) < 120.0:
+        return tuple(float(v) for v in base)
+    return tuple(float(v) for v in ref)
+
+
+def _choose_tint_ref(rgb: np.ndarray, mask: np.ndarray, tint: str,
+                     strength: float = 1.0) -> tuple:
+    """在「固定参考色 / 自估参考色 / 两者折中」里选反解后残影最小的那个。
+
+    α 与水印色度在单张图上无法分离（观测到的偏色是 α·(W-B)），所以纯自估
+    偶尔会跑偏。这里用图自身做闭环：反解完看水印区还剩多少偏色（残影和
+    过矫正都会让 |偏色| 变大），挑最小的。固定表因此只在确实更好时才被
+    替换，标准四色不会有任何回归。
+    """
+    base = TINT_REFS.get(tint, LIGHT_REF)
+    estimated = estimate_tint_ref(rgb, mask, tint=tint)
+    mid = tuple((np.asarray(base, dtype=np.float32)
+                 + np.asarray(estimated, dtype=np.float32)) * 0.5)
+    best, best_cost = base, float("inf")
+    for ref in (base, estimated, mid):
+        fixed = undo_light_watermark(rgb, strength, ref=ref, tint=tint)
+        cost = float(np.abs(_tint_score(fixed.astype(np.float32), tint)[mask]).mean())
+        if cost < best_cost:
+            best, best_cost = ref, cost
+    return best
 
 
 def _run_lengths(mask: np.ndarray):
@@ -454,24 +945,33 @@ def _nearest4_fill(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _safe_den(value: float) -> float:
+    """反解分母的下限保护：绿色参考色的 Wr-Wb 正好是 0，直接除会出 inf。"""
+    if abs(value) >= 4.0:
+        return value
+    return 4.0 if value >= 0 else -4.0
+
+
 def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
-                        ref=LIGHT_REF, tint=None) -> np.ndarray:
+                        ref=None, tint=None) -> np.ndarray:
     """把半透明浅色水印“解”掉，而不是“补”掉。
 
     I = (1-α)·背景 + α·参考色，背景（纸张、表格底）近似中性，于是
     α 可以由 (R-B)/(Wr-Wb)、(G-B)/(Wg-Wb) 估出来，再反解背景。
     这样文字和表格线的像素压根没被动过，不会留下补图常见的暗边。
     strength 是修正强度（1.0 全解，0.5 只解一半），改小可以少伤原图的暖色调。
+    ref 显式传入时优先（传自估值）；否则按 tint 查固定表。
     """
-    if tint is not None and tint in TINT_REFS:
-        ref = TINT_REFS[tint]
+    if ref is None:
+        ref = TINT_REFS.get(tint, LIGHT_REF) if tint else LIGHT_REF
     arr = rgb.astype(np.float32)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
     wr, wg, wb = float(ref[0]), float(ref[1]), float(ref[2])
     luma = 0.299 * r + 0.587 * g + 0.114 * b
     # 灰底（例如表格表头）上反解容易把灰色解出色斑，亮度越低解越少
     scale = np.clip((luma - 200.0) / 40.0, 0.35, 1.0) * float(strength)
-    alpha = ((r - b) / (wr - wb) + (g - b) / (wg - wb)) * 0.5 * scale
+    alpha = ((r - b) / _safe_den(wr - wb)
+             + (g - b) / _safe_den(wg - wb)) * 0.5 * scale
     alpha = np.clip(alpha, 0.0, 0.6)
     alpha = np.where((luma < 150.0) | (alpha < 0.015), 0.0, alpha)
     denom = np.clip(1.0 - alpha, 0.05, 1.0)[..., None]
@@ -553,7 +1053,8 @@ def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
     mask = detect_light_watermark(rgb, tint=tint)
     if not mask.any():
         return np.array(rgb, dtype=np.uint8, copy=True)
-    first = undo_light_watermark(rgb, tint=tint)
+    ref = _choose_tint_ref(rgb, mask, tint)
+    first = undo_light_watermark(rgb, tint=tint, ref=ref)
     first = _flatten_background(first, mask)
     residual = detect_light_watermark(first, diff=2.0, gmin=105,
                                       luma_gate=110.0, tint=tint)
@@ -636,6 +1137,7 @@ __all__ = [
     "box_pixels",
     "clean_light_watermark",
     "detect_light_watermark",
+    "estimate_tint_ref",
     "inpaint",
     "iter_photos",
     "normalize_box",
