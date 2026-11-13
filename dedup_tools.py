@@ -54,6 +54,8 @@ SKIP_DIRS = {
 }
 
 MANIFEST_DIR = app_dir() / "_操作记录"
+SCAN_HISTORY_DIR = app_dir() / "_扫描历史"
+SCAN_HISTORY_KEEP = 20  # R23：扫描历史最多留 20 份，按 mtime 清理
 MANIFEST_KEEP = 12
 _LOG = logging.getLogger("dedup.tools")
 
@@ -511,7 +513,13 @@ def save_manifest(kind: str, root: Path, records) -> Path:
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                     encoding="utf-8")
     os.replace(temp, path)
-    for old in sorted(MANIFEST_DIR.glob(f"{kind}-*.json"))[:-MANIFEST_KEEP]:
+    # R23 save_manifest 修 bug：清理改按文件 mtime（修改时间）排序，不再按
+    # 文件名字典序。文件名含本地时区时间戳，时区一切换（比如北京切 UTC），
+    # 新文件字典序会排在旧文件之前，刚写就被当“最旧”删掉，撤销报 FileNotFoundError。
+    # mtime 是文件系统时间，不受文件名时区影响。
+    _all = sorted(MANIFEST_DIR.glob(f"{kind}-*.json"),
+                  key=lambda p: p.stat().st_mtime)
+    for old in _all[:-MANIFEST_KEEP]:
         try:
             old.unlink()
         except Exception as exc:
@@ -584,6 +592,83 @@ def last_restorable_cleanup():
            for r in items):
         return path
     return None
+
+
+# ---------------------------------------------------------------- 扫描历史（R23）
+def save_scan_history(root, groups, file_count=0, elapsed=0.0) -> Path:
+    """把一次扫描结果存成历史快照（JSON），供“扫描历史对比”用。
+
+    只存组的关键信息（类型、相似度、备注、每项路径/大小/保留位），不存指纹。
+    按 mtime 只留最新 SCAN_HISTORY_KEEP 份。"""
+    SCAN_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    path = SCAN_HISTORY_DIR / f"scan-{stamp}.json"
+    data = {
+        "root": str(Path(root)),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_count": file_count,
+        "elapsed": round(float(elapsed), 2),
+        "groups": [
+            {
+                "kind": g.kind,
+                "similarity": g.similarity,
+                "note": g.note,
+                "keep": g.keep,
+                "wasted": g.wasted,
+                "items": [str(i.path) for i in g.items],
+            }
+            for g in groups
+        ],
+    }
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+    os.replace(temp, path)
+    # 按 mtime 清理，只留最新 SCAN_HISTORY_KEEP 份（与 save_manifest 同款修法）
+    _all = sorted(SCAN_HISTORY_DIR.glob("scan-*.json"),
+                  key=lambda p: p.stat().st_mtime)
+    for old in _all[:-SCAN_HISTORY_KEEP]:
+        try:
+            old.unlink()
+        except Exception as exc:
+            ignore(__name__, exc)
+    return path
+
+
+def list_scan_history():
+    """列出扫描历史快照（最新在前），每项为 (path, root, time, 组数)。"""
+    if not SCAN_HISTORY_DIR.exists():
+        return []
+    out = []
+    for path in sorted(SCAN_HISTORY_DIR.glob("scan-*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        out.append((path, data.get("root", ""), data.get("time", ""),
+                    len(data.get("groups", []))))
+    return out
+
+
+def load_scan_history(path):
+    """读一份扫描历史快照，返回 dict（root/time/groups）。"""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def compare_scans(old, new):
+    """对比两次扫描：返回 (新增的组, 消失的组, 两次都有的组)。
+
+    组按“文件路径集合”认同（排序后拼成 key），不认相似度数字。
+    old/new 为 load_scan_history() 返回的 dict。"""
+    def _key(group):
+        return tuple(sorted(str(p) for p in group.get("items", [])))
+    _old = {_key(g): g for g in old.get("groups", [])}
+    _new = {_key(g): g for g in new.get("groups", [])}
+    added = [_new[k] for k in _new if k not in _old]
+    removed = [_old[k] for k in _old if k not in _new]
+    kept = [_new[k] for k in _new if k in _old]
+    return added, removed, kept
 
 
 def read_manifest(path: Path) -> dict:

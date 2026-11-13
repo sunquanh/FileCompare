@@ -53,6 +53,18 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
     """
     root = Path(options.root).resolve()
     skip = {str(x).strip().lower() for x in options.exclude if str(x).strip()}
+    # R23 忽略列表：完整路径（文件或目录），扫描时跳过。目录按前缀匹配。
+    _ignore = [norm_path(Path(str(x)).expanduser()).rstrip("/" + os.sep)
+               for x in getattr(options, "ignore_paths", ()) or ()
+               if str(x).strip()]
+
+    def _is_ignored(candidate: Path) -> bool:
+        """R23：该路径（文件或目录）是否在忽略列表里（精确匹配或位于被忽略的目录下）。"""
+        if not _ignore:
+            return False
+        text = norm_path(candidate).rstrip("/" + os.sep)
+        return any(text == q or text.startswith((q + os.sep, q + "/"))
+                   for q in _ignore)
     protect_roots = [norm_path(Path(x).expanduser()).rstrip("/" + os.sep)
                      for x in list(options.protect)
                      + list(getattr(options, "reference_dirs", ()))]
@@ -81,13 +93,16 @@ def collect_files(options: ScanOptions, cancel=None, on_progress=None):
                 dirnames[:] = [d for d in dirnames
                                if d.lower() not in skip
                                and not should_skip_dir(d, depth)
-                               and not d.startswith(SKIP_PREFIX)]
+                               and not d.startswith(SKIP_PREFIX)
+                               and not _is_ignored(directory / d)]
             else:
                 dirnames[:] = []
             for name in filenames:
                 if name.startswith(SKIP_PREFIX):
                     continue
                 path = directory / name
+                if _is_ignored(path):
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:

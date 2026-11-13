@@ -386,6 +386,7 @@ class ScanOptions:
     min_size: int = 0
     exclude: tuple = ()
     protect: tuple = ()
+    ignore_paths: tuple = ()  # R23 忽略列表：这些文件/目录扫描时跳过（完整路径）
     reference_dirs: tuple = ()
     quick_scan: bool = False
     recursive: bool = True
@@ -398,6 +399,7 @@ class ScanOptions:
         if not self.workers:
             self.workers = min(8, os.cpu_count() or 4)
         self.exclude = tuple(x for x in (self.exclude or ()) if x)
+        self.ignore_paths = tuple(x for x in (self.ignore_paths or ()) if x)
         self.protect = tuple(x for x in (self.protect or ()) if x)
         self.reference_dirs = tuple(x for x in (self.reference_dirs or ())
                                     if x)

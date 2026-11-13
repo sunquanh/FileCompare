@@ -224,6 +224,16 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
                cancel=None, cache=None):
     """on_progress(stage, done, total, detail) / on_log(message)"""
     emit = on_progress or (lambda *a: None)
+
+    def _cur_name(item):
+        """R23 进度显示当前文件名：parallel_map 把刚完成的那一项传回来，
+        取它的文件名拼到进度提示后面；拿不到就返回空串。"""
+        try:
+            if item is not None and hasattr(item, "path"):
+                return f" · {Path(item.path).name}"
+        except Exception:
+            pass
+        return ""
     say = on_log or (lambda *a: None)
     cancel = cancel or threading.Event()
     started = time.perf_counter()
@@ -338,7 +348,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             return fps_list
 
         throttle = ProgressThrottle(
-            lambda d, t, m: emit("photo", d, t, f"照片指纹 {d:,}/{t:,}"))
+            lambda d, t, m: emit("photo", d, t,
+                f"照片指纹 {d:,}/{t:,}" + _cur_name(m)))
         fps_nested = parallel_map(photo_work, todo_photos, options.workers,
                                 cancel=cancel,
                                 on_progress=lambda d, t, m: throttle(d, t, m))
@@ -473,7 +484,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             return sig
 
         throttle = ProgressThrottle(
-            lambda d, t, m: emit("video", d, t, f"视频关键帧 {d:,}/{t:,}"))
+            lambda d, t, m: emit("video", d, t,
+                f"视频关键帧 {d:,}/{t:,}" + _cur_name(m)))
         sigs = parallel_map(video_work, todo_videos, max(2, options.workers // 2),
                             cancel=cancel,
                             on_progress=lambda d, t, m: throttle(d, t, m))
@@ -532,7 +544,8 @@ def _scan_impl(options: ScanOptions, on_progress=None, on_log=None,
             return tags
 
         throttle = ProgressThrottle(
-            lambda d, t, m: emit("audio", d, t, f"音乐标签 {d:,}/{t:,}"))
+            lambda d, t, m: emit("audio", d, t,
+                f"音乐标签 {d:,}/{t:,}" + _cur_name(m)))
         tags_list = parallel_map(audio_work, todo_audio, options.workers,
                                  cancel=cancel,
                                  on_progress=lambda d, t, m: throttle(d, t, m))

@@ -1145,6 +1145,28 @@ class ScanPage(tk.Frame):
         self.strict_hint.pack(fill="x", pady=(s(2), 0))
         self._strict_changed(self.seg_strict.value)
 
+        # R23 阈值可调面板：填了就覆盖上面预设里的对应值，空着用预设。
+        tk.Label(o, text="自定义阈值（留空用预设）", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
+        _th_row = tk.Frame(o, bg=t.CARD)
+        _th_row.pack(fill="x")
+        tk.Label(_th_row, text="结构相关 ≥", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(9), anchor="w").pack(side="left")
+        self.ncc_var = tk.StringVar(value=self.settings.get("img_ncc", ""))
+        _ncc_entry = tk.Entry(_th_row, textvariable=self.ncc_var, bg=t.INPUT,
+                              fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
+                              bd=0, highlightthickness=0, font=t.font(9), width=6)
+        _ncc_entry.pack(side="left", padx=(s(4), s(12)))
+        self._placeholder(_ncc_entry, self.ncc_var, "如 0.95")
+        tk.Label(_th_row, text="布局差 ≤", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(9), anchor="w").pack(side="left")
+        self.layout_var = tk.StringVar(value=self.settings.get("img_layout", ""))
+        _layout_entry = tk.Entry(_th_row, textvariable=self.layout_var, bg=t.INPUT,
+                                 fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
+                                 bd=0, highlightthickness=0, font=t.font(9), width=6)
+        _layout_entry.pack(side="left", padx=(s(4), 0))
+        self._placeholder(_layout_entry, self.layout_var, "如 12")
+
         tk.Label(o, text="最小文件大小", bg=t.CARD, fg=t.TEXT_DIM,
                  font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
         self.seg_size = Segmented(
@@ -1165,6 +1187,19 @@ class ScanPage(tk.Frame):
                             bd=0, highlightthickness=0, font=t.font(9))
         ex_entry.pack(fill="x", padx=s(10), ipady=s(4))
         self._placeholder(ex_entry, self.exclude_var, "例如：缓存, 备份（逗号分隔）")
+
+        tk.Label(o, text="忽略文件/目录（扫描时跳过，完整路径，逗号分隔）", bg=t.CARD, fg=t.TEXT_DIM,
+                 font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
+        ig_field = tk.Frame(o, bg=t.INPUT, highlightthickness=1,
+                            highlightbackground=t.BORDER, highlightcolor=t.ACCENT)
+        ig_field.pack(fill="x")
+        self.ignore_var = tk.StringVar(value=self.settings.get("ignore_paths", ""))
+        ig_entry = tk.Entry(ig_field, textvariable=self.ignore_var, bg=t.INPUT,
+                            fg=t.TEXT, insertbackground=t.TEXT, relief="flat",
+                            bd=0, highlightthickness=0, font=t.font(9))
+        ig_entry.pack(fill="x", padx=s(10), ipady=s(4))
+        self._placeholder(ig_entry, self.ignore_var,
+                          "例如：D:\\旧照片\\a.jpg, D:\\备份（多个用逗号分隔）")
 
         tk.Label(o, text="保护文件夹（永不清理）", bg=t.CARD, fg=t.TEXT_DIM,
                  font=t.font(9), anchor="w").pack(fill="x", pady=(s(6), s(4)))
@@ -1532,6 +1567,24 @@ class ScanPage(tk.Frame):
 
         preset = self.seg_strict.value
         preset_vals = core.PRESETS.get(preset, core.PRESETS["standard"])
+        # R23 自定义阈值：填了就覆盖预设。
+        try:
+            _ncc = float(self.ncc_var.get().strip())
+            if 0 < _ncc <= 1:
+                preset_vals = dict(preset_vals, img_ncc=_ncc)
+        except (ValueError, AttributeError):
+            pass
+        try:
+            _layout = float(self.layout_var.get().strip())
+            if _layout > 0:
+                preset_vals = dict(preset_vals, img_layout=_layout)
+        except (ValueError, AttributeError):
+            pass
+        # R23 忽略列表：完整路径，逗号分隔。
+        ignore_paths = tuple(
+            os.path.expandvars(os.path.expanduser(x))
+            for x in re.split(r"[,，;；\n]+",
+                              self.ignore_var.get().strip()) if x)
         exclude = tuple(re.split(r"[,，;；\s]+", self.exclude_var.get().strip()))
         exclude = tuple(x for x in exclude if x)
         protect = tuple(re.split(r"[,，;；\n]+",
@@ -1550,6 +1603,8 @@ class ScanPage(tk.Frame):
             img_dist=preset_vals["img_dist"],
             img_fine=preset_vals["img_fine"],
             img_hist=preset_vals["img_hist"],
+            img_ncc=preset_vals["img_ncc"],
+            img_layout=preset_vals["img_layout"],
             vid_dist=preset_vals["vid_dist"],
             vid_fine=preset_vals["vid_fine"],
             vid_ratio=preset_vals["vid_ratio"],
@@ -1563,7 +1618,13 @@ class ScanPage(tk.Frame):
             quick_scan=bool(self.sw_quick.value),
             recursive=bool(self.sw_recursive.value),
             keep_rule=self.settings.get("keep_rule", "best"),
+            ignore_paths=ignore_paths,
         )
+        # 存回设置，下次打开还在。
+        self.settings["img_ncc"] = self.ncc_var.get().strip()
+        self.settings["img_layout"] = self.layout_var.get().strip()
+        self.settings["ignore_paths"] = self.ignore_var.get().strip()
+        save_settings(self.settings)
         if not (opts.exact or opts.photos or opts.videos or opts.audio
                 or opts.names):
             alert(self.app, t, "没有选择检测类型",
@@ -1767,6 +1828,7 @@ class ResultsPage(tk.Frame):
         self._page = 0
         self._page_size = 50
         self.sort_key = "wasted"
+        self.sim_filter = 0  # R23 相似度筛选：0 全部，90 ≥90%，80 80–89%，1 <80%
         self.keep_rule = "best"
         self._protected = {}
         self._last_cleanup = None
@@ -1913,10 +1975,22 @@ class ResultsPage(tk.Frame):
                                      kind="ghost", icon="filter", height=34,
                                      size=8, padding=10, bg=t.BG)
         self.btn_sort.pack(side="left", padx=(s(12), 0))
+        self.btn_sim_filter = CanvasButton(bar, t, "筛选", command=self._sim_filter_menu,
+                                           kind="ghost", icon="filter", height=34,
+                                           size=8, padding=10, bg=t.BG)
+        self.btn_sim_filter.pack(side="left", padx=(s(6), 0))
         self.btn_keep = CanvasButton(bar, t, "保留策略", command=self._keep_menu,
                                      kind="ghost", icon="shield", height=34,
                                      size=8, padding=10, bg=t.BG)
         self.btn_keep.pack(side="left", padx=(s(6), 0))
+        self.btn_keep_preview = CanvasButton(bar, t, "保留预览", command=self._keep_preview,
+                                             kind="ghost", icon="eye", height=34,
+                                             size=8, padding=10, bg=t.BG)
+        self.btn_keep_preview.pack(side="left", padx=(s(6), 0))
+        self.btn_history = CanvasButton(bar, t, "扫描历史", command=self._scan_history_dialog,
+                                        kind="ghost", icon="history", height=34,
+                                        size=8, padding=10, bg=t.BG)
+        self.btn_history.pack(side="left", padx=(s(6), 0))
         self.search = SearchBox(bar, t, width=214, on_change=self._on_search)
         self.search.pack(side="right")
         pager = tk.Frame(bar, bg=t.BG)
@@ -2200,6 +2274,12 @@ class ResultsPage(tk.Frame):
         self.scanning = False
         self.app.scanning = False
         self.result = result
+        # R23 扫描历史：每次扫描完存一份快照，供“扫描历史”对比用。
+        try:
+            tools.save_scan_history(result.root, result.groups,
+                                    result.file_count, result.elapsed)
+        except Exception as exc:
+            self.app.log(f"扫描历史保存失败：{exc}", "warn")
         self.app.result = result
         self.selection.clear()
         self._size_map = {}
@@ -2317,8 +2397,18 @@ class ResultsPage(tk.Frame):
                 continue
             if q and not any(q in item.name.lower() for item in g.items):
                 continue
+            # R23 相似度筛选。
+            if self.sim_filter == 90 and g.similarity < 90:
+                continue
+            if self.sim_filter == 80 and not (80 <= g.similarity < 90):
+                continue
+            if self.sim_filter == 1 and g.similarity >= 80:
+                continue
             out.append(g)
-        if self.sort_key == "similarity":
+        if self.sort_key == "shot_time":
+            # R23 按拍摄时间：组内最早文件的修改时间（照片通常接近拍摄时间）。
+            out.sort(key=lambda g: min((i.mtime for i in g.items), default=0))
+        elif self.sort_key == "similarity":
             out.sort(key=lambda g: (-g.similarity, -g.wasted))
         elif self.sort_key == "files":
             out.sort(key=lambda g: (-len(g.items), -g.wasted))
@@ -2481,7 +2571,8 @@ class ResultsPage(tk.Frame):
     def _sort_menu(self):
         t = self.theme
         options = [("按可释放空间", "wasted"), ("按相似度", "similarity"),
-                   ("按文件数", "files"), ("按文件名", "name")]
+                   ("按文件数", "files"), ("按文件名", "name"),
+                   ("按拍摄时间", "shot_time")]
         items = [(label, "filter", lambda k=key: self._set_sort(k))
                  for label, key in options]
         x = self.btn_sort.winfo_rootx()
@@ -2495,6 +2586,72 @@ class ResultsPage(tk.Frame):
         self._render_groups()
         self.scroll.scroll_to_top()
         self.app.toast("已重新排序", "info", 1400)
+
+    def _sim_filter_menu(self):
+        """R23 相似度筛选菜单。"""
+        t = self.theme
+        options = [("全部相似度", 0), ("相似度 ≥90%", 90),
+                   ("相似度 80–89%", 80), ("相似度 <80%", 1)]
+        items = [(label, "filter", lambda k=key: self._set_sim_filter(k))
+                 for label, key in options]
+        x = self.btn_sim_filter.winfo_rootx()
+        y = self.btn_sim_filter.winfo_rooty() + self.btn_sim_filter.winfo_height() + 4
+        PopupMenu(self.app, t, items, x=x, y=y)
+
+    def _set_sim_filter(self, value):
+        self.sim_filter = value
+        self._page = 0
+        self._render_groups()
+        self.scroll.scroll_to_top()
+        _labels = {0: "全部相似度", 90: "相似度 ≥90%", 80: "相似度 80–89%",
+                   1: "相似度 <80%"}
+        _label = _labels.get(value, "全部")
+        self.app.toast(f"已筛选：{_label}", "info", 1400)
+
+    def _keep_preview(self):
+        """R23 保留规则预览：按当前保留策略，列出每组会保留哪个文件。"""
+        if not self.result or not self.result.groups:
+            self.app.toast("还没有扫描结果", "info")
+            return
+        t = self.theme
+        lines = []
+        for i, g in enumerate(self.result.groups[:20], 1):
+            keep_idx = core._pick_keep(g.kind, g.items, self.keep_rule,
+                                     self.result.root)
+            keep_item = g.items[keep_idx] if 0 <= keep_idx < len(g.items) else None
+            if keep_item is None:
+                continue
+            lines.append(f"{i}. {g.kind}（相似度 {g.similarity}%）：保留 {keep_item.name}")
+        if len(self.result.groups) > 20:
+            lines.append(f"…共 {len(self.result.groups)} 组，只显示前 20 组")
+        _label = core.KEEP_RULE_LABELS.get(self.keep_rule, self.keep_rule)
+        alert(self.app, t, f"保留预览（{_label}）", "\n".join(lines) or "没有可预览的组",
+              icon="info")
+
+    def _scan_history_dialog(self):
+        """R23 扫描历史：列出历史快照，选两份做对比。"""
+        t = self.theme
+        hist = tools.list_scan_history()
+        if not hist:
+            self.app.toast("还没有扫描历史", "info")
+            return
+        lines = []
+        for i, (path, root, when, n) in enumerate(hist[:10], 1):
+            lines.append(f"{i}. {when} · {n} 组 · {root}")
+        if len(hist) > 10:
+            lines.append(f"…共 {len(hist)} 份，只显示最新 10 份")
+        lines.append("")
+        lines.append("对比方法：选最新两份，自动算新增/消失的组。")
+        if len(hist) >= 2:
+            try:
+                old = tools.load_scan_history(hist[1][0])
+                new = tools.load_scan_history(hist[0][0])
+                added, removed, kept = tools.compare_scans(old, new)
+                lines.append(f"最新两份对比：新增 {len(added)} 组，消失 {len(removed)} 组，"
+                             f"还在 {len(kept)} 组")
+            except Exception as exc:
+                lines.append(f"对比失败：{exc}")
+        alert(self.app, t, "扫描历史", "\n".join(lines), icon="info")
 
     def _keep_menu(self):
         t = self.theme

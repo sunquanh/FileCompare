@@ -64,7 +64,9 @@ def parallel_map(func, items, workers=4, cancel=None, on_progress=None,
                     results[index] = None
                 done += 1
                 if on_progress is not None:
-                    on_progress(done, total, None)
+                    # R23 进度显示当前文件名：把刚完成的那一项传给回调，
+                    # 调用方可用它拼出“正在处理 xxx.jpg”这样的提示。
+                    on_progress(done, total, items[index])
             check_cancel(cancel)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
