@@ -25,8 +25,8 @@ hiddenimports = (
     + ort_modules
     + ["numpy", "onnxruntime", "tkinter", "tkinter.ttk", "sqlite3",
        "dedup_core", "dedup_models", "dedup_cache", "dedup_exact",
-       "dedup_photos", "dedup_names", "dedup_video", "dedup_audio",
-       "dedup_files", "dedup_tools", "dedup_watermark",
+       "dedup_photos", "dedup_photo_embed", "dedup_names", "dedup_video",
+       "dedup_audio", "dedup_files", "dedup_tools", "dedup_watermark",
        "dedup_watermark_lama", "ui_kit"]
 )
 

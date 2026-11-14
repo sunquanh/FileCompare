@@ -66,14 +66,20 @@ ZOOM_LAYOUT_TOL_EXT = 21.0
 # 先按 6% 粗扫，再在最好的两档附近按 1% 细扫：粗扫单档最坏错位 3%（相关
 # 值只剩 0.76~0.86），细扫一轮就能回到 0.95 以上。
 ZOOM_LADDER = (1.00, 1.06, 1.13, 1.20, 1.28, 1.37, 1.46, 1.56, 1.67, 1.82, 2.00)
-THUMB_SIZE = 64            # 缓存里存的中间图边长，缩放搜索的原料
+# 深裁切 40% 后窗口只剩 0.6×96≈58px，再缩到 32×32 做 NCC 仍有足够信息；
+# 64 时只剩 38px，真对相关会被重采样压低。PNG 缓存约 4~8KB → 10~20KB。
+THUMB_SIZE = 96            # 缓存里存的中间图边长，缩放搜索的原料
 ZOOM_MAX_PAIRS = 512       # 每块最多对多少对做缩放搜索（v7：缓存做便宜后提上限）
 # two_way=两路：直方图前 64 + dHash 前 64，去重后补齐到 128。
 # 缩放队列排序键（诊断用）：hist_pref=直方图升序/dHash次之（现状）；
 # pref_hist=dHash升序/直方图次之；fine_pref=pHash升序/dHash次之；
 # pref_fine=dHash升序/pHash次之；sum=dHash+pHash之和；
 # maxnorm=max(dHash/16, pHash/42)，按门校准的归一化。
-ZOOM_QUEUE_SORT = "hist_pref"  # 非默认分支仅供诊断（改常量切换），默认 hist_pref
+# radial=径向签名升序优先；其余非默认分支仅供诊断（改常量切换）
+ZOOM_QUEUE_SORT = "radial"
+# 缩放队列里深度余弦的权重：key = 径向距离 − w·余弦。实测 2.0 时入队真对
+# 最多（272/281），再大就会让「配色相近但不同场景」挤掉真对。
+ZOOM_QUEUE_COS_W = 2.0
 # 缩放路径单独的直方图门：裁掉太多会改变颜色分布（center50 实测 0.30~0.38），
 # 同尺度与 EXIF 两条路仍用调用方传的 hist_tol。
 ZOOM_HIST_TOL = 0.40
@@ -91,6 +97,11 @@ ZOOM_EXT_SCALES = (1.11, 1.25, 1.43, 1.67, 2.00)
 ZOOM_RECT_FRACS = (0.75, 0.67, 0.60)
 # 小角度旋转档位（度）。
 ROT_ANGLES = (3.0, -3.0, 5.0, -5.0, 10.0, -10.0)
+# 宽角旋转兜底：15°/18° 超出上面的离散梯子，但真实「歪着拍/后期转正」
+# 很常见。重采样代价是梯子的两倍多，所以只对 embedding 余弦极高的配对
+# 开放（见 EMBED_ROT_COS），默认路径完全不受影响。
+ROT_ANGLES_WIDE = (13.0, -13.0, 15.0, -15.0, 18.0, -18.0, 21.0, -21.0)
+EMBED_ROT_COS = 0.97
 # 第二道门（缩放描述子）的 NCC 下限：真对最低 0.61、假对最高 0.51，
 # 取 0.60 卡在中间；描述子与布局闸才是主判据。
 ZOOM_NCC_FLOOR = 0.60
@@ -100,7 +111,45 @@ ZOOM_EXT_TOPK = 6
 ZOOM_REVERSE_FLOOR = 0.50
 # 同机型 + 拍摄时间相差 ≤2 秒：EXIF 本身就对得上，结构阈值放宽一档
 EXIF_TIME_TOL = 2
-EXIF_NCC_TOL = 0.80
+EXIF_CAPTURE_TOL = 2          # 拍摄时间差超过这么多秒 = 先后两次快门，不是同一张
+# 分块 NCC：把 32×32 高频切成 4×4 块各算相关，丢掉最差的 3 块再平均。
+# 贴纸/大字只会污染个别块，整幅点积却会被拉到门限以下；pHash 细差同样
+# 会被污染，所以这是一条不依赖 fine/corr 的独立救援路径。
+BLOCK_NCC_CELLS = 4
+BLOCK_NCC_DROP = 3
+BLOCK_NCC_TOL = 0.90          # 分块相关放行线（跨场景假对 ≤0.41）
+BLOCK_FINE_MAX = 80           # 贴纸真对 pHash 细差 46~66，跨场景假对 ≥110
+BLOCK_LAYOUT_DROP = 16        # 8×8 布局丢掉最差的 1/4 块
+BLOCK_LAYOUT_TOL = 55.0       # 稳健布局放行线（跨场景假对 ≥89）
+# EXIF 救援收紧：连拍帧（同机型同秒、主体动了）最容易在这里误并
+EXIF_NCC_TOL = 0.86           # 原 0.80，实测真对仍远高于此
+EXIF_BURST_NCC_TOL = 0.93     # 判为「疑似连拍」时再抬一档
+EXIF_LAYOUT_FACTOR = 0.80     # 布局门收到调用方阈值的 80%
+EXIF_BURST_LAYOUT_FACTOR = 0.60
+EXIF_DERIVED_SIZE_RATIO = 0.85  # 体积明显更小 = 裁切/压缩派生副本
+EXIF_DERIVED_AREA_RATIO = 0.90
+EXIF_BURST_SIZE_RATIO = 0.97    # 体积几乎一样 + 同秒 + 无 SubSec = 疑似连拍
+EXIF_BURST_AREA_RATIO = 0.985
+# 局部编辑救援也要挡连拍：真贴纸/白边对体积比 ≤0.95，连拍 ≥0.99
+BLOCK_BURST_SIZE_RATIO = 0.97
+# 可选深度 embedding（模块缺失/没模型时整层跳过）
+EMBED_HIGH = 0.94             # 余弦 ≥ 此值 + 手工门联合：提召回（实测假对 0）
+EMBED_LOW = 0.55              # 余弦 ≤ 此值：否决 EXIF 与分块救援，压误报
+# Fourier–Mellin：log-polar 幅度谱相位相关，一次解出任意角度/缩放
+FM_RADIAL_BINS = 64           # log 半径采样数
+FM_ANGLE_BINS = 120           # 角度采样数 → 3°/格
+FM_RHO_LIMIT = 14             # 相位相关里允许的半径位移上限（抑制 wrap 假峰）
+FM_TOP_ANGLES = 2             # 折叠角度响应取前几个候选
+FM_REFINE_STEP = 2.0          # 每个候选再 ±2° 细扫，补 1° 级误差
+FM_MIN_SCALE = 0.50           # 解出的缩放比可信区间
+FM_MAX_SCALE = 2.00
+FM_MIN_HOPE = 0.30            # 四档最好相关低于此值就不值得再跑 FFT
+# 旋转对齐要重采样两次（原图旋转 + 缩略图对齐），NCC 天花板天然低于
+# 同尺度：真对 7° 0.88、15° 0.69，跨场景假对天花板 0.436。
+# 这一档只认 FM 解出的参数，且叠加布局门与连拍否决，不动全局门。
+FM_ROT_NCC_TOL = 0.66
+FM_ROT_LAYOUT_TOL = 32.0
+FM_ROT_LAYOUT_TRIM_TOL = 38.0
 _DCT_CACHE: dict[int, np.ndarray] = {}
 
 
@@ -274,6 +323,75 @@ def structure_ncc(a, b) -> float:
     if a is None or b is None:
         return 1.0
     return max(float((a * o).sum()) for o in _orients(b))
+
+
+def _block_vectors(x: np.ndarray, cells: int = BLOCK_NCC_CELLS) -> np.ndarray:
+    """(N,32,32) → (N, cells², 块内像素数)，每块各自去均值 + 单位化。
+
+    必须逐块去均值：整幅高通只去掉了全图低频，某一块仍可能有一层直流
+    （大片白贴纸/黑字），不做的话块内余弦会被这层直流主导。
+    """
+    arr = np.asarray(x, dtype=np.float32).reshape(-1, 32, 32)
+    b = 32 // cells
+    v = arr.reshape(-1, cells, b, cells, b).transpose(0, 1, 3, 2, 4)
+    v = v.reshape(-1, cells * cells, b * b)
+    v = v - v.mean(axis=2, keepdims=True)
+    norm = np.sqrt((v * v).sum(axis=2, keepdims=True))
+    return v / np.maximum(norm, 1e-6)
+
+
+def block_corr_rows(ha, hb, cells: int = BLOCK_NCC_CELLS,
+                    drop: int = BLOCK_NCC_DROP) -> np.ndarray:
+    """分块 NCC 的批量版（structure_ncc / _corr_rows 的同伴）。
+
+    返回 (N,) 的截尾均值：每块各算余弦，丢掉相关最差的 drop 块再平均，
+    最后仍取 8 个方向里最好的一个。局部编辑（贴纸、大字、局部涂抹）只
+    让少数块掉下去，被截尾直接丢掉，整体判断不受影响。
+    """
+    a = np.asarray(ha, dtype=np.float32).reshape(-1, 32, 32)
+    b = np.asarray(hb, dtype=np.float32).reshape(-1, 32, 32)
+    va = _block_vectors(a, cells)
+    best = np.full(a.shape[0], -1.0, dtype=np.float32)
+    for turn in range(4):
+        turned = np.rot90(b, turn, axes=(1, 2))
+        for flipped in (False, True):
+            cur = turned[:, :, ::-1] if flipped else turned
+            vb = _block_vectors(np.ascontiguousarray(cur), cells)
+            per = (va * vb).sum(axis=2)
+            if drop > 0 and drop < per.shape[1]:
+                score = np.partition(per, drop - 1, axis=1)[:, drop:].mean(axis=1)
+            else:
+                score = per.mean(axis=1)
+            np.maximum(best, score, out=best)
+    return best
+
+
+def block_ncc(a, b, cells: int = BLOCK_NCC_CELLS,
+              drop: int = BLOCK_NCC_DROP) -> float:
+    """单对版分块 NCC。"""
+    if a is None or b is None:
+        return 1.0
+    return float(block_corr_rows(a[None], b[None], cells, drop)[0])
+
+
+def layout_distance_trimmed(a, b, drop: int = BLOCK_LAYOUT_DROP) -> float:
+    """布局差的稳健版：丢掉差得最离谱的若干块再取 75 分位。
+
+    整幅 8×8 布局先做全局去均值/归一，一块大白贴纸会把均值整体拉偏，
+    于是「明明只有一块不一样」被放大成全图都偏。这里按同样的截尾思路
+    把最差的 1/4 块丢掉，只看剩下的主体是否对得上。必须与分块 NCC
+    联合使用（单独放宽布局会让「同背景换了主体」混进来）。
+    """
+    if a is None or b is None:
+        return 0.0
+    af = _layout_norm(a)
+    best = 1e9
+    for o in _orients(b):
+        diff = np.abs(af - _layout_norm(o)).mean(axis=2).ravel()
+        kept = (np.partition(diff, drop - 1)[drop:]
+                if 0 < drop < diff.size else diff)
+        best = min(best, float(np.percentile(kept, 75)))
+    return best
 
 
 def _layout_norm(grid) -> np.ndarray:
@@ -528,6 +646,145 @@ def _thumb_gray(thumb) -> np.ndarray:
         [0.299, 0.587, 0.114], dtype=np.float32)
 
 
+def _bilinear(gray: np.ndarray, ys, xs) -> np.ndarray:
+    """双线性采样，越界夹到边缘（径向剖面用）。"""
+    h, w = gray.shape
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    fy = np.clip(ys - y0, 0.0, 1.0)
+    fx = np.clip(xs - x0, 0.0, 1.0)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y0 = np.clip(y0, 0, h - 1)
+    x0 = np.clip(x0, 0, w - 1)
+    return ((1.0 - fy) * ((1.0 - fx) * gray[y0, x0]
+                          + fx * gray[y0, x1])
+            + fy * ((1.0 - fx) * gray[y1, x0]
+                    + fx * gray[y1, x1]))
+
+
+RADIAL_BINS = 48
+RADIAL_KEEP = 16
+RADIAL_ANGLES = 64
+
+
+def radial_signature(thumb, bins: int = RADIAL_BINS,
+                     keep: int = RADIAL_KEEP) -> np.ndarray:
+    """缩放/旋转不变的廉价签名：径向积分轮廓 → 1D DCT → 低频幅度。
+
+    沿 log 半径取一圈角度均值：旋转只换角度起点（均值不变），缩放把
+    log 半径整体平移（DCT 的相位变、幅度近似不变），于是前 keep 个低频
+    系数的绝对值就是几十字节的缩放不变描述子。用途很单一——把真正的
+    裁切候选排进 ZOOM_MAX_PAIRS 队列前排，别再靠直方图距离猜。
+    """
+    gray = _thumb_gray(thumb)
+    n = gray.shape[0]
+    cy = cx = (n - 1) * 0.5
+    radii = np.exp(np.linspace(np.log(1.5),
+                               np.log(max(2.0, n * 0.5)), bins))
+    ang = np.linspace(0.0, 2.0 * np.pi, RADIAL_ANGLES, endpoint=False)
+    ys = cy + radii[:, None] * np.sin(ang)[None, :]
+    xs = cx + radii[:, None] * np.cos(ang)[None, :]
+    profile = _bilinear(gray, ys, xs).mean(axis=1).astype(np.float32)
+    profile -= profile.mean()
+    coeff = _dct_matrix(bins) @ profile
+    sig = np.abs(coeff[1:keep + 1])
+    norm = float(np.sqrt(float((sig * sig).sum())))
+    return (sig / norm if norm > 1e-6 else sig).astype(np.float32)
+
+
+def fm_logpolar(gray, bins: int = FM_RADIAL_BINS,
+                angles: int = FM_ANGLE_BINS) -> np.ndarray:
+    """灰度图 → 幅度谱的 log-polar 重采样 (bins, angles)。
+
+    幅度谱丢掉相位，对平移天然免疫；旋转变成角度轴的循环位移，缩放变成
+    log 半径轴的位移，于是一次相位相关就能把两个参数一起解出来。
+    Hanning 窗压边界泄漏，沿半径去均值避免径向衰减主导相关。
+    """
+    n = gray.shape[0]
+    g = (np.asarray(gray, dtype=np.float32) - float(gray.mean()))
+    g = g * np.outer(np.hanning(n), np.hanning(n)).astype(np.float32)
+    mag = np.abs(np.fft.fftshift(np.fft.fft2(g)))
+    c = (n - 1) * 0.5
+    rho = np.linspace(np.log(2.5), np.log(max(3.0, n * 0.46)), bins)
+    theta = np.linspace(0.0, 2.0 * np.pi, angles, endpoint=False)
+    ys = c + np.exp(rho)[:, None] * np.sin(theta)[None, :]
+    xs = c + np.exp(rho)[:, None] * np.cos(theta)[None, :]
+    lp = _bilinear(mag, ys, xs).astype(np.float32)
+    lp -= lp.mean(axis=0, keepdims=True)
+    return lp
+
+
+def fm_estimate(src_gray, dst_gray, la=None, lb=None) -> tuple:
+    """Fourier–Mellin：返回 (角度候选列表, 缩放比, 置信度)。
+
+    ``缩放比`` 是 src 相对 dst 的内容倍率（<1 表示 dst 是放大后的裁切副本），
+    对齐时取 z = 1 / scale。幅度谱中心对称，所以角度折叠到 [0,180)，
+    再由 8 方向匹配覆盖 90° 倍数，这里只给小角度候选。
+
+    相位相关峰值本身不足以当判据（重调色/贴纸会把它压到 0.1），所以这里
+    只产出候选；是否合并仍由对齐后的 NCC + 布局双门决定。
+    ``la``/``lb`` 允许传入按图缓存的 log-polar 谱，避免每对重复做 FFT。
+    """
+    if la is None:
+        la = fm_logpolar(src_gray)
+    if lb is None:
+        lb = fm_logpolar(dst_gray)
+    A = np.fft.fft2(la)
+    B = np.fft.fft2(lb)
+    R = A * np.conj(B)
+    R /= np.abs(R) + 1e-9
+    corr = np.real(np.fft.ifft2(R))
+    corr[FM_RHO_LIMIT:, :] = -1e9
+    corr[-FM_RHO_LIMIT:, :] = -1e9
+    # 每个角度列取该列最大响应：不要求半径位移完全对准，角度依旧可解
+    prof = corr[:FM_RHO_LIMIT].max(axis=0)
+    half = FM_ANGLE_BINS // 2
+    folded = prof[:half] + prof[half:]
+    top = np.argsort(-folded)[:FM_TOP_ANGLES]
+    cands = []
+    for t in top:
+        base = float(t) * 360.0 / FM_ANGLE_BINS
+        for d in (-FM_REFINE_STEP, 0.0, FM_REFINE_STEP):
+            # 负角度交给 _orients 的 8 方向匹配覆盖，这里只给正向候选，
+            # 避免每个角度都白做一次 PIL 旋转。
+            v = round(base + d, 2)
+            if v not in cands:
+                cands.append(v)
+    # 半径位移在最佳角度列上取峰
+    dt = int(top[0])
+    dr = int(np.argmax(corr[:FM_RHO_LIMIT, dt]))
+    rho_step = ((np.log(max(3.0, src_gray.shape[0] * 0.46)) - np.log(2.5))
+                / (FM_RADIAL_BINS - 1))
+    scale = float(np.clip(np.exp(-dr * rho_step),
+                          FM_MIN_SCALE, FM_MAX_SCALE))
+    return cands, scale, float(folded[top[0]])
+
+
+def phase_fft(gray) -> np.ndarray:
+    """相位相关用的预计算谱：按图缓存一次，所有配对复用。"""
+    return np.fft.fft2(np.asarray(gray, dtype=np.float32)
+                       - float(gray.mean()))
+
+
+def phase_translation(a, b, fa=None, fb=None) -> tuple[int, int]:
+    """普通相位相关解平移 (dy, dx)，用来替代 3×3 偏心位置枚举。
+
+    返回 b 相对 a 的循环位移（超过半幅的按负值处理）。``fa``/``fb``
+    可传入 phase_fft 的结果避免重复 FFT。调用方只把它当候选窗口用，
+    最终仍走 NCC + 布局验证。
+    """
+    A = fa if fa is not None else phase_fft(a)
+    B = fb if fb is not None else phase_fft(b)
+    R = A * np.conj(B)
+    R /= np.abs(R) + 1e-9
+    c = np.real(np.fft.ifft2(R))
+    dy, dx = np.unravel_index(int(np.argmax(c)), c.shape)
+    h, w = c.shape
+    return (dy - h if dy > h // 2 else dy,
+            dx - w if dx > w // 2 else dx)
+
+
 def _hp_from_rect(gray, y0, y1, x0, x1) -> np.ndarray:
     """矩形区域 → 32×32 高频单位向量（缩放搜索共用；方形窗口是特例）。"""
     cs = np.cumsum(np.cumsum(gray[y0:y1, x0:x1], axis=0), axis=1)
@@ -673,7 +930,7 @@ def _ext_windows(n):
     return wins
 
 
-_EXT_WINS_64 = _ext_windows(THUMB_SIZE)
+_EXT_WINS = _ext_windows(THUMB_SIZE)
 
 
 def _view_rect(thumb, y0, y1, x0, x1, size):
@@ -710,12 +967,15 @@ def zoom_desc_win(thumb, win, mat=None):
     """窗口（_zoom_hit 返回的描述）对应的 (dHash, pHash)。
 
     win: ("sq", z, inset, py, px) | ("rh", frac, pos) | ("rv", frac, pos)
-    | ("rot", angle, z)。
+    | ("rot", angle, z) | ("sh", y0, y1, x0, x1)。
+    ``sh`` 是相位相关解出的连续平移窗口，直接存矩形坐标。
     """
     n = thumb.shape[0]
     if win[0] == "rot":
         thumb = _rot_thumb(thumb, win[1])
         win = ("sq", win[2], 1.0, 1, 1)
+    if win[0] == "sh":
+        return zoom_desc_rect(thumb, win[1], win[2], win[3], win[4], mat)
     if win[0] == "sq":
         _, z, inset, py, px = win
         side = max(8, min(n, int(round(n / float(z) * inset))))
@@ -729,24 +989,43 @@ def zoom_desc_win(thumb, win, mat=None):
     return zoom_desc_rect(thumb, y0, y1, x0, x1, mat)
 
 
-def exif_shot(path):
-    """(拍摄时间 epoch 秒, 机型)；读不到就是 (0, "")。"""
+def exif_shot_full(path):
+    """(拍摄时间 epoch 秒, 机型, SubSecTime)；读不到分别是 0 / "" / ""。
+
+    SubSecTime 用来区分「同一秒里的连拍帧」：37521=原始时间、37522=
+    数字化时间、37520=通用，真实文件里通常藏在 ExifIFD(0x8769) 下，
+    Pillow 的顶层 getexif() 不一定给，所以两处都查。
+    """
     try:
         with Image.open(path) as im:
             exif = im.getexif()
             raw = exif.get(36867) or exif.get(306) or ""
             model = str(exif.get(272) or "").strip()
+            try:
+                sub_ifd = exif.get_ifd(0x8769) or {}
+            except Exception:
+                sub_ifd = {}
+            sub = (sub_ifd.get(37521) or sub_ifd.get(37522)
+                   or sub_ifd.get(37520) or exif.get(37521)
+                   or exif.get(37522) or exif.get(37520) or "")
+            sub = str(sub).strip()
     except Exception:
-        return 0, ""
+        return 0, "", ""
     text = str(raw).strip()
     if not text:
-        return 0, ""
+        return 0, "", ""
     for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return int(datetime.strptime(text, fmt).timestamp()), model
+            return int(datetime.strptime(text, fmt).timestamp()), model, sub
         except Exception:
             continue
-    return 0, ""
+    return 0, "", ""
+
+
+def exif_shot(path):
+    """兼容旧调用：(拍摄时间 epoch 秒, 机型)。"""
+    t, model, _sub = exif_shot_full(path)
+    return t, model
 
 
 @dataclass
@@ -760,13 +1039,18 @@ class PhotoFP:
     hp: np.ndarray | None = None    # (LEVELS, 32, 32) 零均值单位范数高频分量
     grid: np.ndarray | None = None  # (LEVELS, 8, 8, 3) uint8 空间颜色布局
     energy: np.ndarray | None = None  # (LEVELS,) float32 各层细节能量
-    thumb: np.ndarray | None = None   # (64, 64, 3) uint8，缩放搜索的原料
+    thumb: np.ndarray | None = None   # (THUMB_SIZE, THUMB_SIZE, 3) uint8
     exif_time: int = 0                # 拍摄时间（epoch 秒），0 = 没有
     exif_model: str = ""              # 机型，空 = 没有
+    exif_subsec: str = ""             # #4 SubSecTime，用来区分同秒连拍帧
+    size_bytes: int = 0               # #4 文件大小，派生副本通常更小
+    radial: np.ndarray | None = None  # #6 (16,) 缩放不变径向签名
+    embed: np.ndarray | None = None   # #1 可选深度 embedding（L2 归一）
+    embed_model: str = ""             # #1 生成 embed 的模型标识，换模型要失效
 
     def to_cache(self):
         return {
-            "v": 3,
+            "v": 4,
             "dh": [[int(x) for x in row] for row in self.dh],
             "ph": [[[int(x) for x in row] for row in lv] for lv in self.ph],
             "hist": [round(float(x), 5) for x in self.hist],
@@ -779,12 +1063,20 @@ class PhotoFP:
                       else _pack_thumb(self.thumb)),
             "exif_time": int(self.exif_time or 0),
             "exif_model": str(self.exif_model or ""),
+            "exif_subsec": str(self.exif_subsec or ""),
+            "sz": int(self.size_bytes or 0),
+            "radial": (None if self.radial is None
+                       else [round(float(x), 5) for x in self.radial]),
+            "embed": (None if self.embed is None
+                      else [round(float(x), 5) for x in self.embed]),
+            "embed_model": str(self.embed_model or ""),
         }
 
     @classmethod
     def from_cache(cls, data):
-        if int(data.get("v", 1)) < 3:
-            # v1 用绝对 RGB 直方图、v2 是固定裁边层；语义都变了，留着会静默算错
+        if int(data.get("v", 1)) < 4:
+            # v1/v2 语义变过；v3 的缩略图是 64×64，与 96 的窗口表和
+            # 径向签名不通用，混用会静默算错，一律重建
             raise ValueError("照片指纹缓存是旧格式")
         dh = np.array(data["dh"], dtype=np.uint64).reshape(LEVELS, ORIENTS)
         ph = np.array(data["ph"], dtype=np.uint64).reshape(LEVELS, ORIENTS, 4)
@@ -800,10 +1092,19 @@ class PhotoFP:
                   else np.array(energy, dtype=np.float32).reshape(LEVELS))
         thumb = data.get("thumb")
         thumb = (None if not thumb else _unpack_thumb(thumb))
+        radial = data.get("radial")
+        radial = (None if not radial
+                  else np.array(radial, dtype=np.float32))
+        embed = data.get("embed")
+        embed = None if not embed else np.array(embed, dtype=np.float32)
         return cls(dh, ph, hist, int(data["w"]), int(data["h"]),
                    int(dh[0].min()), hp, grid, energy, thumb,
                    int(data.get("exif_time") or 0),
-                   str(data.get("exif_model") or ""))
+                   str(data.get("exif_model") or ""),
+                   str(data.get("exif_subsec") or ""),
+                   int(data.get("sz") or 0),
+                   radial, embed,
+                   str(data.get("embed_model") or ""))
 
 
 def _jpeg_end(data, soi):
@@ -932,7 +1233,8 @@ def probe_size(path):
         return None
 
 
-def _fp_from_rgb(rgb, shot_time=0, shot_model="") -> PhotoFP | None:
+def _fp_from_rgb(rgb, shot_time=0, shot_model="", subsec="",
+                 size_bytes=0) -> PhotoFP | None:
     """RGB 图 → PhotoFP（fingerprint 与 frame_fingerprints 共用）。"""
     width, height = rgb.size
     if width < 16 or height < 16:
@@ -964,18 +1266,38 @@ def _fp_from_rgb(rgb, shot_time=0, shot_model="") -> PhotoFP | None:
     ph_arr = np.array(ph, dtype=np.uint64).reshape(LEVELS, ORIENTS, 4)
     thumb = np.asarray(rgb.resize((THUMB_SIZE, THUMB_SIZE),
                                   Image.Resampling.BOX), dtype=np.uint8)
-    return PhotoFP(dh_arr, ph_arr, histogram(small), width, height,
-                   int(dh_arr[0].min()), np.stack(hps), np.stack(grids),
-                   np.array(energies, dtype=np.float32), thumb,
-                   shot_time, shot_model)
+    fp = PhotoFP(dh_arr, ph_arr, histogram(small), width, height,
+                 int(dh_arr[0].min()), np.stack(hps), np.stack(grids),
+                 np.array(energies, dtype=np.float32), thumb,
+                 shot_time, shot_model, subsec, size_bytes,
+                 radial_signature(thumb))
+    # 深度 embedding 是可选层：没装 onnxruntime / 没放模型就整层跳过，
+    # 指纹其余部分完全不受影响（也不联网、不下载任何东西）。
+    try:
+        import dedup_photo_embed as emb
+        vec, model_id = emb.embed_rgb(rgb)
+        if vec is not None:
+            fp.embed = vec
+            fp.embed_model = model_id
+    except Exception as exc:
+        ignore(__name__, exc)
+    return fp
+
+
+def _file_size(path):
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
 
 
 def fingerprint(path, max_edge=1024) -> PhotoFP | None:
     """单帧指纹（第一帧），行为与原来一致。"""
     try:
         rgb = open_small(path, max_edge)
-        shot_time, shot_model = exif_shot(path)
-        return _fp_from_rgb(rgb, shot_time, shot_model)
+        shot_time, shot_model, subsec = exif_shot_full(path)
+        return _fp_from_rgb(rgb, shot_time, shot_model, subsec,
+                            _file_size(path))
     except Exception:
         return None
 
@@ -984,7 +1306,8 @@ def frame_fingerprints(path, max_edge=1024, max_frames=16) -> list:
     """多帧指纹：每帧各一个 PhotoFP（最多前 max_frames 帧）。
     单帧文件返回 1 元列表；全帧不可用返回 []。"""
     try:
-        shot_time, shot_model = exif_shot(path)
+        shot_time, shot_model, subsec = exif_shot_full(path)
+        size_bytes = _file_size(path)
         out = []
         with Image.open(path) as im:
             n = int(getattr(im, "n_frames", 1) or 1)
@@ -996,7 +1319,8 @@ def frame_fingerprints(path, max_edge=1024, max_frames=16) -> list:
                     if frame.width > max_edge or frame.height > max_edge:
                         frame.thumbnail((max_edge, max_edge),
                                       Image.Resampling.LANCZOS)
-                    fp = _fp_from_rgb(frame, shot_time, shot_model)
+                    fp = _fp_from_rgb(frame, shot_time, shot_model,
+                                      subsec, size_bytes)
                 except Exception:
                     fp = None
                 if fp is not None:
@@ -1007,8 +1331,8 @@ def frame_fingerprints(path, max_edge=1024, max_frames=16) -> list:
 
 
 def _frames_to_cache(fps_list):
-    """帧指纹列表 → 缓存值（{"v": 3, "frames": [...]}）。"""
-    return {"v": 3, "frames": [fp.to_cache() for fp in fps_list]}
+    """帧指纹列表 → 缓存值（{"v": 4, "frames": [...]}）。"""
+    return {"v": 4, "frames": [fp.to_cache() for fp in fps_list]}
 
 
 def _frames_from_cache(data):
@@ -1019,6 +1343,40 @@ def _frames_from_cache(data):
 
 
 # ---------------------------------------------------------------- 匹配
+
+def capture_mismatch(a, b) -> bool:
+    """EXIF 能证明「这是先后两次快门」，就不可能是同一张照片的副本。
+
+    副本（另存 / 压缩 / 裁切 / 转格式 / 换目录）都原样保留 DateTimeOriginal，
+    所以这条不会误伤真副本：
+      * 两台机型都有且不同 → 两台相机拍的，不是同一张；
+      * 机型相同、拍摄时间差 > 2 秒 → 同一场景的连拍或多拍，是不同照片。
+    没有 EXIF（截图、被剥掉信息的副本）时不作判断，保持旧行为。
+
+    实测样本：同一个毕业典礼相隔 10~50 秒的 19 张连拍，以及隔着 51 秒的
+    两张合影，原来被判成互相重复（58 条误报边），本函数全部拦下。
+    """
+    ma = (a.exif_model or "").strip().lower()
+    mb = (b.exif_model or "").strip().lower()
+    if not ma or not mb:
+        return False
+    if ma != mb:
+        return True
+    ta, tb = int(a.exif_time or 0), int(b.exif_time or 0)
+    return ta > 0 and tb > 0 and abs(ta - tb) > EXIF_CAPTURE_TOL
+
+
+def _drop_capture_mismatch(edges, fps):
+    """丢掉「EXIF 已说明是两次快门」的边。
+
+    连拍/同场景多拍的指纹往往一模一样，会从「同指纹组内」那条直推路径
+    产出边（不经过缩放搜索），所以必须在所有边汇齐后统一过滤。
+    """
+    if not edges:
+        return edges
+    return [edge for edge in edges
+            if not capture_mismatch(fps[edge[0]], fps[edge[1]])]
+
 
 def _shot_ratio(fp) -> float:
     return fp.width / fp.height if fp.height else 1.0
@@ -1101,6 +1459,73 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                       dtype=np.int32)
     mat = _dct_matrix(DCT_SIZE)
 
+    # ---- 局部编辑 / 连拍 / 缩放候选 所需的逐图附加信息（一次性向量化） ----
+    subsecs = [str(f.exif_subsec or "") for f in uniq]
+    size_b = np.array([int(f.size_bytes or 0) for f in uniq], dtype=np.int64)
+    area_b = np.array([f.width * f.height for f in uniq], dtype=np.int64)
+    radial_dim = RADIAL_KEEP
+    radial_mat = np.zeros((m, radial_dim), dtype=np.float32)
+    for i, f in enumerate(uniq):
+        if f.radial is not None and len(f.radial) == radial_dim:
+            radial_mat[i] = f.radial
+
+    # 可选深度 embedding：模型/模块缺失时整层跳过，行为与旧版完全一致
+    embed_sim = None
+    embed_ok = None
+    try:
+        import dedup_photo_embed as emb
+        dims = {len(f.embed) for f in uniq if f.embed is not None}
+        mids = {f.embed_model for f in uniq if f.embed is not None}
+        if (len(dims) == 1 and len(mids) == 1 and emb.available()
+                and next(iter(mids)) == emb.model_id()):
+            dim = next(iter(dims))
+            vec = np.zeros((m, dim), dtype=np.float32)
+            ok = np.zeros(m, dtype=bool)
+            for i, f in enumerate(uniq):
+                if f.embed is not None:
+                    vec[i] = f.embed
+                    ok[i] = True
+            vec /= np.maximum(np.linalg.norm(vec, axis=1, keepdims=True), 1e-6)
+            embed_sim = vec @ vec.T
+            embed_ok = ok[:, None] & ok[None, :]
+    except Exception as exc:
+        ignore(__name__, exc)
+
+    def _shot_pair_info(ia, ib):
+        """(硬否决, 疑似连拍, 派生副本)。
+
+        硬否决：两张都有 SubSecTime 且值不同 —— 同一秒里的不同连拍帧，
+        无论 NCC 多高都不是同一张照片的副本（EXIF 37521/37522/37520）。
+        疑似连拍：同机型同秒、都没有 SubSec（老相机）、分辨率与文件体积
+        几乎完全一致 —— 真派生副本（裁切/压缩）至少有一项会明显变小。
+        派生副本：体积或像素面积明显更小，符合「从大图导出小图」。
+        """
+        fa, fb = uniq[ia], uniq[ib]
+        sa, sb = subsecs[ia], subsecs[ib]
+        if sa and sb and sa != sb:
+            return True, False, False
+        same = (fa.exif_time > 0 and fb.exif_time > 0
+                and fa.exif_model and fa.exif_model == fb.exif_model
+                and abs(fa.exif_time - fb.exif_time) <= EXIF_TIME_TOL)
+        if not same:
+            return False, False, False
+        za, zb = int(size_b[ia]), int(size_b[ib])
+        aa, ab = int(area_b[ia]), int(area_b[ib])
+        sr = min(za, zb) / max(1, max(za, zb))
+        ar = min(aa, ab) / max(1, max(aa, ab))
+        derived = (za > 0 and zb > 0
+                   and (sr <= EXIF_DERIVED_SIZE_RATIO
+                        or ar <= EXIF_DERIVED_AREA_RATIO))
+        burst = (not sa and not sb and za > 0 and zb > 0
+                 and sr >= EXIF_BURST_SIZE_RATIO
+                 and ar >= EXIF_BURST_AREA_RATIO)
+        return False, burst, derived
+
+    def _embed_of(ia, ib):
+        if embed_sim is None or not embed_ok[ia, ib]:
+            return None
+        return float(embed_sim[ia, ib])
+
     out = []
     # 同指纹组内部的边：粗差、细差恒为 0，直方图距离按原公式（同一数组）算一次
     for group in members:
@@ -1137,6 +1562,7 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 out.append((i, j, 0, 0, hist_d, corr_v[i],
                             layout_v.get(i, 0.0)))
     if m < 2:
+        out = _drop_capture_mismatch(out, fps)
         out.sort(key=lambda edge: (edge[0], edge[1]))
         return out
 
@@ -1156,6 +1582,9 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
     dst_mean_cache = {}
     rot_gray_cache = {}
     rot_hp_cache = {}
+    fm_est_cache = {}
+    fm_lp_cache = {}
+    phase_fft_cache = {}
     ext_hp_cache = {}
     EXT_HP_CACHE_MAX = 8192
     ZOOM_BIG_CACHE_MAX = 2048  # 大条目缓存上限（ladder 45KB/条、orient 32KB/条）
@@ -1225,6 +1654,9 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             y0 = py * (n - side) // 2
             x0 = px * (n - side) // 2
             grid = zoom_grid_rect(thumb, y0, y0 + side, x0, x0 + side)
+        elif win[0] == "sh":
+            _, y0, y1, x0, x1 = win
+            grid = zoom_grid_rect(thumb, y0, y1, x0, x1)
         elif win[0] == "rh":
             y0, y1, x0, x1 = _rect_h(n, win[1], win[2])
             grid = zoom_grid_rect(thumb, y0, y1, x0, x1)
@@ -1317,17 +1749,46 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             dmean = np.stack([o.ravel() for o in _orients(dm.reshape(8, 8))])
             if len(dst_mean_cache) < ZOOM_CACHE_MAX:
                 dst_mean_cache[dst_pos] = dmean
-        wins = _EXT_WINS_64 if n == THUMB_SIZE else _ext_windows(n)
+        base_wins = list(_EXT_WINS if n == THUMB_SIZE else _ext_windows(n))
+        # 普通相位相关一次解出连续平移量：3×3 偏心枚举只覆盖 9 个离散
+        # 位置，真裁切的偏移常落在档位之间。解出的窗口单独算并「保送」
+        # 进全高频复核，不污染按 src 缓存的 58 窗口均值表（长度必须一致）。
+        extra_wins = []
+        dg = _gray(dst_pos)
+        if len(dg):
+            def _pfft(pos, gray):
+                f = phase_fft_cache.get(pos)
+                if f is None:
+                    f = phase_fft(gray)
+                    if len(phase_fft_cache) < ZOOM_CACHE_MAX:
+                        phase_fft_cache[pos] = f
+                return f
+
+            dy, dx = phase_translation(g, dg, _pfft(src_pos, g),
+                                       _pfft(dst_pos, dg))
+            for z in ZOOM_EXT_SCALES[:2]:
+                side = max(8, min(n, int(round(n / float(z)))))
+                cy = (n - side) // 2 + int(np.clip(dy, -n // 4, n // 4))
+                cx = (n - side) // 2 + int(np.clip(dx, -n // 4, n // 4))
+                y0 = int(np.clip(cy, 0, n - side))
+                x0 = int(np.clip(cx, 0, n - side))
+                extra_wins.append((("sh", y0, y0 + side, x0, x0 + side),
+                                   y0, y0 + side, x0, x0 + side))
+        wins = base_wins + extra_wins
         if not wins:
             return -2.0, None
         means = ext_means_cache.get(src_pos)
         if means is None:
             means = _mean8_batch_from_cs(
-                cs, [(y0, y1, x0, x1) for _, y0, y1, x0, x1 in wins])
+                cs, [(y0, y1, x0, x1) for _, y0, y1, x0, x1 in base_wins])
             if len(ext_means_cache) < EXT_HP_CACHE_MAX:
                 ext_means_cache[src_pos] = means
         coarse = (means @ dmean.T).max(axis=1)
-        top = np.argsort(-coarse)[:ZOOM_EXT_TOPK]
+        top = list(np.argsort(-coarse)[:ZOOM_EXT_TOPK])
+        # 相位窗口保送：粗筛没把它选进来，也给它一次算全高频的机会
+        for e in range(len(base_wins), len(wins)):
+            if e not in top:
+                top.append(e)
         best_v = -2.0
         best_win = None
         vecs = [_ext_hp(src_pos, cs, *wins[int(k)][1:]) for k in top]
@@ -1349,11 +1810,15 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 best_win = ("sq", zs[k], 1.0, py, px)
         return best_v, best_win
 
-    def _rotation_search(src_pos, dst_pos, targets, tol, best_z):
+    def _rotation_search(src_pos, dst_pos, targets, tol, best_z,
+                         angles=None):
         """小角度旋转：把 src 缩略图按 ±3°/±5°/±10° 转后再对齐。
         z 取 1.0（纯旋转）与中心梯子最好的那档（旋转 + 裁切）两处。
         只在两图尺寸基本一致时跑（旋转不改变尺寸；裁切/加框的尺寸
-        本来就不一样，跑了也是白跑）。返回最好的 (相关, z, 窗口)。"""
+        本来就不一样，跑了也是白跑）。返回最好的 (相关, z, 窗口)。
+
+        ``angles`` 用于宽角兜底（见 ``_wide_rotation``），默认走标准梯子。
+        """
         src, dst = uniq[src_pos], uniq[dst_pos]
         if src.thumb is None:
             return -2.0, 0.0, None
@@ -1366,7 +1831,7 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
         best_zz = 0.0
         combos = []
         vecs = []
-        for angle in ROT_ANGLES:
+        for angle in (ROT_ANGLES if angles is None else angles):
             key = (src_pos, angle)
             g = rot_gray_cache.get(key)
             if g is None:
@@ -1392,6 +1857,119 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             best_win = ("rot", angle, z)
             best_zz = z
         return best_v, best_zz, best_win
+
+    def _fm_search(src_pos, dst_pos, targets):
+        """Fourier–Mellin 一次性对齐：用解出的任意角度/缩放构造窗口。
+
+        前面的梯子只覆盖离散档位（±3/5/10°），7°/15° 会整类漏判。这里
+        对幅度谱做 log-polar 相位相关拿到候选，再按候选对齐做一次 NCC；
+        重采样两次会压低相关，所以这一档用专用门，并叠加布局门 + 连拍
+        否决（假对天花板 0.436，真对 15° 约 0.69）。
+        返回 (相关, 布局差, z, 窗口)；不过门时布局差为 None。
+        """
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        if src.thumb is None or dst.thumb is None or dst.grid is None:
+            return -2.0, None, 0.0, None
+        hard, burst, derived = _shot_pair_info(src_pos, dst_pos)
+        if hard or (burst and not derived):
+            return -2.0, None, 0.0, None
+        key = (src_pos, dst_pos)
+        est = fm_est_cache.get(key)
+        if est is None:
+            def _lp(pos):
+                lp = fm_lp_cache.get(pos)
+                if lp is None:
+                    g = _gray(pos)
+                    if not len(g):
+                        return None
+                    lp = fm_logpolar(g)
+                    if len(fm_lp_cache) < ZOOM_CACHE_MAX:
+                        fm_lp_cache[pos] = lp
+                return lp
+
+            la, lb = _lp(src_pos), _lp(dst_pos)
+            if la is None or lb is None:
+                return -2.0, None, 0.0, None
+            est = fm_estimate(_gray(src_pos), _gray(dst_pos), la, lb)
+            if len(fm_est_cache) < ZOOM_CACHE_MAX:
+                fm_est_cache[key] = est
+        cands, scale, _conf = est
+        z_from_fm = 1.0 / scale if scale > 0 else 1.0
+        zs = [1.0, 1.06, 1.13]
+        for z in (z_from_fm, z_from_fm * 1.06, z_from_fm * 0.94):
+            z = float(np.clip(z, 1.0, 2.0))
+            if z not in zs:
+                zs.append(z)
+        def _hp(src_pos, ang, z):
+            hp_key = (src_pos, ang, z)
+            vec = rot_hp_cache.get(hp_key)
+            if vec is None:
+                if ang == 0.0:
+                    g = _gray(src_pos)
+                else:
+                    rk = (src_pos, ang)
+                    g = rot_gray_cache.get(rk)
+                    if g is None:
+                        g = _thumb_gray(_rot_thumb(src.thumb, ang))
+                        if len(rot_gray_cache) < ZOOM_CACHE_MAX:
+                            rot_gray_cache[rk] = g
+                vec = zoom_hp_gray(g, z).ravel()
+                if len(rot_hp_cache) < ZOOM_CACHE_MAX:
+                    rot_hp_cache[hp_key] = vec
+            return vec
+
+        # 两阶段代替全组合：先固定 z 找最佳角度，再只在该角度上试缩放。
+        # 角度与缩放的交互很弱，实测最佳角度几乎不随 z 变，代价从
+        # |angles|×|zs| 降到 |angles|+|zs|。
+        z_probe = 1.0
+        best_a, v_a = 0.0, -2.0
+        for ang in (0.0, *cands):
+            v = float((_hp(src_pos, ang, z_probe) @ targets.T).max())
+            if v > v_a:
+                best_a, v_a = ang, v
+        best_v, best_win = v_a, ("rot", best_a, z_probe)
+        for z in zs[1:]:
+            v = float((_hp(src_pos, best_a, z) @ targets.T).max())
+            if v > best_v:
+                best_v, best_win = v, ("rot", best_a, z)
+        if best_v < FM_ROT_NCC_TOL or best_win is None:
+            return best_v, None, best_win[2] if best_win else 0.0, best_win
+        ang, z = best_win[1], best_win[2]
+        thumb = src.thumb if ang == 0.0 else _rot_thumb(src.thumb, ang)
+        grid = zoom_grid(thumb, z)
+        lay = layout_distance(grid, dst.grid[0])
+        if lay > FM_ROT_LAYOUT_TOL:
+            return best_v, None, z, best_win
+        lay_t = layout_distance_trimmed(grid, dst.grid[0])
+        if lay_t > FM_ROT_LAYOUT_TRIM_TOL:
+            return best_v, None, z, best_win
+        return best_v, lay, z, best_win
+
+    def _wide_rotation(src_pos, dst_pos, targets, best_z):
+        """宽角旋转兜底：13°/15°/18°/21°，补离散梯子与 FM 都覆盖不到的档。
+
+        只由 ``EMBED_ROT_COS`` 触发，所以默认路径不会多付任何代价。校验
+        沿用 FM 档的专用门（重采样两次本身会压低相关），再叠加布局门与
+        连拍否决——放行的仍是「对齐后确实结构一致」的配对。
+        """
+        v, z, win = _rotation_search(src_pos, dst_pos, targets, 0.0, best_z,
+                                     angles=ROT_ANGLES_WIDE)
+        if win is None or v < FM_ROT_NCC_TOL:
+            return v, None, z, win
+        hard, burst, derived = _shot_pair_info(src_pos, dst_pos)
+        if hard or (burst and not derived):
+            return v, None, z, win
+        src, dst = uniq[src_pos], uniq[dst_pos]
+        if dst.grid is None:
+            return v, None, z, win
+        thumb = src.thumb if win[1] == 0.0 else _rot_thumb(src.thumb, win[1])
+        grid = zoom_grid(thumb, win[2])
+        lay = layout_distance(grid, dst.grid[0])
+        if lay > FM_ROT_LAYOUT_TOL:
+            return v, None, z, win
+        if layout_distance_trimmed(grid, dst.grid[0]) > FM_ROT_LAYOUT_TRIM_TOL:
+            return v, None, z, win
+        return v, lay, z, win
 
     def _zoom_second_chance(src_pos, dst_pos, win, best_v):
         """第二道门：NCC 在 [ZOOM_NCC_FLOOR, tol) 时，用缩放描述子再判一次。
@@ -1453,6 +2031,28 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
             lay = _layout_for(src_pos, dst_pos, best_win)
             if lay is not None:
                 return best_v, lay, best_z, best_win
+        # ④b 宽角旋转：15°/18° 这类档位，标准梯子与 FM 峰值都可能覆盖不到。
+        # 重采样代价高，只对 embedding 余弦 ≥ EMBED_ROT_COS 的配对开放；
+        # 假对在高余弦区仍有 s01/s08 这类配色相近的，所以校验不放松。
+        if best_v < tol:
+            sim = _embed_of(src_pos, dst_pos)
+            if sim is not None and sim >= EMBED_ROT_COS:
+                v6, lay6, z6, w6 = _wide_rotation(src_pos, dst_pos,
+                                                  targets, best_z)
+                if lay6 is not None and v6 > best_v:
+                    return v6, lay6, z6, w6
+                if v6 > best_v:
+                    best_v, best_z, best_win = v6, z6, w6
+        # ⑤ Fourier–Mellin：离散角度梯子覆盖不到的任意角度（7°/15°…）。
+        # 只有「四档最好相关仍有希望」且「尺寸接近」（旋转不改尺寸）时才跑：
+        # FFT + 重采样比梯子贵，不加门会给每对不相干的图白算一次。
+        if best_v >= FM_MIN_HOPE and (
+                abs(src.width - dst.width) <= 0.10 * max(src.width, dst.width)
+                and abs(src.height - dst.height)
+                <= 0.10 * max(src.height, dst.height)):
+            v5, lay5, z5, w5 = _fm_search(src_pos, dst_pos, targets)
+            if lay5 is not None and v5 > best_v:
+                return v5, lay5, z5, w5
         lay = _zoom_second_chance(src_pos, dst_pos, best_win, best_v)
         if lay is not None:
             return best_v, lay, best_z, best_win
@@ -1565,10 +2165,23 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 & strict_pair & strict_hist)[0]
             for pos in shot:
                 ia, ib = int(ia_all[pos]), int(ib_all[pos])
+                hard, burst, derived = _shot_pair_info(ia, ib)
+                if hard:
+                    # 两张都有 SubSecTime 且不同：同一秒里的两帧连拍，
+                    # 不是「原图 → 派生副本」，EXIF 再像也不能合并。
+                    continue
+                sim = _embed_of(ia, ib)
+                if sim is not None and sim <= EMBED_LOW:
+                    continue
+                suspicious = burst and not derived
+                if suspicious and corr[pos] < EXIF_BURST_NCC_TOL:
+                    continue
+                gate = layout_tol * (EXIF_BURST_LAYOUT_FACTOR if suspicious
+                                     else EXIF_LAYOUT_FACTOR)
                 fa, fb = uniq[ia], uniq[ib]
                 lay = (0.0 if fa.grid is None or fb.grid is None
                        else layout_distance(fa.grid[0], fb.grid[0]))
-                if lay > layout_tol:
+                if lay > gate:
                     continue
                 f2 = fine_all[pos]
                 accepted[pos] = True
@@ -1576,7 +2189,69 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                               int(f2.min()), float(hist_ok[pos]),
                               float(corr[pos]), lay))
 
-            # ---- 3) 缩放搜索：任意裁边量。按色分布从近到远排队，限量做
+            # ---- 2b) 局部编辑救援：分块 NCC 截尾均值 + 稳健布局
+            # 贴纸、大字、局部涂抹会同时把整幅 NCC 和 pHash 细差拉垮，
+            # 但只污染少数块：4×4 各算相关、丢掉最差 3 块后仍 ≥0.90。
+            # 严格门（长宽比/直方图/dHash 粗差/pHash 上限）保证不会把
+            # 「同背景换了主体」放进来；EXIF 连拍判据再挡一层。
+            blk_cand = np.nonzero(
+                ~accepted & strict_pair & strict_hist & allow_same
+                & hp_ok
+                & (coarse.min(axis=(1, 2)) <= dist)
+                & (fine_all.min(axis=(1, 2)) <= BLOCK_FINE_MAX))[0]
+            if blk_cand.size:
+                bv = block_corr_rows(hp0[ia_all[blk_cand]],
+                                     hp0[ib_all[blk_cand]])
+                for k in np.nonzero(bv >= BLOCK_NCC_TOL)[0]:
+                    pos = int(blk_cand[k])
+                    ia, ib = int(ia_all[pos]), int(ib_all[pos])
+                    hard, burst, derived = _shot_pair_info(ia, ib)
+                    if hard or (burst and not derived):
+                        continue
+                    sim = _embed_of(ia, ib)
+                    if sim is not None and sim <= EMBED_LOW:
+                        continue
+                    fa, fb = uniq[ia], uniq[ib]
+                    if fa.grid is None or fb.grid is None:
+                        lay_t = 0.0
+                    else:
+                        lay_t = layout_distance_trimmed(fa.grid[0],
+                                                        fb.grid[0])
+                    if lay_t > BLOCK_LAYOUT_TOL:
+                        continue
+                    accepted[pos] = True
+                    found.append((ia, ib, int(coarse_flat[pos].min()),
+                                  int(fine_all[pos].min()),
+                                  float(hist_ok[pos]),
+                                  float(bv[k]), lay_t))
+
+            # ---- 2c) 深度 embedding 联合救援（可选层，无模型时整段跳过）
+            # 重调色 + 大幅裁切 + 贴纸 + 强压缩叠加时，dHash/pHash/NCC/布局
+            # 会一起崩掉，embedding 却仍高度相似。但它不是语义模型，跨场景
+            # 配色相近时余弦也会很高，所以必须叠加严格手工门（直方图、
+            # dHash 粗差、长宽比）与连拍否决，绝不单独放行。
+            if embed_sim is not None:
+                emb_cand = np.nonzero(
+                    ~accepted & strict_pair & strict_hist & allow_same
+                    & (coarse.min(axis=(1, 2)) <= dist)
+                    & (hist_ok <= hist_tol))[0]
+                for pos in emb_cand:
+                    ia, ib = int(ia_all[pos]), int(ib_all[pos])
+                    sim = _embed_of(ia, ib)
+                    if sim is None or sim < EMBED_HIGH:
+                        continue
+                    hard, burst, derived = _shot_pair_info(ia, ib)
+                    if hard or (burst and not derived):
+                        continue
+                    fa, fb = uniq[ia], uniq[ib]
+                    lay = (0.0 if fa.grid is None or fb.grid is None
+                           else layout_distance(fa.grid[0], fb.grid[0]))
+                    accepted[pos] = True
+                    found.append((ia, ib, int(coarse_flat[pos].min()),
+                                  int(fine_all[pos].min()),
+                                  float(hist_ok[pos]), float(corr[pos]), lay))
+
+            # ---- 3) 缩放搜索：任意裁边量。按径向签名从近到远排队，限量做
             rest = np.nonzero(~accepted)[0]
             if rest.size:
                 if ZOOM_QUEUE_SORT == "two_way":
@@ -1612,7 +2287,28 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                 elif ZOOM_QUEUE_SORT == "maxnorm":
                     key = np.maximum(pref_ok[rest] / 16.0, cur[rest] / 42.0)
                     order = rest[np.argsort(key, kind="stable")]
-                else:  # hist_pref（默认）
+                elif ZOOM_QUEUE_SORT == "radial":
+                    # 缩放不变签名做主排序键：裁切/加框的整幅哈希差会被拉大，
+                    # 但径向轮廓只是 log 半径上的平移，DCT 幅度几乎不变，
+                    # 真候选因此能排进 ZOOM_MAX_PAIRS，不再靠直方图距离猜。
+                    # 直方图/dHash 只作次级键，防签名偶然撞上无关图。
+                    rd = np.abs(radial_mat[ia_all[rest]]
+                                - radial_mat[ib_all[rest]]).mean(axis=1)
+                    if embed_sim is not None:
+                        # 只靠径向签名在大库里不够：同色系/同背景的照片
+                        # 签名彼此很近，真对会被挤到 2000 名外，被
+                        # ZOOM_MAX_PAIRS 静默截断。叠一道余弦后入队真对
+                        # 从 156/281 提到 272/281，代价是零（矩阵已算好）。
+                        ea, eb = ia_all[rest], ib_all[rest]
+                        cos = np.where(embed_ok[ea, eb],
+                                       embed_sim[ea, eb], 0.0)
+                        key = rd - ZOOM_QUEUE_COS_W * cos
+                        order = rest[np.lexsort(
+                            (pref_ok[rest], hist_ok[rest], key))]
+                    else:
+                        order = rest[np.lexsort(
+                            (pref_ok[rest], hist_ok[rest], rd))]
+                else:  # hist_pref（诊断分支）
                     order = rest[np.lexsort((pref_ok[rest], hist_ok[rest]))]
                 for pos in order[:ZOOM_MAX_PAIRS]:
                     ia, ib = int(ia_all[pos]), int(ib_all[pos])
@@ -1626,8 +2322,12 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                     hit = _zoom_hit(first[0], first[1], crop_ncc_tol)
                     src, dst = uniq[first[0]], uniq[first[1]]
                     # 方向不对称：镜像缩放窗口只能把「被裁的那张」当 src，
-                    # 所以失败后必须换方向再试一次
-                    if hit[1] is None and hit[0] >= ZOOM_REVERSE_FLOOR:
+                    # 所以失败后必须换方向再试一次。
+                    # 加白边/加框的图尤其如此：内容被缩进中间，正确方向是
+                    # 「带框的那张当 src 取中间窗口」，而正向相关只有 0.1 上下，
+                    # 永远过不了 ZOOM_REVERSE_FLOOR。色分布相近时补试一次。
+                    if hit[1] is None and (hit[0] >= ZOOM_REVERSE_FLOOR
+                                           or hist_ok[pos] <= hist_tol):
                         hit = _zoom_hit(second[0], second[1], crop_ncc_tol)
                         src, dst = uniq[second[0]], uniq[second[1]]
                     if hit[1] is None:
@@ -1667,5 +2367,6 @@ def match_photos(fps, dist=8, fine=42, hist_tol=0.26, ratio_tol=0.12,
                     out.append((i, j, coarse_v, fine_v, hist_v, corr_v, lay))
                 else:
                     out.append((j, i, coarse_v, fine_v, hist_v, corr_v, lay))
+    out = _drop_capture_mismatch(out, fps)
     out.sort(key=lambda edge: (edge[0], edge[1]))
     return out
