@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import shutil
 import warnings
 from pathlib import Path
 
@@ -698,8 +699,22 @@ def iter_photos(folder):
             yield path
 
 
+def target_dir(path, out_dir=None, subdir: bool = False) -> Path:
+    """单张图的输出目录。
+
+    out_dir 为主时统一存那里；否则存原图旁边，subdir=True 再加一层
+    `_去水印`。零散选来的若干张照片往往来自不同文件夹，所以必须按张算，
+    不能拿第一张的目录当全体。
+    """
+    if out_dir:
+        return Path(out_dir)
+    parent = Path(path).parent
+    return parent / "_去水印" if subdir else parent
+
+
 def batch_remove(paths, box, out_dir=None, method: str = "auto",
-                 quality: int = 95, cancel=None, on_progress=None) -> dict:
+                 quality: int = 95, cancel=None, on_progress=None,
+                 subdir: bool = False) -> dict:
     """批量处理；返回 {"done", "failed", "skipped", "total"}。
 
     同名输出已存在就跳过——重复点一次不会生成一堆 `_去水印(2)(3)`。
@@ -712,7 +727,8 @@ def batch_remove(paths, box, out_dir=None, method: str = "auto",
         if cancel is not None and cancel.is_set():
             break
         try:
-            target = output_path(path, out_dir, unique=False)
+            target = output_path(path, target_dir(path, out_dir, subdir),
+                                 unique=False)
             if target.exists():
                 skipped += 1
             else:
@@ -759,6 +775,43 @@ def _tint_scores(rgb: np.ndarray) -> dict:
             for name in ("黄", "蓝", "粉", "绿")}
 
 
+def looks_like_photo(rgb: np.ndarray, limit: int = 25) -> bool:
+    """照片护栏：文档截图的中位色度近 0（白纸），人像/风景随便就 30~60。
+
+    只抽 1/16 的像素就行——中位数对抽样不敏感，而全图算一遍要 0.8 秒：
+    批量大图时这一步本来就是快进快出的分支，不值得付全价。
+    """
+    sample = rgb[::4, ::4]
+    if not sample.size:
+        return False
+    r = sample[..., 0].astype(np.int16)
+    g = sample[..., 1].astype(np.int16)
+    b = sample[..., 2].astype(np.int16)
+    high = np.maximum(np.maximum(r, g), b)
+    low = np.minimum(np.minimum(r, g), b)
+    return float(np.median(high - low)) > limit
+
+
+_LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
+def _luma_chroma(rgb: np.ndarray):
+    """一次算好亮度与色度，返回 (luma float32, chroma uint8)。
+
+    大图上最大的坑是 ``arr.max(axis=2)``：跨通道归约是跳着读的，12 MP 一次要
+    3.5 秒，而一次一键抠会反复调它 8 次（detect_tint / 反解 / 灰水印 / 照片
+    护栏各自算一遍）。换成“先转 int32 再两两比较”后同样的图只要 0.2 秒；
+    亮度用 77/150/29 的整数权重（≈ Rec.601 × 256），和浮点公式差不到 1/255。
+    """
+    # tensordot 一次点乘三个通道（就是调 BLAS），12 MP 只要 0.09 秒；
+    # 先转 int32 再整数加权要 0.60 秒（uint16 反而更慢，0.97 秒）。
+    luma = np.tensordot(rgb, _LUMA_WEIGHTS, axes=([2], [0]))
+    r8, g8, b8 = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    high = np.maximum(np.maximum(r8, g8), b8)
+    low = np.minimum(np.minimum(r8, g8), b8)
+    return luma, high - low
+
+
 def _robust_threshold(score: np.ndarray, floor: float = 3.0,
                       cap: float = 8.0) -> float:
     """用中位数绝对偏差估噪声，阈值随图片自动定：干净白底上能抓到 ⩽3 的淡差。"""
@@ -768,17 +821,17 @@ def _robust_threshold(score: np.ndarray, floor: float = 3.0,
 
 
 def detect_tint(rgb: np.ndarray, gmin: int = 120,
-                luma_gate: float = 140.0) -> str:
+                luma_gate: float = 140.0, stats=None) -> str:
     """判断这张图上的浅色水印偏哪种颜色（黄/蓝/粉/绿），全没就返回空串。"""
     arr = rgb.astype(np.float32)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    luma = 0.299 * r + 0.587 * g + 0.114 * b
-    chroma = arr.max(axis=2) - arr.min(axis=2)
+    g = arr[..., 1]
+    luma, chroma = stats if stats is not None else _luma_chroma(rgb)
     pale = (luma > luma_gate) & (chroma < 45) & (g >= gmin)
     if not pale.any():
         return ""
     best, best_count = "", 0
-    for name, score in _tint_scores(rgb).items():
+    scores = _tint_scores(arr)
+    for name, score in scores.items():
         limit = _robust_threshold(score[pale])
         count = int(((score > limit) & pale).sum())
         if count > best_count:
@@ -789,21 +842,21 @@ def detect_tint(rgb: np.ndarray, gmin: int = 120,
 
 def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
                            luma_gate: float = 140.0,
-                           tint=None) -> np.ndarray:
+                           tint=None, stats=None) -> np.ndarray:
     """找浅色（淡黄/淡蓝/淡粉/淡绿）半透明水印的像素。
 
     判据：偏那种颜色 + 够亮 + 不饱和。低饱和是为了避开彩色 logo、选中框
     这类真·彩色元素；阈值默认由图自身的噪声自动定，不再写死。
     """
-    arr = rgb.astype(np.float32)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    luma = 0.299 * r + 0.587 * g + 0.114 * b
-    chroma = arr.max(axis=2) - arr.min(axis=2)
+    g = rgb[..., 1]
+    luma, chroma = stats if stats is not None else _luma_chroma(rgb)
     pale = (luma > luma_gate) & (chroma < 45) & (g >= gmin)
-    name = tint if tint is not None else detect_tint(rgb, gmin, luma_gate)
+    name = tint if tint is not None else detect_tint(rgb, gmin, luma_gate,
+                                                    stats=(luma, chroma))
     if not name:
         return np.zeros(luma.shape, dtype=bool)
-    score = _tint_scores(rgb)[name]
+    arr = rgb.astype(np.float32)
+    score = _tint_score(arr, name)
     limit = float(diff) if diff is not None else _robust_threshold(score[pale])
     return (score > limit) & pale
 
@@ -833,6 +886,11 @@ def estimate_tint_ref(rgb: np.ndarray, mask: np.ndarray,
     arr = np.asarray(rgb, dtype=np.float32)
     luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
     vals, lum = arr[mask], luma[mask]
+    # 12 MP 的扫描页上掩膜能有上百万像素，argpartition 逐个算要 2 秒；
+    # 取“最亮的 5% 的中位色”只需要一个抽样代表值，封顶 20 万个像素足够。
+    if vals.shape[0] > 200_000:
+        pick = np.linspace(0, vals.shape[0] - 1, 200_000).astype(np.int64)
+        vals, lum = vals[pick], lum[pick]
     k = min(vals.shape[0], max(1, int(np.ceil(vals.shape[0] * top_pct / 100.0))))
     obs = np.median(vals[np.argpartition(lum, -k)[-k:]], axis=0).astype(np.float32)
     paper = float(obs.max())
@@ -862,13 +920,22 @@ def _choose_tint_ref(rgb: np.ndarray, mask: np.ndarray, tint: str,
     替换，标准四色不会有任何回归。
     """
     base = TINT_REFS.get(tint, LIGHT_REF)
-    estimated = estimate_tint_ref(rgb, mask, tint=tint)
+    # 只比“哪个参考色反解后残影更小”，是均值型判定，不必上全分辨率：
+    # 12 MP 整幅反解一次要 2 秒，三个候选就是 6 秒；抽 1/3 像素后 0.7 秒，
+    # 选出的参考色再拿去全分辨率反解（这一步的精度才真正影响像素）。
+    step = 3 if rgb.shape[0] * rgb.shape[1] > 2_000_000 else 1
+    probe_rgb = rgb[::step, ::step] if step > 1 else rgb
+    probe_mask = mask[::step, ::step] if step > 1 else mask
+    if probe_mask.sum() < 200:
+        probe_rgb, probe_mask = rgb, mask
+    estimated = estimate_tint_ref(probe_rgb, probe_mask, tint=tint)
     mid = tuple((np.asarray(base, dtype=np.float32)
                  + np.asarray(estimated, dtype=np.float32)) * 0.5)
     best, best_cost = base, float("inf")
     for ref in (base, estimated, mid):
-        fixed = undo_light_watermark(rgb, strength, ref=ref, tint=tint)
-        cost = float(np.abs(_tint_score(fixed.astype(np.float32), tint)[mask]).mean())
+        fixed = undo_light_watermark(probe_rgb, strength, ref=ref, tint=tint)
+        cost = float(np.abs(_tint_score(fixed.astype(np.float32),
+                                        tint)[probe_mask]).mean())
         if cost < best_cost:
             best, best_cost = ref, cost
     return best
@@ -877,14 +944,19 @@ def _choose_tint_ref(rgb: np.ndarray, mask: np.ndarray, tint: str,
 def _run_lengths(mask: np.ndarray):
     """每个像素所在连续段有多长（横、竖各一张），用来区分“笔画”和“长直线”。"""
     height, width = mask.shape
-    rows = np.broadcast_to(np.arange(width), (height, width))
+    # int16 而不是默认的 int64：大图上这四道 accumulate 原本占 2.8 秒，窄类型
+    # 把内存带宽降下来一半又一半（结果完全一样；超宽图才退回 int32）
+    dtype = np.int16 if max(height, width) < 32000 else np.int32
+    rows = np.broadcast_to(np.arange(width, dtype=dtype),
+                           (height, width))
     row_start = np.maximum.accumulate(np.where(mask, 0, rows + 1), axis=1)
     run_row = rows - row_start + 1
     row_end = np.minimum.accumulate(
         np.where(mask, width, rows - 1)[:, ::-1], axis=1)[:, ::-1]
     run_row = np.minimum(run_row, row_end - rows + 1)
 
-    cols = np.broadcast_to(np.arange(height)[:, None], (height, width))
+    cols = np.broadcast_to(np.arange(height, dtype=dtype)[:, None],
+                           (height, width))
     col_start = np.maximum.accumulate(np.where(mask, 0, cols + 1), axis=0)
     run_col = cols - col_start + 1
     col_end = np.minimum.accumulate(
@@ -893,15 +965,14 @@ def _run_lengths(mask: np.ndarray):
     return run_row, run_col
 
 
-def _neutral_mask(rgb: np.ndarray, max_run: int = 60) -> np.ndarray:
+def _neutral_mask(rgb: np.ndarray, max_run: int = 60,
+                  stats=None) -> np.ndarray:
     """淡灰色水印：没有偏色，只是比纸面暗一点点。
 
     难点：灰色网格线和灰色水印亮度几乎一样，只能看形状——网格线很长、
     笔画很短。所以要求横、竖两个方向的连续段都不长。
     """
-    arr = rgb.astype(np.float32)
-    luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    chroma = arr.max(axis=2) - arr.min(axis=2)
+    luma, chroma = stats if stats is not None else _luma_chroma(rgb)
     background = float(np.percentile(luma, 90))
     deficit = background - luma
     candidate = (chroma < 6.0) & (deficit > 1.5) & (deficit < 40.0)
@@ -919,30 +990,47 @@ def _nearest4_fill(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if not mask.any():
         return np.array(arr, dtype=np.uint8, copy=True)
     known = ~mask
-    idx_w = np.broadcast_to(np.arange(width), (height, width)).copy()
-    idx_h = np.broadcast_to(np.arange(height)[:, None], (height, width)).copy()
-    left = np.maximum.accumulate(np.where(known, idx_w, -1), axis=1)
-    right = np.minimum.accumulate(np.where(known, idx_w, width)[:, ::-1],
-                                 axis=1)[:, ::-1]
-    up = np.maximum.accumulate(np.where(known, idx_h, -1), axis=0)
-    down = np.minimum.accumulate(np.where(known, idx_h, height)[::-1],
-                                 axis=0)[::-1]
     ys, xs = np.nonzero(mask)
+    # 只算“有水印像素的那些行/列”。全图建索引再 accumulate 要开 4 张 12 MP
+    # 的 int64 数组（每张 96 MB），实测 4.4 秒；而一张扫描页上的残影往往
+    # 只占几十行，抽出来算不到 0.4 秒，结果逐像素一致。
+    rows = np.unique(ys)
+    cols = np.unique(xs)
+    row_pos = np.searchsorted(rows, ys)
+    col_pos = np.searchsorted(cols, xs)
+    idx_w = np.arange(width, dtype=np.int32)
+    idx_h = np.arange(height, dtype=np.int32)
+    sub_rows = known[rows]
+    left = np.maximum.accumulate(np.where(sub_rows, idx_w, -1), axis=1)[row_pos, xs]
+    right = np.minimum.accumulate(np.where(sub_rows, idx_w, width)[:, ::-1],
+                                  axis=1)[:, ::-1][row_pos, xs]
+    sub_cols = known[:, cols]
+    up = np.maximum.accumulate(np.where(sub_cols, idx_h[:, None], -1),
+                               axis=0)[ys, col_pos]
+    down = np.minimum.accumulate(np.where(sub_cols, idx_h[:, None], height)[::-1],
+                                 axis=0)[::-1][ys, col_pos]
     cands = []
-    for yy, xx, ok in (
-            (ys, left[ys, xs], left[ys, xs] >= 0),
-            (ys, right[ys, xs], right[ys, xs] <= width - 1),
-            (up[ys, xs], xs, up[ys, xs] >= 0),
-            (down[ys, xs], xs, down[ys, xs] <= height - 1)):
+    for yy, xx, ok in ((ys, left, left >= 0),
+                       (ys, right, right <= width - 1),
+                       (up, xs, up >= 0),
+                       (down, xs, down <= height - 1)):
         pick = arr[np.clip(yy, 0, height - 1), np.clip(xx, 0, width - 1)]
-        cands.append(np.where(ok[:, None], pick, np.nan))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        med = np.nanmedian(np.stack(cands), axis=0)
-    out = arr.astype(np.float32).copy()
-    good = ~np.isnan(med[:, 0])
-    out[ys[good], xs[good]] = med[good]
-    return np.clip(out, 0, 255).astype(np.uint8)
+        cands.append(np.where(ok[:, None], pick, np.nan).astype(np.float32))
+    # 手写 NaN 中位数：np.nanmedian 内部走 masked array，12 MP 上仅这一层
+    # 包装就要 1 秒。把 NaN 换成 +inf 排序后取中间两个即可（4 个候选）。
+    stack = np.stack(cands)
+    finite = ~np.isnan(stack[..., 0])
+    count = finite.sum(axis=0)
+    stack[~finite] = np.inf
+    stack.sort(axis=0)
+    lo = np.maximum((count - 1) // 2, 0)
+    hi = np.maximum(count // 2, 0)
+    med = (np.take_along_axis(stack, lo[None, :, None], axis=0)[0]
+           + np.take_along_axis(stack, hi[None, :, None], axis=0)[0]) * 0.5
+    out = arr.copy()
+    good = count > 0
+    out[ys[good], xs[good]] = np.clip(med[good], 0, 255).astype(np.uint8)
+    return out
 
 
 def _safe_den(value: float) -> float:
@@ -972,11 +1060,17 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
     scale = np.clip((luma - 200.0) / 40.0, 0.35, 1.0) * float(strength)
     alpha = ((r - b) / _safe_den(wr - wb)
              + (g - b) / _safe_den(wg - wb)) * 0.5 * scale
-    alpha = np.clip(alpha, 0.0, 0.6)
-    alpha = np.where((luma < 150.0) | (alpha < 0.015), 0.0, alpha)
-    denom = np.clip(1.0 - alpha, 0.05, 1.0)[..., None]
-    fixed = (arr - alpha[..., None] * np.array([wr, wg, wb], dtype=np.float32)) / denom
-    return np.clip(fixed, 0, 255).astype(np.uint8)
+    alpha = np.clip(alpha, 0.0, 0.6, out=alpha)
+    alpha[(luma < 150.0) | (alpha < 0.015)] = 0.0
+    denom = np.clip(1.0 - alpha, 0.05, 1.0)
+    # 逐通道就地在 arr 上算：(arr - α·W) / (1-α)。原来走的是
+    # (arr - alpha[...,None]*W)/denom[...,None]，要多开两个 12 MP×3 通道的
+    # 临时数组（各 144 MB），整次反解 0.7 秒里一半花在分配和填零上。
+    for ch, wc in ((arr[..., 0], wr), (arr[..., 1], wg), (arr[..., 2], wb)):
+        np.subtract(ch, alpha * wc, out=ch)
+        np.divide(ch, denom, out=ch)
+    np.clip(arr, 0, 255, out=arr)
+    return arr.astype(np.uint8)
 
 
 def _box_blur_known(arr: np.ndarray, known: np.ndarray, radius: int):
@@ -990,25 +1084,45 @@ def _box_blur_known(arr: np.ndarray, known: np.ndarray, radius: int):
     counts = np.pad(known.astype(np.float32), ((pad, pad), (pad, pad)))
     sum_a = weighted.cumsum(0).cumsum(1)
     sum_k = counts.cumsum(0).cumsum(1)
-    ys = np.arange(height) + pad
-    xs = np.arange(width) + pad
+    # 窗口是连续的：用切片取四个角，不要用 fancy 索引（
+    # total[y1][:, x1] 会先把整行块拷一遍，12 MP 上四个角就是四次全图拷贝，
+    # 原实现光这一步要 8 秒）。pad = radius + 1，所以左上从 0 开始、
+    # 右下从 2·radius+2 开始，四个切片直接相减即可。
+    span = 2 * radius + 2
+    def rect(total):
+        return (total[span:span + height, span:span + width]
+                - total[:height, span:span + width]
+                - total[span:span + height, :width]
+                + total[:height, :width])
 
-    def rect(total, y0, y1, x0, x1):
-        return (total[y1][:, x1] - total[y0 - 1][:, x1]
-                - total[y1][:, x0 - 1] + total[y0 - 1][:, x0 - 1])
-
-    y0, y1 = ys - radius, ys + radius + 1
-    x0, x1 = xs - radius, xs + radius + 1
-    acc = rect(sum_a, y0, y1, x0, x1)
-    cnt = rect(sum_k, y0, y1, x0, x1)
+    acc = rect(sum_a)
+    cnt = rect(sum_k)
     return acc / np.maximum(cnt, 1e-6)[..., None], cnt
 
 
+def _upsample2(small: np.ndarray, shape) -> np.ndarray:
+    """最近邻放大两倍并裁到原尺寸（只用于“周围背景”这种平滑量）。"""
+    big = np.repeat(np.repeat(small, 2, axis=0), 2, axis=1)
+    return big[:shape[0], :shape[1]]
+
+
 def _local_std(gray: np.ndarray, radius: int = 6) -> np.ndarray:
-    known = np.ones(gray.shape, dtype=bool)
-    mean = _box_blur_known(gray, known, radius)[0][..., 0]
-    mean2 = _box_blur_known(gray * gray, known, radius)[0][..., 0]
-    return np.sqrt(np.maximum(mean2 - mean * mean, 0.0))
+    """局部标准差（判“这块是不是平坦”用）。
+
+    大图上降到 1/2 分辨率、半径同步减半：它只用来看“纹理多不多”，粗一倍
+    不影响门限，却能省掉 3/4 的积分图开销（12 MP 上两次累加和约 1 秒）。
+    """
+    step = 2 if gray.size > 4_000_000 else 1
+    small = gray[::step, ::step] if step > 1 else gray
+    r = max(2, int(round(radius / step)))
+    known = np.ones(small.shape, dtype=bool)
+    mean = _box_blur_known(small, known, r)[0][..., 0]
+    mean2 = _box_blur_known(small * small, known, r)[0][..., 0]
+    std = np.sqrt(np.maximum(mean2 - mean * mean, 0.0))
+    if step == 1:
+        return std
+    std = np.repeat(np.repeat(std, step, axis=0), step, axis=1)
+    return std[:gray.shape[0], :gray.shape[1]]
 
 
 def _flatten_background(fixed: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -1023,15 +1137,29 @@ def _flatten_background(fixed: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if not grow.any():
         return fixed
     known = ~grow
-    background, _ = _box_blur_known(fixed, known, 12)
-    luma = fixed.astype(np.float32).mean(axis=2)
+    luma = fixed.mean(axis=2, dtype=np.float32)
+    # “周围背景”本来就要平滑，降到 1/2 分辨率算（半径同步减半）再放大回来，
+    # 12 MP 上两次三通道积分图从 4.5 秒降到 1.2 秒，肉眼看不出差别。
+    step = 2 if luma.size > 4_000_000 else 1
+    if step > 1:
+        background = _upsample2(
+            _box_blur_known(fixed[::step, ::step], known[::step, ::step], 6)[0],
+            fixed.shape[:2])
+        dark_small = ((luma[::step, ::step] < 145)
+                      & known[::step, ::step]).astype(np.float32)
+        dark_frac = _upsample2(
+            _box_blur_known(dark_small, known[::step, ::step], 5)[0][..., 0],
+            luma.shape)
+    else:
+        background, _ = _box_blur_known(fixed, known, 12)
+        dark = ((luma < 145) & known).astype(np.float32)
+        dark_frac = _box_blur_known(dark, known, 10)[0][..., 0]
     std = _local_std(luma, 6)
-    dark = ((luma < 145) & known).astype(np.float32)
-    dark_frac = _box_blur_known(dark, known, 10)[0][..., 0]
-    flat = (std < 0.8) & (dark_frac <= 0.0) & (luma > 195) & grow
-    out = fixed.astype(np.float32).copy()
+    flat = (std < 0.8) & (dark_frac <= 1e-6) & (luma > 195) & grow
+    out = fixed.astype(np.float32)
     out[flat] = background[flat]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
 
 
 def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
@@ -1039,32 +1167,56 @@ def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
 
     彩色淡色水印走反解；完全没偏色的淡灰水印走“平坦区重铺背景”。
     """
-    tint = detect_tint(rgb)
+    # 照片护栏：文档截图的中位色度接近 0（白纸），人像/风景随便就 30~60。
+    # 在照片上强行“反解浅色水印”会把皮肤、汗光、天空当水印抹掉（实测一张
+    # 人像整张发灰、平均差 5.8），所以高色度图直接放过，交给框选+高质量。
+    if looks_like_photo(rgb):
+        return np.array(rgb, dtype=np.uint8, copy=True)
+    luma, chroma = _luma_chroma(rgb)
+    stats = (luma, chroma)
+
+    tint = detect_tint(rgb, stats=stats)
     if not tint:
-        neutral = _neutral_mask(rgb)
+        neutral = _neutral_mask(rgb, stats=stats)
         if int(neutral.sum()) < max(300, neutral.size // 500):
+            return np.array(rgb, dtype=np.uint8, copy=True)
+        # 照片护栏：真的浅灰水印是“在纸上盖一层字”，占比很小（文档样本
+        # 0.5%~3%）。风景/人像里的反光、白皮肤、天空随便就能占 7%，照旧
+        # 重铺会把整张照片抹成一片，所以超过这个比例就不认为它是文档水印。
+        if neutral.mean() > 0.05:
             return np.array(rgb, dtype=np.uint8, copy=True)
         grow = _grow_mask(neutral, 2)
         background, _ = _box_blur_known(rgb, ~grow, 10)
-        out = rgb.astype(np.float32).copy()
+        out = rgb.astype(np.float32)
         out[grow] = background[grow]
         return np.clip(out, 0, 255).astype(np.uint8)
 
-    mask = detect_light_watermark(rgb, tint=tint)
+    mask = detect_light_watermark(rgb, tint=tint, stats=stats)
     if not mask.any():
         return np.array(rgb, dtype=np.uint8, copy=True)
     ref = _choose_tint_ref(rgb, mask, tint)
     first = undo_light_watermark(rgb, tint=tint, ref=ref)
     first = _flatten_background(first, mask)
+    # 反解后的亮度/色度算一次就够：残影检测与紧跟的“附近有没有深色内容”
+    # 都要用同一张图，不传下去就是同一次归约算两遍（12 MP 约 0.5 秒）。
+    stats2 = _luma_chroma(first)
     residual = detect_light_watermark(first, diff=2.0, gmin=105,
-                                      luma_gate=110.0, tint=tint)
+                                      luma_gate=110.0, tint=tint,
+                                      stats=stats2)
     if residual.any():
         # 文字、表格线旁边不补：那里的“残余黄点”其实是笔画自身的抗锯齿边缘，
         # 补下去会把字吐成毛边（实测表头字母会被吞出锯齿）
         known = ~residual
-        luma = first.astype(np.float32).mean(axis=2)
-        dark = ((luma < 145) & known).astype(np.float32)
-        dark_frac = _box_blur_known(dark, known, 8)[0][..., 0]
+        luma = stats2[0]
+        # 又是“附近有没有深色内容”的均值判定：1/2 分辨率算，半径同步减半
+        step = 2 if luma.size > 4_000_000 else 1
+        small = luma[::step, ::step] < 145
+        known_small = known[::step, ::step]
+        dark_frac = _box_blur_known(
+            (small & known_small).astype(np.float32), known_small,
+            max(3, 8 // step))[0][..., 0]
+        if step > 1:
+            dark_frac = _upsample2(dark_frac, luma.shape)
         residual &= dark_frac <= 0.0
     if residual.any():
         residual = _grow_mask(residual, 1)
@@ -1083,15 +1235,34 @@ def _grow_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
-def remove_light_file(src, dst=None, quality: int = 95) -> Path:
-    """处理一张图（自动抠浅色水印），不覆盖原图。"""
+def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
+                     method: str = "auto") -> Path:
+    """处理一张图（自动抠浅色水印），不覆盖原图。
+
+    boxes 给了就先反解淡色水印，再把这些框（比如记下来的徽标位置）整块补掉：
+    徽标上的白字是不透明的，反解救不回来，只能靠补。
+    """
     src = Path(src)
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im)
         arr = np.asarray(im.convert("RGB"))
         fixed = clean_light_watermark(arr)
+        height, width = fixed.shape[:2]
+        for one in as_box_list(boxes) if boxes else []:
+            # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘
+            # 当成“要保留的内容”接回去（实测不留余量时白字会残一半）
+            y0, y1, x0, x1 = box_pixels(one, width, height)
+            pad = max(6, int((y1 - y0) * 0.35))
+            grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
+                     min(width, x1 + pad) / width, min(height, y1 + pad) / height)
+            fixed = inpaint(fixed, grown, method)
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # 没改动（照片护栏直接放过、或者这张图本来就没水印）就直接拷原文件：
+    # 重存一遍既费时（12 MP 约 0.4 秒）又白白损一次 JPEG 质量。
+    if not boxes and np.array_equal(fixed, arr):
+        shutil.copyfile(src, target)
+        return target
     image = Image.fromarray(fixed, "RGB")
     if target.suffix.lower() in (".jpg", ".jpeg"):
         image.save(target, quality=quality, subsampling=0)
@@ -1103,7 +1274,8 @@ def remove_light_file(src, dst=None, quality: int = 95) -> Path:
 
 
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
-                       on_progress=None) -> dict:
+                       on_progress=None, subdir: bool = False, boxes=None,
+                       method: str = "auto") -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致。"""
     paths = list(paths)
     done = skipped = 0
@@ -1113,11 +1285,13 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
         if cancel is not None and cancel.is_set():
             break
         try:
-            target = output_path(path, out_dir, unique=False)
+            target = output_path(path, target_dir(path, out_dir, subdir),
+                                 unique=False)
             if target.exists():
                 skipped += 1
             else:
-                remove_light_file(path, target, quality)
+                remove_light_file(path, target, quality, boxes=boxes,
+                                  method=method)
                 done += 1
         except Exception as exc:
             failed.append((str(path), str(exc)))
@@ -1145,5 +1319,6 @@ __all__ = [
     "pick_method",
     "remove_light_file",
     "remove_watermark_file",
+    "target_dir",
     "undo_light_watermark",
 ]
