@@ -1296,7 +1296,8 @@ class LightDetection:
     投影除以阈值，>1 才过线，越大越笃定；source 说明框从哪来
     （"box" 用户框选 / "grid" 一键抠网格 / "doc" 文档全局）；
     rejected 是拒认原因（"" 表示没拒；只有“平铺水印占比超 70%”才会拒，
-    其余情况没认出就是没认出，不算拒）。
+    其余情况没认出就是没认出，不算拒）；bg 是这次检测用的背景色（RGB
+    三元组 float，None 表示没检出）——反解直接用它，不再重算环背景。
     """
 
     box: tuple
@@ -1305,6 +1306,7 @@ class LightDetection:
     score: float = 0.0
     source: str = "box"
     rejected: str = ""
+    bg: tuple = None
 
     @property
     def found(self) -> bool:
@@ -1332,15 +1334,23 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
     把黄水印带跑。认不出（占比太小）时 tint 为 ""、mask 全假；
     占比超过七成（多半是整块底色被当成水印，比如一整片黄沙滩）时
     rejected 记“平铺水印”，同样不认。
+
+    两遍：第一遍用框外环背景投票；检出后，用掩膜外一圈（膨胀 10px
+    减掉掩膜本身）重估背景，再投一次色系。格子大、背景有渐变时环中
+    位色会偏（sky 蓝的格子环中位色比文字处真实背景 R 低 16），偏了的
+    偏差近乎无色，色度符号门会把真水印误杀（蓝压蓝天被投成“绿”）。
+    掩膜紧贴的邻域才是文字处真正的背景，第二遍的色系和背景都以它
+    为准。邻域像素太少（<100）时不重投，留第一遍的结果。
+    第二遍没检出时也留第一遍——新背景只影响这一格的判断，不降级。
     """
     height, width = rgb.shape[:2]
     y0, y1, x0, x1 = box_pixels(box, width, height)
     empty = np.zeros((height, width), dtype=bool)
     if y1 - y0 < 8 or x1 - x0 < 8:
         return LightDetection(box, source=source)
+    arr = rgb.astype(np.float32)
     pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
     ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
-    arr = rgb.astype(np.float32)
     bg = _local_background(arr, ring)
     if bg is None:
         # 框贴边、圈外没像素：退回框的最外一圈当背景
@@ -1348,49 +1358,70 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
         edge[0, :] = edge[-1, :] = True
         edge[:, 0] = edge[:, -1] = True
         bg = np.median(arr[y0:y1, x0:x1][edge], axis=0).astype(np.float32)
-    crop = _blur3(arr[y0:y1, x0:x1])
-    radius = max(8, min(crop.shape[:2]) // 8)
-    names = (tint,) if tint else tuple(BOX_TINT_REFS)
-    best_name, best_mask, best_count, best_score = "", empty, 0, 0.0
-    for name in names:
-        ref = BOX_TINT_REFS[name]
-        full, chroma = _projections(crop, bg, ref)
-        # 判据 = 去趋势后的全投影：亮度渐变（天空、墙面）被模糊吃掉，
-        # 只剩紧凑的水印笔画；再加色度投影 >0 的符号门，挡掉亮绿草叶
-        # 这类“只亮不带黄色调”的偏离（暖墙上的黄水印色度信号本来就弱，
-        # 只看色度强度会漏，所以色度只作符号门，不作阈值）。
-        score = full - _blur_f(full, radius)
-        limit = _robust_threshold(score, floor=5.0, cap=12.0)
-        # α 门：只有半透明（α≤0.75）才配反解。白字徽标这类不透明的
-        # （α≈1）投影也很大，但底下什么都没剩、反解不出东西，只能整块补；
-        # 逐像素筛，混在一个框里的白字和水印能各走各的路。α 用没模糊过的
-        # 原图算：模糊会把笔画边的 α 稀释到 0.5 左右，白字轮廓就漏网了。
-        local = (score > limit) & (chroma > 0.0)
-        if local.any():
-            raw, _ = _projections(arr[y0:y1, x0:x1], bg, ref)
-            norm = float(np.sqrt(np.dot(
-                np.asarray(ref, dtype=np.float32) - bg,
-                np.asarray(ref, dtype=np.float32) - bg)))
-            local &= (raw / max(norm, 1.0) <= 0.75)
-        count = int(local.sum())
-        if count > best_count:
-            full_mask = np.zeros((height, width), dtype=bool)
-            full_mask[y0:y1, x0:x1] = local
-            best_name, best_mask, best_count = name, full_mask, count
-            best_score = (float(np.median(score[local])) / limit
-                          if local.any() else 0.0)
-    # 占比太小不算水印（框内至少千分之一且 ≥100 像素）；占比超过七成
-    # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认、且明确拒。
-    # 注：去趋势会把均匀填充吃掉，均匀色块的掩膜到不了七成，这条目前
-    # 几乎触发不了，作安全网保留。
-    total = (y1 - y0) * (x1 - x0)
-    if best_count < max(100, total // 1000):
-        return LightDetection(box, source=source)
-    if best_count > total * 0.7:
-        return LightDetection(box, source=source,
-                              rejected="平铺水印（占比超 70%），不处理")
-    return LightDetection(box, tint=best_name, mask=best_mask,
-                          score=best_score, source=source)
+
+    def run(bg):
+        """用给定背景投一次色系，返回 LightDetection（bg 记这次用的）。"""
+        crop = _blur3(arr[y0:y1, x0:x1])
+        radius = max(8, min(crop.shape[:2]) // 8)
+        names = (tint,) if tint else tuple(BOX_TINT_REFS)
+        best_name, best_mask, best_count, best_score = "", empty, 0, 0.0
+        for name in names:
+            ref = BOX_TINT_REFS[name]
+            full, chroma = _projections(crop, bg, ref)
+            # 判据 = 去趋势后的全投影：亮度渐变（天空、墙面）被模糊吃掉，
+            # 只剩紧凑的水印笔画；再加色度投影 >0 的符号门，挡掉亮绿草叶
+            # 这类“只亮不带黄色调”的偏离（暖墙上的黄水印色度信号本来就弱，
+            # 只看色度强度会漏，所以色度只作符号门，不作阈值）。
+            score = full - _blur_f(full, radius)
+            limit = _robust_threshold(score, floor=5.0, cap=12.0)
+            # α 门：只有半透明（α≤0.75）才配反解。白字徽标这类不透明的
+            # （α≈1）投影也很大，但底下什么都没剩、反解不出东西，只能整块补；
+            # 逐像素筛，混在一个框里的白字和水印能各走各的路。α 用没模糊过的
+            # 原图算：模糊会把笔画边的 α 稀释到 0.5 左右，白字轮廓就漏网了。
+            local = (score > limit) & (chroma > 0.0)
+            if local.any():
+                raw, _ = _projections(arr[y0:y1, x0:x1], bg, ref)
+                norm = float(np.sqrt(np.dot(
+                    np.asarray(ref, dtype=np.float32) - bg,
+                    np.asarray(ref, dtype=np.float32) - bg)))
+                local &= (raw / max(norm, 1.0) <= 0.75)
+            count = int(local.sum())
+            if count > best_count:
+                full_mask = np.zeros((height, width), dtype=bool)
+                full_mask[y0:y1, x0:x1] = local
+                best_name, best_mask, best_count = name, full_mask, count
+                best_score = (float(np.median(score[local])) / limit
+                              if local.any() else 0.0)
+        # 占比太小不算水印（框内至少千分之一且 ≥100 像素）；占比超过七成
+        # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认、且明确拒。
+        # 注：去趋势会把均匀填充吃掉，均匀色块的掩膜到不了七成，这条目前
+        # 几乎触发不了，作安全网保留。
+        bg_tuple = tuple(float(v) for v in bg)
+        total = (y1 - y0) * (x1 - x0)
+        if best_count < max(100, total // 1000):
+            return LightDetection(box, source=source, bg=bg_tuple)
+        if best_count > total * 0.7:
+            return LightDetection(box, source=source, bg=bg_tuple,
+                                  rejected="平铺水印（占比超 70%），不处理")
+        return LightDetection(box, tint=best_name, mask=best_mask,
+                              score=best_score, source=source, bg=bg_tuple)
+
+    det1 = run(bg)
+    if not det1.found:
+        return det1
+    # 第二遍：掩膜外一圈重估背景，再投一次色系。_grow_mask 用 np.roll
+    # 膨胀，贴图边的掩膜会从对边卷进几个像素，中位数扛得住这点污染。
+    nb = _grow_mask(det1.mask, 10) & ~det1.mask
+    if int(nb.sum()) < 100:
+        return det1
+    bg2 = np.median(arr[nb], axis=0).astype(np.float32)
+    if float(np.max(np.abs(bg2 - bg))) <= 5.0:
+        # 背景几乎没动：环背景本来就准，换背景只会让 α 估计多一点
+        # 波动（紧框在 sky 上实测差 1~2 个点），不重投，留第一遍。
+        # 格子的大偏差（R 差 16）照修——阈值 5 介于两者之间。
+        return det1
+    det2 = run(bg2)
+    return det2 if det2.found else det1
 
 
 def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
@@ -1420,9 +1451,14 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
         # 框内直接用投票赢的候选参考色。_choose_tint_ref 是给白底文档做的
         # （按“纸面亮度”自估），用在照片框上会把参考色估跑偏、反解过头。
         ref = BOX_TINT_REFS.get(name, LIGHT_REF)
-    pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
-    ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
-    bg = _local_background(arr, ring)
+    # 反解用检测那遍的背景：框外环背景在大格子 + 渐变底色上会偏
+    # （sky 蓝的格子环中位色比文字处 R 低 16），偏了的偏差近乎无色，
+    # α 估计和色度判断都跟着错。检测里第二遍已用掩膜外一圈重估过
+    # 背景，直接用它；没给时才退回环背景。
+    bg = (np.asarray(det.bg, dtype=np.float32) if det.bg is not None
+          else _local_background(
+              arr, _box_ring_mask((height, width), y0, y1, x0, x1,
+                                  max(8, int(min(y1 - y0, x1 - x0) * 0.25)))))
     if bg is None:
         return unchanged, empty, empty
     w = np.asarray(ref, dtype=np.float32) - bg

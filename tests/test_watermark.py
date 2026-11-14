@@ -416,6 +416,64 @@ class TestStatus(unittest.TestCase):
         self.assertEqual(result["rejected"], 1)
         self.assertEqual(result["results"][0][1], "rejected")
 
+class TestSkyBlueFix(unittest.TestCase):
+    """sky 蓝文件流弱项的回归：格子大、背景有渐变时环中位色会偏，
+    偏了的偏差近乎无色，色度门把真蓝水印误杀、色系投成“绿”。
+    修法：检测到掩膜后，用掩膜外一圈重估背景再投一次色系。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, arr):
+        src = self.tmp / name
+        Image.fromarray(arr).save(src, quality=95)
+        return src
+
+    def _jpeg(self, tint, alpha):
+        clean = _background("sky")
+        wm, bbox = _watermark(clean, tint, alpha)
+        return clean, wm, bbox, self._write("photo.jpg", wm)
+
+    def test_grid_cell_votes_blue_on_jpeg_sky(self):
+        # 顶格（y 100–300）以前投成“绿”、钉死“蓝” mask=0；
+        # 第二遍后必须是“蓝”，掩膜不小于单框检出量的八成
+        _clean, _wm, _bbox, src = self._jpeg("蓝", 0.35)
+        loaded = np.asarray(Image.open(src).convert("RGB"))
+        cell = (0.0, 0.25, 0.41666666666666663, 0.75)
+        det = W.detect_light_in_box(loaded, cell)
+        self.assertEqual(det.tint, "蓝")
+        self.assertGreaterEqual(int(det.mask.sum()), 2000)
+
+    def test_one_click_blue_sky_drops_to_floor(self):
+        # 一键抠（JPEG 图）以前只降 16%（11.41→9.57），现在要降到
+        # 单框反解的水平（约 6.7），即降幅不低于 35%
+        clean, _wm, bbox, src = self._jpeg("蓝", 0.35)
+        loaded = np.asarray(Image.open(src).convert("RGB"))
+        x0, y0, x1, y1 = bbox
+        before = _box_err(loaded, clean, y0, y1, x0, x1)
+        fixed, _status = W.clean_light_watermark(loaded)
+        after = _box_err(fixed, clean, y0, y1, x0, x1)
+        self.assertLess(after, before * 0.65)
+
+    def test_file_stream_blue_sky_drops_to_floor(self):
+        # 文件流以前只降 15%（11.41→9.68，partial），现在降幅
+        # 不低于 35%（约 6.4）。状态仍是 partial 也可以——校验在
+        # 输出图上仍检出轻微残留（分数近线，detail 里写明），
+        # 误差已到 JPEG 底噪水平，不是没修干净。
+        clean, _wm, bbox, src = self._jpeg("蓝", 0.35)
+        x0, y0, x1, y1 = bbox
+        before = _box_err(np.asarray(Image.open(src).convert("RGB")),
+                          clean, y0, y1, x0, x1)
+        dst, status = W.remove_light_file(src, boxes=[_text_box_norm(bbox)])
+        after = _box_err(np.asarray(Image.open(dst).convert("RGB")),
+                         clean, y0, y1, x0, x1)
+        self.assertLess(after, before * 0.65)
+        self.assertIn(status.status, ("clean", "partial"))
+
 
 if __name__ == "__main__":
     unittest.main()
