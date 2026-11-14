@@ -6020,6 +6020,36 @@ class WatermarkPage(ToolPage):
         if failed:
             parts.append(f"失败 {len(failed)} 张")
             self.app.log(f"去水印失败 {len(failed)} 张：{failed[0][0]}", "warn")
+        # 浅色批量多一层状态（框选补图路径不返回这些键，别拿它当总计）：
+        # clean 已清 / partial 解不干净 / unchanged 没找到 / rejected
+        # 明确拒绝；只在结果里有这些键时显示
+        counts = {k: result.get(k, 0) for k in
+                  ("clean", "partial", "unchanged", "rejected")}
+        if any(counts.values()):
+            bits = []
+            if counts["clean"]:
+                bits.append(f"干净 {counts['clean']} 张")
+            if counts["partial"]:
+                # “解不彻底”盖两种 partial：反解不净被迫整块补图、
+                # 校验发现残留；别写“仍有残留”（前者水印已被补掉）、
+                # 也别写“已整块补图”（后者没补）
+                bits.append(f"解不彻底 {counts['partial']} 张")
+            if counts["unchanged"]:
+                bits.append(f"未找到 {counts['unchanged']} 张")
+            if counts["rejected"]:
+                bits.append(f"拒绝 {counts['rejected']} 张")
+            parts.append("、".join(bits))
+            # 非干净的逐张记进日志（干净的不刷屏），最多 8 条
+            shown = 0
+            for path, status, detail in result.get("results") or []:
+                # 干净但框被拒的也要记一句（水印是自动抠清的，框没生效）
+                if status == "clean" and "拒绝" not in detail:
+                    continue
+                if shown >= 8:
+                    break
+                self.app.log(f"去水印[{status}] {os.path.basename(path)}：{detail}",
+                             "warn")
+                shown += 1
         text = " · ".join(parts)
         self.status.configure(text=f"{text} → {where}")
         self.app.log(f"去水印{text}，输出：{where}",

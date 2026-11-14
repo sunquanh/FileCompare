@@ -173,10 +173,11 @@ class TestBoxUnblend(unittest.TestCase):
 
     def test_clean_photo_box_returns_empty(self):
         clean = _background("sky")
-        name, mask = W.detect_light_in_box(
-            clean, (0.1, 0.4, 0.7, 0.7))
-        self.assertEqual(name, "")
-        self.assertEqual(int(mask.sum()), 0)
+        det = W.detect_light_in_box(clean, (0.1, 0.4, 0.7, 0.7))
+        self.assertEqual(det.tint, "")
+        self.assertFalse(det.found)
+        self.assertEqual(det.rejected, "")
+        self.assertEqual(det.score, 0.0)
 
 
 class TestCleanPhoto(unittest.TestCase):
@@ -187,7 +188,8 @@ class TestCleanPhoto(unittest.TestCase):
         wm, bbox = _watermark(clean, "黄", 0.35)
         x0, y0, x1, y1 = bbox
         before = _box_err(wm, clean, y0, y1, x0, x1)
-        fixed = W.clean_light_watermark(wm)
+        fixed, status = W.clean_light_watermark(wm)
+        self.assertEqual(status.status, "clean")
         after = _box_err(fixed, clean, y0, y1, x0, x1)
         self.assertLess(after, before * 0.6,
                         f"grid path: box err {before:.2f} -> {after:.2f}")
@@ -196,7 +198,8 @@ class TestCleanPhoto(unittest.TestCase):
 
     def test_no_watermark_unchanged(self):
         clean = _background("wall")
-        fixed = W.clean_light_watermark(clean)
+        fixed, status = W.clean_light_watermark(clean)
+        self.assertEqual(status.status, "unchanged")
         self.assertTrue(np.array_equal(fixed, clean),
                         "photo without watermark must be untouched")
 
@@ -214,7 +217,8 @@ class TestCleanDoc(unittest.TestCase):
         wm, bbox = _watermark(doc, "黄", 0.35)
         x0, y0, x1, y1 = bbox
         before = _box_err(wm, doc, y0, y1, x0, x1)
-        fixed = W.clean_light_watermark(wm)
+        fixed, status = W.clean_light_watermark(wm)
+        self.assertEqual(status.status, "clean")
         after = _box_err(fixed, doc, y0, y1, x0, x1)
         self.assertLess(after, before * 0.7,
                         f"doc: box err {before:.2f} -> {after:.2f}")
@@ -240,7 +244,8 @@ class TestRemoveLightFile(unittest.TestCase):
         # 框内非水印像素误差约 7.6，这部分反解救不回来；内存内同款测试
         # 已证算法本身能降 68%，这里只验端到端接线。
         loaded = np.asarray(Image.open(src).convert("RGB"))
-        dst = W.remove_light_file(src, boxes=[_text_box_norm(bbox)])
+        dst, status = W.remove_light_file(src, boxes=[_text_box_norm(bbox)])
+        self.assertEqual(status.status, "clean")
         out = np.asarray(Image.open(dst).convert("RGB"))
         x0, y0, x1, y1 = bbox
         before = _box_err(loaded, clean, y0, y1, x0, x1)
@@ -256,12 +261,160 @@ class TestRemoveLightFile(unittest.TestCase):
         wm, bbox = _watermark(clean, "黄", 1.0, color=(255, 255, 255))
         src = self.tmp / "logo.jpg"
         Image.fromarray(wm).save(src, quality=95)
-        dst = W.remove_light_file(src, boxes=[_text_box_norm(bbox)])
+        dst, status = W.remove_light_file(src, boxes=[_text_box_norm(bbox)])
+        self.assertEqual(status.status, "clean")
+        self.assertIn("不透明", status.detail)
         out = np.asarray(Image.open(dst).convert("RGB"))
         x0, y0, x1, y1 = bbox
         moved = _box_err(out, wm, y0, y1, x0, x1)
         self.assertGreater(moved, 5.0,
                            "opaque logo box must be inpainted, not left")
+
+
+class TestDetection(unittest.TestCase):
+    """检测只吐 LightDetection：框 + 色系 + 掩膜 + 分数 + 来源 + 拒认原因。"""
+
+    def test_box_detection_fields(self):
+        clean = _background("grass")
+        wm, bbox = _watermark(clean, "黄", 0.35)
+        det = W.detect_light_in_box(wm, _text_box_norm(bbox))
+        self.assertTrue(det.found)
+        self.assertEqual(det.tint, "黄")
+        self.assertGreater(det.score, 1.0)
+        self.assertEqual(det.source, "box")
+        self.assertEqual(det.rejected, "")
+        self.assertGreater(int(det.mask.sum()), 100)
+        self.assertEqual(det.box, _text_box_norm(bbox))
+
+    def test_grid_detections_carry_source(self):
+        clean = _background("grass")
+        wm, _bbox = _watermark(clean, "黄", 0.35)
+        dets = W._grid_light_boxes(wm)
+        self.assertGreater(len(dets), 0)
+        for det in dets:
+            self.assertEqual(det.source, "grid")
+            self.assertTrue(det.found)
+
+
+class TestReconstruct(unittest.TestCase):
+    """重建决策是唯一的分叉点：同一套规则，不再两条路各写一套。"""
+
+    def test_yellow_box_unblend_or_fill(self):
+        clean = _background("grass")
+        wm, bbox = _watermark(clean, "黄", 0.35)
+        x0, y0, x1, y1 = bbox
+        before = _box_err(wm, clean, y0, y1, x0, x1)
+        fixed, action, _detail = W.reconstruct_light(
+            wm, _text_box_norm(bbox))
+        self.assertIn(action, ("unblend", "fill"))
+        after = _box_err(fixed, clean, y0, y1, x0, x1)
+        self.assertLess(after, before * 0.6)
+
+    def test_strong_yellow_box_inpaint_residual(self):
+        # 草地 α=0.5：反解留 47% 残留，不得不整块补（partial 的决策层）
+        clean = _background("grass")
+        wm, bbox = _watermark(clean, "黄", 0.5)
+        _fixed, action, detail = W.reconstruct_light(
+            wm, _text_box_norm(bbox))
+        self.assertEqual(action, "inpaint-residual")
+        self.assertIn("残留", detail)
+
+    def test_white_logo_box_inpaint_opaque(self):
+        clean = _background("grass")
+        wm, bbox = _watermark(clean, "黄", 1.0, color=(255, 255, 255))
+        _fixed, action, detail = W.reconstruct_light(
+            wm, _text_box_norm(bbox))
+        self.assertEqual(action, "inpaint-opaque")
+        self.assertIn("不透明", detail)
+
+    def test_clean_box_none(self):
+        clean = _background("sky")
+        _fixed, action, _detail = W.reconstruct_light(
+            clean, (0.1, 0.4, 0.7, 0.7))
+        self.assertEqual(action, "none")
+
+    def test_whole_image_box_rejected(self):
+        clean = _background("sky")
+        wm, _bbox = _watermark(clean, "黄", 0.35)
+        _fixed, action, detail = W.reconstruct_light(
+            wm, (0.0, 0.0, 1.0, 1.0))
+        self.assertEqual(action, "rejected")
+        self.assertIn("70%", detail)
+
+
+class TestStatus(unittest.TestCase):
+    """处理结论如实报：干净 / 残留 / 未找到 / 拒绝，不悄悄说成功。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, arr):
+        src = self.tmp / name
+        Image.fromarray(arr).save(src, quality=95)
+        return src
+
+    def test_clean_photo_unchanged(self):
+        src = self._write("clean.jpg", _background("wall"))
+        _dst, status = W.remove_light_file(src)
+        self.assertEqual(status.status, "unchanged")
+
+    def test_yellow_photo_clean(self):
+        clean = _background("sky")
+        wm, bbox = _watermark(clean, "黄", 0.35)
+        src = self._write("photo.jpg", wm)
+        _dst, status = W.remove_light_file(
+            src, boxes=[_text_box_norm(bbox)])
+        self.assertEqual(status.status, "clean")
+
+    def test_whole_image_box_rejected(self):
+        # 白字徽标 + 整图大框：自动抠不管白字，框又占图超 70% → 明确拒绝
+        clean = _background("grass")
+        wm, _bbox = _watermark(clean, "黄", 1.0, color=(255, 255, 255))
+        src = self._write("logo.jpg", wm)
+        _dst, status = W.remove_light_file(src, boxes=[(0.0, 0.0, 1.0, 1.0)])
+        self.assertEqual(status.status, "rejected")
+        self.assertIn("70%", status.detail)
+
+    def test_whole_image_box_clean_with_note(self):
+        # 黄字照片 + 整图大框：水印是自动抠清的，结论仍是 clean，
+        # 但被拒的框必须记一句，不能悄悄吞掉
+        clean = _background("sky")
+        wm, _bbox = _watermark(clean, "黄", 0.35)
+        src = self._write("photo.jpg", wm)
+        _dst, status = W.remove_light_file(src, boxes=[(0.0, 0.0, 1.0, 1.0)])
+        self.assertEqual(status.status, "clean")
+        self.assertIn("拒绝", status.detail)
+
+    def test_batch_counts_and_results(self):
+        clean = _background("wall")
+        wm_y, _b = _watermark(_background("sky"), "黄", 0.35)
+        wm_l, _b2 = _watermark(_background("grass"), "黄", 1.0,
+                               color=(255, 255, 255))
+        paths = [self._write("clean.jpg", clean),
+                 self._write("yellow.jpg", wm_y),
+                 self._write("logo.jpg", wm_l)]
+        result = W.batch_remove_light(paths)
+        self.assertEqual(result["done"], 3)
+        self.assertEqual(result["clean"], 1)
+        self.assertEqual(result["unchanged"], 2)
+        self.assertEqual(result["partial"], 0)
+        self.assertEqual(result["rejected"], 0)
+        by_name = {Path(p).name: s for p, s, _d in result["results"]}
+        self.assertEqual(by_name["yellow.jpg"], "clean")
+        self.assertEqual(by_name["clean.jpg"], "unchanged")
+        self.assertEqual(by_name["logo.jpg"], "unchanged")
+
+    def test_batch_rejected_count(self):
+        clean = _background("grass")
+        wm_l, _b = _watermark(clean, "黄", 1.0, color=(255, 255, 255))
+        src = self._write("logo.jpg", wm_l)
+        result = W.batch_remove_light([src], boxes=[(0.0, 0.0, 1.0, 1.0)])
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["results"][0][1], "rejected")
 
 
 if __name__ == "__main__":

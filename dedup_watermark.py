@@ -15,12 +15,19 @@
   * 反射采不到的地方（框贴住图片边、对面也没空间）退回由外向内扩散，
     只会给出平滑过渡，细节会糊——这是无模型方案的硬上限，界面上要提示。
 
+流程分层（检测 → 重建 → 状态）：检测器（detect_light_in_box）只吐
+LightDetection（框 + 色系 + 掩膜 + 分数 + 来源 + 拒认原因），重建决策
+（reconstruct_light）是唯一决定“反解还是补图”的地方，框选和一键抠
+两条入口都走它；每张图最后给一个 LightStatus（干净 / 残留 / 未找到 /
+拒绝），处理完不认怂——解不干净、处理不了的都如实报，不悄悄说成功。
+
 只处理使用者自己有版权的照片。
 """
 from __future__ import annotations
 
 import shutil
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -1280,19 +1287,57 @@ def _projections(arr, bg, ref):
     return full, chroma
 
 
-def detect_light_in_box(rgb, box, tint=None):
-    """框内局部检测浅色水印。
+@dataclass
+class LightDetection:
+    """一处浅色水印的检测结果：检测器只吐这个，重建只认这个。
 
-    返回 (tint, mask)：mask 是全图尺寸布尔阵，只有框内可能为真。
+    box 是归一化框；tint 是赢的色系（"" 表示没认出）；mask 全图尺寸
+    （只有框内可能为真）；score 是检出强度——框内检出像素的中位去趋势
+    投影除以阈值，>1 才过线，越大越笃定；source 说明框从哪来
+    （"box" 用户框选 / "grid" 一键抠网格 / "doc" 文档全局）；
+    rejected 是拒认原因（"" 表示没拒；只有“平铺水印占比超 70%”才会拒，
+    其余情况没认出就是没认出，不算拒）。
+    """
+
+    box: tuple
+    tint: str = ""
+    mask: np.ndarray = field(default=None, repr=False)
+    score: float = 0.0
+    source: str = "box"
+    rejected: str = ""
+
+    @property
+    def found(self) -> bool:
+        return bool(self.tint) and self.mask is not None and bool(self.mask.any())
+
+
+@dataclass
+class LightStatus:
+    """一张图的处理结论：只报结果，不报过程。
+
+    status：clean（水印已清，纹理保留）；partial（反解没解干净，不得不
+    整块补图，纹理被重建）；unchanged（没找到水印，什么都没动）；
+    rejected（平铺水印或框过大，明确不处理）。detail 是一句人话。
+    """
+
+    status: str  # "clean" | "partial" | "unchanged" | "rejected"
+    detail: str = ""
+
+
+def detect_light_in_box(rgb, box, tint=None, source="box"):
+    """框内局部检测浅色水印，返回 LightDetection。
+
     背景取框外一圈中位色，色调在框内投票，阈值按框内投影分布自定——
     压在深色草地/肤色上的黄字也能被认出来，全图投“蓝”的蓝天照片不再
-    把黄水印带跑。认不出（或占比太小/太大）时返回 ("", 全假)。
+    把黄水印带跑。认不出（占比太小）时 tint 为 ""、mask 全假；
+    占比超过七成（多半是整块底色被当成水印，比如一整片黄沙滩）时
+    rejected 记“平铺水印”，同样不认。
     """
     height, width = rgb.shape[:2]
     y0, y1, x0, x1 = box_pixels(box, width, height)
     empty = np.zeros((height, width), dtype=bool)
     if y1 - y0 < 8 or x1 - x0 < 8:
-        return "", empty
+        return LightDetection(box, source=source)
     pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
     ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
     arr = rgb.astype(np.float32)
@@ -1306,7 +1351,7 @@ def detect_light_in_box(rgb, box, tint=None):
     crop = _blur3(arr[y0:y1, x0:x1])
     radius = max(8, min(crop.shape[:2]) // 8)
     names = (tint,) if tint else tuple(BOX_TINT_REFS)
-    best_name, best_mask, best_count = "", empty, 0
+    best_name, best_mask, best_count, best_score = "", empty, 0, 0.0
     for name in names:
         ref = BOX_TINT_REFS[name]
         full, chroma = _projections(crop, bg, ref)
@@ -1332,12 +1377,20 @@ def detect_light_in_box(rgb, box, tint=None):
             full_mask = np.zeros((height, width), dtype=bool)
             full_mask[y0:y1, x0:x1] = local
             best_name, best_mask, best_count = name, full_mask, count
+            best_score = (float(np.median(score[local])) / limit
+                          if local.any() else 0.0)
     # 占比太小不算水印（框内至少千分之一且 ≥100 像素）；占比超过七成
-    # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认。
+    # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认、且明确拒。
+    # 注：去趋势会把均匀填充吃掉，均匀色块的掩膜到不了七成，这条目前
+    # 几乎触发不了，作安全网保留。
     total = (y1 - y0) * (x1 - x0)
-    if best_count < max(100, total // 1000) or best_count > total * 0.7:
-        return "", empty
-    return best_name, best_mask
+    if best_count < max(100, total // 1000):
+        return LightDetection(box, source=source)
+    if best_count > total * 0.7:
+        return LightDetection(box, source=source,
+                              rejected="平铺水印（占比超 70%），不处理")
+    return LightDetection(box, tint=best_name, mask=best_mask,
+                          score=best_score, source=source)
 
 
 def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
@@ -1356,9 +1409,10 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
         return unchanged, empty, empty
     if (y1 - y0) * (x1 - x0) > height * width * 0.7:
         return unchanged, empty, empty
-    name, mask = detect_light_in_box(rgb, box, tint=tint)
-    if not name or not mask.any():
+    det = detect_light_in_box(rgb, box, tint=tint)
+    if not det.found:
         return unchanged, empty, empty
+    name, mask = det.tint, det.mask
     arr = rgb.astype(np.float32)
     crop = arr[y0:y1, x0:x1]
     sub = mask[y0:y1, x0:x1]
@@ -1386,9 +1440,74 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
     out = arr.copy()
     out[y0:y1, x0:x1] = np.clip(fixed_crop, 0, 255)
     fixed = np.rint(np.clip(out, 0, 255)).astype(np.uint8)
-    # 反解后框内再检一次：还有多少没解掉
-    _, residual = detect_light_in_box(fixed, box, tint=name)
+    # 反解后框内再检一次：还有多少没解掉（没检出就是空掩膜，不是 None）
+    res_det = detect_light_in_box(fixed, box, tint=name)
+    residual = res_det.mask if res_det.mask is not None else empty
     return fixed, mask, residual
+
+
+def reconstruct_light(arr, box, det=None, method="auto", allow_inpaint=True,
+                      source="box"):
+    """重建决策：检测和重建之间唯一的分叉点。
+
+    输入检测记录（没给就现检），按同一套规则决定反解、补残影还是整块补，
+    框选路径和一键抠网格都走这里，不再各自写一套“反解还是补”的判断：
+    - 没检出 → ("none", "未找到水印")，原样返回；
+    - 检测被拒（平铺水印）→ ("rejected", 拒认原因)，不碰；
+    - mask 太小（<200 像素且 < 框面积 2%）→ 不透明徽标，整块补
+      （allow_inpaint=False 时原样返回，action "none"）；
+    - 反解后无残留 → ("unblend", "反解干净")；
+    - 残留 ≤30% → 小补残影 ("fill", "反解后残留 X%，已小补")；
+    - 残留 >30% → 整块补 ("inpaint-residual", ...)，纹理被重建；
+    - 框占图超 70%（undo 内部拒掉）→ ("rejected", "框过大，不处理")。
+    返回 (fixed, action, detail)：action 是 unblend / fill /
+    inpaint-opaque / inpaint-residual / none / rejected，detail 是一句人话。
+    det 是在原图上探出的检测（remove_light_file 的框路径先在原图探、
+    再在当前图上反解）；det 为 None 时在 arr 上现检。
+    """
+    height, width = arr.shape[:2]
+    y0, y1, x0, x1 = box_pixels(box, width, height)
+    unchanged = np.array(arr, dtype=np.uint8, copy=True)
+    if det is None:
+        det = detect_light_in_box(arr, box, source=source)
+    if det.rejected:
+        return unchanged, "rejected", det.rejected
+    if not det.found:
+        return unchanged, "none", "未找到水印"
+    box_area = (y1 - y0) * (x1 - x0)
+    # 框占图超七成先拒掉——不管框里是什么，整块补/反解整张图都是错的；
+    # 这个检查必须在“mask 太小就整块补”之前，否则白字徽标配大框会把
+    # 整张图都补掉
+    if box_area > height * width * 0.7:
+        return unchanged, "rejected", "框占图超 70%，不处理"
+    # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘当成
+    # “要保留的内容”接回去（实测不留余量时白字会残一半）
+    pad = max(6, int((y1 - y0) * 0.35))
+    grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
+             min(width, x1 + pad) / width, min(height, y1 + pad) / height)
+    if int(det.mask.sum()) < max(200, box_area * 0.02):
+        # 原图框里几乎没有可反解的浅色水印：不透明徽标（白字只剩抗锯齿
+        # 轮廓也算），整块补
+        if allow_inpaint:
+            return (inpaint(arr, grown, method), "inpaint-opaque",
+                    "不透明徽标，已整块补图")
+        return unchanged, "none", "不透明徽标，整块补已关"
+    # 框内有浅色水印：先反解一次，再看残留决定
+    fixed, mask2, residual = undo_light_in_box(arr, box, tint=det.tint)
+    if not mask2.any():
+        # 探时有、解时没了：水印已被自动抠处理掉，不硬补
+        return unchanged, "none", "已由自动抠处理"
+    if not residual.any():
+        return fixed, "unblend", "反解干净"
+    frac = float(residual.sum()) / max(float(det.mask.sum()), 1.0)
+    if frac <= 0.30:
+        return (_nearest4_fill(fixed, _grow_mask(residual, 1)), "fill",
+                f"反解后残留 {frac:.0%}，已小补")
+    if allow_inpaint:
+        return (inpaint(fixed, grown, method), "inpaint-residual",
+                f"反解残留 {frac:.0%}，已整块补图")
+    return (_nearest4_fill(fixed, _grow_mask(residual, 1)), "fill",
+            f"反解残留 {frac:.0%}，已小补（整块补已关）")
 
 
 def _box_iou(a, b):
@@ -1409,7 +1528,8 @@ def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
     """一键抠在照片上的分区检测：把图切成重叠网格，逐格局部投票。
 
     水印通常只占一角或一条边，整图投票会被主导色（蓝天、黄沙）带跑；
-    格子化后每格只看自己的一小片背景。返回归一化框列表（重叠的已合并）。
+    格子化后每格只看自己的一小片背景。返回 LightDetection 列表
+    （重叠的已合并，掩膜取并集，色系取像素多的那格）。
     """
     height, width = rgb.shape[:2]
     cell_h = 1.0 / rows
@@ -1422,35 +1542,44 @@ def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
             x0 = max(0.0, c * cell_w - cell_w * overlap)
             x1 = min(1.0, (c + 1) * cell_w + cell_w * overlap)
             box = (x0, y0, x1, y1)
-            _, mask = detect_light_in_box(rgb, box)
-            count = int(mask.sum())
+            det = detect_light_in_box(rgb, box, source="grid")
+            count = int(det.mask.sum()) if det.found else 0
             py0, py1, px0, px1 = box_pixels(box, width, height)
             total = (py1 - py0) * (px1 - px0)
             # 证据要够强：格内至少 200 像素且占比不超过 25%（太少是噪声，
             # 太多是整块底色）；太少时 detect 里已经返回空了，这里只补上限
             if count >= 200 and count <= total * 0.25:
-                found.append(box)
+                found.append(det)
     # 合并重叠的格子（IoU>0.3 合成外接框），避免同一处水印反解两次。
     # 没合并的相邻格（IoU 约 0.14）重叠区会被两个格各反解一次，是自收敛
     # 的（第二次按重新估计的残余 α 再解，不会过冲），不是 bug。
     merged = []
-    for box in found:
+    for det in found:
         placed = False
         for i, old in enumerate(merged):
-            if _box_iou(box, old) > 0.3:
-                merged[i] = (min(box[0], old[0]), min(box[1], old[1]),
-                             max(box[2], old[2]), max(box[3], old[3]))
+            if _box_iou(det.box, old.box) > 0.3:
+                box = (min(det.box[0], old.box[0]), min(det.box[1], old.box[1]),
+                       max(det.box[2], old.box[2]), max(det.box[3], old.box[3]))
+                merged[i] = LightDetection(
+                    box,
+                    tint=(det.tint if int(det.mask.sum()) >= int(old.mask.sum())
+                          else old.tint),
+                    mask=det.mask | old.mask,
+                    score=max(det.score, old.score),
+                    source="grid")
                 placed = True
                 break
         if not placed:
-            merged.append(box)
+            merged.append(det)
     return merged
 
 
-def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
+def clean_light_watermark(rgb: np.ndarray):
     """浅色水印一键流程：认出色调 → 反解 → 铺平平坦背景 → 补掉残影。
 
     彩色淡色水印走反解；完全没偏色的淡灰水印走“平坦区重铺背景”。
+    返回 (image, LightStatus)：照片走网格检测 + 统一重建决策
+    （reconstruct_light，一键抠不整块补）；文档走原全局路径。
     """
     # 照片护栏（分区版）：文档截图的中位色度接近 0（白纸），人像/风景随便
     # 就 30~60。在照片上强行全图反解会把皮肤、汗光、天空当水印抹掉（实测
@@ -1459,14 +1588,19 @@ def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
     # 原样返回。
     if looks_like_photo(rgb):
         out = np.array(rgb, dtype=np.uint8, copy=True)
-        for one in _grid_light_boxes(rgb):
-            fixed, mask, residual = undo_light_in_box(out, one)
-            if not mask.any():
-                continue
-            out = fixed
-            if residual.any():
-                out = _nearest4_fill(out, _grow_mask(residual, 1))
-        return out
+        dets = _grid_light_boxes(rgb)
+        if not dets:
+            return out, LightStatus("unchanged", "未找到浅色水印")
+        changed = 0
+        for det in dets:
+            fixed, action, _detail = reconstruct_light(
+                out, det.box, det=det, allow_inpaint=False)
+            if action in ("unblend", "fill"):
+                out = fixed
+                changed += 1
+        if not changed:
+            return out, LightStatus("unchanged", "水印区已处理过")
+        return out, LightStatus("clean", f"{changed} 个水印区已反解")
     luma, chroma = _luma_chroma(rgb)
     stats = (luma, chroma)
 
@@ -1474,21 +1608,25 @@ def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
     if not tint:
         neutral = _neutral_mask(rgb, stats=stats)
         if int(neutral.sum()) < max(300, neutral.size // 500):
-            return np.array(rgb, dtype=np.uint8, copy=True)
+            return (np.array(rgb, dtype=np.uint8, copy=True),
+                    LightStatus("unchanged", "未找到浅色水印"))
         # 照片护栏：真的浅灰水印是“在纸上盖一层字”，占比很小（文档样本
         # 0.5%~3%）。风景/人像里的反光、白皮肤、天空随便就能占 7%，照旧
         # 重铺会把整张照片抹成一片，所以超过这个比例就不认为它是文档水印。
         if neutral.mean() > 0.05:
-            return np.array(rgb, dtype=np.uint8, copy=True)
+            return (np.array(rgb, dtype=np.uint8, copy=True),
+                    LightStatus("unchanged", "疑似照片纹理，未处理"))
         grow = _grow_mask(neutral, 2)
         background, _ = _box_blur_known(rgb, ~grow, 10)
         out = rgb.astype(np.float32)
         out[grow] = background[grow]
-        return np.clip(out, 0, 255).astype(np.uint8)
+        return (np.clip(out, 0, 255).astype(np.uint8),
+                LightStatus("clean", "淡灰水印已重铺背景"))
 
     mask = detect_light_watermark(rgb, tint=tint, stats=stats)
     if not mask.any():
-        return np.array(rgb, dtype=np.uint8, copy=True)
+        return (np.array(rgb, dtype=np.uint8, copy=True),
+                LightStatus("unchanged", "未找到浅色水印"))
     ref = _choose_tint_ref(rgb, mask, tint)
     first = undo_light_watermark(rgb, tint=tint, ref=ref)
     first = _flatten_background(first, mask)
@@ -1515,8 +1653,9 @@ def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
         residual &= dark_frac <= 0.0
     if residual.any():
         residual = _grow_mask(residual, 1)
-        return _nearest4_fill(first, residual)
-    return first
+        return (_nearest4_fill(first, residual),
+                LightStatus("clean", f"{tint}色水印已反解"))
+    return first, LightStatus("clean", f"{tint}色水印已反解")
 
 
 def _grow_mask(mask: np.ndarray, radius: int) -> np.ndarray:
@@ -1530,50 +1669,72 @@ def _grow_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
+def _verify_light_watermark(arr):
+    """处理后校验（只针对照片）：在输出图上用同一套网格检测再检一遍，
+    确认水印真的没了。返回 None 表示通过，否则返回 partial。
+
+    文档不走这里：文档路径内部已经用同一套残影检测复检并补过，靠近
+    文字笔画的残留是按设计留下的（那是笔画抗锯齿，不是水印），这里
+    再报就是误报。平铺水印网格本身不认（格内上限 25%），校验也检不
+    出——那是检测的已知局限，不在这里硬报。
+    """
+    if not looks_like_photo(arr):
+        return None
+    dets = _grid_light_boxes(arr)
+    if not dets:
+        return None
+    top = max(det.score for det in dets)
+    return LightStatus(
+        "partial",
+        f"处理后仍有 {len(dets)} 个水印区残留（检出分数 {top:.2f}，"
+        "越接近 1 越可能是轻微残留）")
+
+
 def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
-                     method: str = "auto") -> Path:
+                     method: str = "auto"):
     """处理一张图（自动抠浅色水印），不覆盖原图。
 
-    boxes 给了就先反解淡色水印，再把这些框（比如记下来的徽标位置）整块补掉：
-    徽标上的白字是不透明的，反解救不回来，只能靠补。
+    返回 (目标路径, LightStatus)：先跑一键自动抠，再按用户框走统一重建
+    决策（reconstruct_light：先反解、解不净再补、不透明徽标整块补、
+    平铺水印明确拒绝）。boxes 给了就先反解淡色水印，再把这些框（比如
+    记下来的徽标位置）整块补掉：徽标上的白字是不透明的，反解救不回来，
+    只能靠补。
     """
     src = Path(src)
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im)
         arr = np.asarray(im.convert("RGB"))
-        fixed = clean_light_watermark(arr)
-        height, width = fixed.shape[:2]
+        fixed, auto = clean_light_watermark(arr)
+        box_notes = []
+        rejected = None
+        partial = None
+        cleaned = auto.status == "clean"
         for one in as_box_list(boxes) if boxes else []:
-            # 先反解、解不净再补：框里有浅色水印时整块补会把底纹也抹掉
-            # （草地/皮肤）；只有白字徽标这类不透明的、或反解后残留太多
-            # 的框，才按老路整块补掉。
-            _, mask0, _ = undo_light_in_box(arr, one)
-            # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘
-            # 当成“要保留的内容”接回去（实测不留余量时白字会残一半）
-            y0, y1, x0, x1 = box_pixels(one, width, height)
-            pad = max(6, int((y1 - y0) * 0.35))
-            grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
-                     min(width, x1 + pad) / width, min(height, y1 + pad) / height)
-            if mask0.sum() < max(200, (y1 - y0) * (x1 - x0) * 0.02):
-                # 原图框里几乎没有可反解的浅色水印：不透明徽标（白字只剩
-                # 抗锯齿轮廓也算），整块补
-                fixed = inpaint(fixed, grown, method)
-                continue
-            # 框内有浅色水印：先在当前图上反解一次，再看残留决定
-            fixed, _, residual = undo_light_in_box(fixed, one)
-            if not residual.any():
-                continue
-            if residual.sum() <= 0.30 * mask0.sum():
-                fixed = _nearest4_fill(fixed, _grow_mask(residual, 1))
-            else:
-                fixed = inpaint(fixed, grown, method)
+            # 探：先在原图上检测（框里有什么），再在当前图上重建；重建决策
+            # 集中在 reconstruct_light，这里只汇总每框的结论
+            det = detect_light_in_box(arr, one, source="box")
+            fixed, action, detail = reconstruct_light(
+                fixed, one, det=det, method=method, allow_inpaint=True)
+            if action == "rejected":
+                rejected = detail
+                box_notes.append(f"框已拒绝：{detail}")
+            elif action == "inpaint-residual":
+                partial = detail
+                box_notes.append(f"框：{detail}")
+            elif action == "inpaint-opaque":
+                cleaned = True
+                box_notes.append(f"框：{detail}")
+            elif action in ("unblend", "fill"):
+                cleaned = True
+                box_notes.append(f"框：{detail}")
+            # action "none"：框里没水印，不记
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
     # 没改动（照片护栏直接放过、或者这张图本来就没水印）就直接拷原文件：
     # 重存一遍既费时（12 MP 约 0.4 秒）又白白损一次 JPEG 质量。
     if not boxes and np.array_equal(fixed, arr):
         shutil.copyfile(src, target)
-        return target
+        return target, LightStatus("unchanged", "未找到浅色水印")
     image = Image.fromarray(fixed, "RGB")
     if target.suffix.lower() in (".jpg", ".jpeg"):
         image.save(target, quality=quality, subsampling=0)
@@ -1581,16 +1742,52 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
         image.save(target, quality=quality)
     else:
         image.save(target)
-    return target
+    if rejected is not None and not cleaned and partial is None:
+        # 唯一结果就是被拒：什么都没动，如实报 rejected
+        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+                 else []) + box_notes
+        detail = "；".join(notes) if notes else rejected
+        base = LightStatus("rejected", detail)
+    elif partial is not None:
+        # 反解没解干净，不得不整块补图——纹理被重建，报 partial
+        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+                 else []) + box_notes
+        detail = "；".join(notes) if notes else partial
+        base = LightStatus("partial", detail)
+    elif cleaned:
+        # 框被拒但水印已被自动抠清掉：结论仍是 clean，拒的框只记一句
+        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+                 else []) + box_notes
+        detail = "；".join(notes)
+        base = LightStatus("clean", detail or "水印已清")
+    else:
+        base = LightStatus("unchanged", "未找到浅色水印")
+    # 处理后校验：自称干净的，输出图上再检一遍；校验发现残留就改口
+    # partial，不悄悄说成功。已经是 partial/rejected 的只补一句。
+    verify = (_verify_light_watermark(fixed)
+              if base.status in ("clean", "partial") else None)
+    if verify is not None:
+        if base.status == "clean":
+            base = verify
+        else:
+            base = LightStatus(base.status,
+                               base.detail + "；" + verify.detail)
+    return target, base
 
 
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
                        method: str = "auto") -> dict:
-    """批量自动抠浅色水印；返回格式与 batch_remove 一致。"""
+    """批量自动抠浅色水印；返回格式与 batch_remove 一致，再加逐张状态。
+
+    results 是 [(原路径, 状态, 一句人话)]，供界面逐张报“干净 / 残留 /
+    未找到 / 拒绝”；clean/partial/unchanged/rejected 是各状态的张数。
+    """
     paths = list(paths)
     done = skipped = 0
     failed = []
+    results = []
+    counts = {"clean": 0, "partial": 0, "unchanged": 0, "rejected": 0}
     total = len(paths)
     for index, path in enumerate(paths, 1):
         if cancel is not None and cancel.is_set():
@@ -1601,21 +1798,25 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
             if target.exists():
                 skipped += 1
             else:
-                remove_light_file(path, target, quality, boxes=boxes,
-                                  method=method)
+                _, status = remove_light_file(path, target, quality,
+                                              boxes=boxes, method=method)
+                results.append((str(path), status.status, status.detail))
+                counts[status.status] += 1
                 done += 1
         except Exception as exc:
             failed.append((str(path), str(exc)))
         if on_progress is not None:
             on_progress(index, total, str(path))
     return {"done": done, "failed": failed, "skipped": skipped,
-            "total": total}
+            "total": total, "results": results, **counts}
 
 
 __all__ = [
     "LIGHT_REF",
     "METHOD_LABELS",
     "PRESETS",
+    "LightDetection",
+    "LightStatus",
     "as_box_list",
     "batch_remove",
     "batch_remove_light",
@@ -1629,6 +1830,7 @@ __all__ = [
     "normalize_box",
     "output_path",
     "pick_method",
+    "reconstruct_light",
     "remove_light_file",
     "remove_watermark_file",
     "target_dir",
