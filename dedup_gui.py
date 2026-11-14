@@ -908,6 +908,8 @@ class App(tk.Tk):
             self.watermark_page.on_done(*event[1])
         elif kind == "wm_model":
             self.watermark_page.on_model(*event[1])
+        elif kind == "wm_preview":
+            self.watermark_page.on_preview(*event[1])
         elif kind == "cleanup_restored":
             self.results_page.on_cleanup_restored(*event[1])
         elif kind == "thumb":
@@ -5573,6 +5575,50 @@ class WatermarkPage(ToolPage):
                                 font=t.font(8), anchor="w")
         self.hq_hint.pack(fill="x", pady=(s(4), 0))
 
+        # 只修水印笔画：框里只补检测出的笔画，其余像素保留原图；
+        # 检测不到（或像半透明底板）时自动退回整框，结果里标「已回退」
+        st_opt = tk.Frame(d, bg=t.CARD)
+        st_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(st_opt, text="只修水印笔画（实验，默认关）\r\n框里只补文字笔画，其余保留原图；检测不到自动整框",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_strokes = Switch(st_opt, t, bg=t.CARD,
+                                 value=bool(self.settings.get("wm_strokes",
+                                                              False)),
+                                 command=self._strokes_toggled)
+        self.sw_strokes.pack(side="right")
+        sens_row = tk.Frame(d, bg=t.CARD)
+        sens_row.pack(fill="x", pady=(s(4), 0))
+        tk.Label(sens_row, text="笔画灵敏度", bg=t.CARD, fg=t.MUTED,
+                 font=t.font(8), anchor="w").pack(side="left")
+        try:
+            sens_value = int(self.settings.get("wm_sens", 5))
+        except Exception:
+            sens_value = 5
+        self.sens_var = tk.IntVar(value=min(max(sens_value, 0), 10))
+        self.scale_sens = tk.Scale(
+            sens_row, from_=0, to=10, orient="horizontal",
+            variable=self.sens_var, showvalue=True, resolution=1,
+            bg=t.CARD, fg=t.MUTED, troughcolor=t.INPUT,
+            highlightthickness=0, bd=0, sliderrelief="flat",
+            font=t.font(8), length=s(170),
+            command=lambda _v: self._sens_changed())
+        self.scale_sens.pack(side="right")
+        tk.Label(d, text="字没抠干净就调高，误伤背景就调低（默认 5）",
+                 bg=t.CARD, fg=t.FAINT, font=t.font(8),
+                 anchor="w").pack(fill="x")
+
+        gps_opt = tk.Frame(d, bg=t.CARD)
+        gps_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(gps_opt, text="去除位置信息\r\n保存时删掉照片里的 GPS，其余 EXIF/色彩配置照常保留",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_gps = Switch(gps_opt, t, bg=t.CARD,
+                             value=bool(self.settings.get("wm_strip_gps",
+                                                          False)),
+                             command=self._gps_toggled)
+        self.sw_gps.pack(side="right")
+
         tools_row = tk.Frame(d, bg=t.CARD)
         tools_row.pack(fill="x", pady=(s(14), 0))
         CanvasButton(tools_row, t, "按数值添加", command=self._add_from_fields,
@@ -5581,6 +5627,12 @@ class WatermarkPage(ToolPage):
         CanvasButton(tools_row, t, "清空区域", command=self._clear_boxes,
                      kind="ghost", height=34, size=9, padding=14,
                      bg=t.CARD).pack(side="left", padx=(s(8), 0))
+        # 先拿第一张试：结果写到临时目录，不进照片文件夹，满意了再批量
+        self.btn_try = CanvasButton(tools_row, t, "先预览一张",
+                                    command=self.preview_one,
+                                    kind="secondary", height=34, size=9,
+                                    padding=14, bg=t.CARD)
+        self.btn_try.pack(side="left", padx=(s(8), 0))
 
         auto_card = tk.Frame(d, bg=t.CARD)
         auto_card.pack(fill="x", pady=(s(14), 0))
@@ -5867,6 +5919,102 @@ class WatermarkPage(ToolPage):
         self.settings["wm_pm"] = bool(self.sw_pm.value)
         save_settings(self.settings)
 
+    def _strokes_toggled(self, value):
+        self.settings["wm_strokes"] = bool(value)
+        save_settings(self.settings)
+
+    def _sens_changed(self):
+        self.settings["wm_sens"] = int(self.sens_var.get())
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _gps_toggled(self, value):
+        self.settings["wm_strip_gps"] = bool(value)
+        save_settings(self.settings)
+
+    def _stroke_options(self):
+        """当前「只修笔画 / 灵敏度 / 去位置信息」三个选项。"""
+        strokes = bool(getattr(self, "sw_strokes", None)
+                       and self.sw_strokes.value)
+        try:
+            sens = min(max(int(self.sens_var.get()), 0), 10) / 10.0
+        except Exception:
+            sens = 0.5
+        strip_gps = bool(getattr(self, "sw_gps", None) and self.sw_gps.value)
+        return strokes, sens, strip_gps
+
+    def _method(self):
+        if self.sw_hq.value:
+            return "lama"
+        if getattr(self, "sw_pm", None) and self.sw_pm.value:
+            return "patchmatch"
+        return "auto"
+
+    def preview_one(self):
+        """用当前框和选项只处理第一张，存到临时目录后弹前后对照。"""
+        if self.busy:
+            return
+        photos = self._photos_cache
+        if photos is None:
+            photos = self._photos()
+        if not photos:
+            self.app.toast("先选照片或文件夹", "warn")
+            return
+        first = Path(photos[0])
+        box = list(self.boxes) or [self._box()]
+        method = self._method()
+        strokes, sens, strip_gps = self._stroke_options()
+        self.busy = True
+        self.btn_try.set_text("预览中…")
+        self.btn_try.set_enabled(False)
+        self.btn_run.set_enabled(False)
+
+        def work():
+            import tempfile
+            import time as _time
+            report = []
+            try:
+                folder = Path(tempfile.mkdtemp(prefix="wm_preview_"))
+                target = folder / (first.stem + "_预览" + first.suffix)
+                started = _time.perf_counter()
+                wmark.remove_watermark_file(first, box, target, method,
+                                            strokes=strokes,
+                                            sensitivity=sens,
+                                            strip_gps=strip_gps,
+                                            report=report)
+                cost = _time.perf_counter() - started
+                self.app.post(("wm_preview",
+                               (str(first), str(target), report, cost, "")))
+            except Exception as exc:
+                self.app.post(("wm_preview",
+                               (str(first), "", report, 0.0, str(exc))))
+
+        threading.Thread(target=work, daemon=True,
+                         name="watermark-preview").start()
+
+    def on_preview(self, before, after, report, cost, error):
+        self.busy = False
+        self.btn_try.set_text("先预览一张")
+        self.btn_try.set_enabled(True)
+        self.btn_run.set_enabled(True)
+        if error or not after:
+            self.app.toast(f"预览失败：{error}", "err")
+            self.app.log(f"去水印预览失败：{error}", "warn")
+            return
+        fell = [r for r in report or [] if r.get("fallback")]
+        note = f"预览 · 用时 {cost:.1f} 秒"
+        if fell:
+            reason = fell[0].get("reason") or "未检测到笔画"
+            note += f" · {len(fell)} 个框已回退整框（{reason}）"
+            self.app.log(f"预览：{len(fell)} 个框已回退整框（{reason}）", "warn")
+        try:
+            LightPreviewDialog(self.app, self.theme, self.app.theme_name,
+                               before, after, note)
+        except Exception as exc:
+            self.app.log(f"前后对照打开失败：{exc}", "warn")
+
     def _pm_toggled(self, value):
         self.settings["wm_pm"] = bool(value)
         save_settings(self.settings)
@@ -5915,6 +6063,7 @@ class WatermarkPage(ToolPage):
         method = ("lama" if self.sw_hq.value
                   else "patchmatch" if getattr(self, "sw_pm", None)
                   and self.sw_pm.value else "auto")
+        strip_gps = self._stroke_options()[2]
         self.busy = True
         self._last_mode = "light"
         self._cancel = threading.Event()
@@ -5936,7 +6085,7 @@ class WatermarkPage(ToolPage):
                 result = wmark.batch_remove_light(
                     photos, out_dir=out_dir, cancel=cancel, on_progress=prog,
                     subdir=subdir, boxes=list(self.boxes) or None,
-                    method=method)
+                    method=method, strip_gps=strip_gps)
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -5966,12 +6115,8 @@ class WatermarkPage(ToolPage):
         self.settings["wm_pm"] = bool(getattr(self, "sw_pm", None)
                                       and self.sw_pm.value)
         save_settings(self.settings)
-        if self.sw_hq.value:
-            method = "lama"
-        elif getattr(self, "sw_pm", None) and self.sw_pm.value:
-            method = "patchmatch"
-        else:
-            method = "auto"
+        method = self._method()
+        strokes, sens, strip_gps = self._stroke_options()
 
         self.busy = True
         self._last_mode = "box"
@@ -5990,7 +6135,10 @@ class WatermarkPage(ToolPage):
             try:
                 result = wmark.batch_remove(photos, box, out_dir=out_dir,
                                             cancel=cancel, on_progress=prog,
-                                            method=method, subdir=subdir)
+                                            method=method, subdir=subdir,
+                                            strokes=strokes,
+                                            sensitivity=sens,
+                                            strip_gps=strip_gps)
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -6013,9 +6161,20 @@ class WatermarkPage(ToolPage):
         skipped = result.get("skipped", 0)
         failed = result.get("failed") or []
         self.app.set_status("引擎就绪", t.GREEN)
+        redone = result.get("redone", 0)
+        fallback = result.get("fallback") or []
         parts = [f"完成 {done} 张"]
+        if redone:
+            parts.append(f"其中 {redone} 张参数变了已重做")
         if skipped:
-            parts.append(f"跳过 {skipped} 张（已处理过）")
+            parts.append(f"跳过 {skipped} 张（参数相同，已处理过）")
+        if fallback:
+            # 只记日志、不弹窗：批量时不打断
+            parts.append(f"{len(fallback)} 张已回退整框")
+            names = "、".join(Path(p).name for p, _ in fallback[:5])
+            more = " 等" if len(fallback) > 5 else ""
+            self.app.log(f"只修笔画已回退整框 {len(fallback)} 张：{names}{more}"
+                         f"（{fallback[0][1]}）", "warn")
         if failed:
             parts.append(f"失败 {len(failed)} 张")
             self.app.log(f"去水印失败 {len(failed)} 张：{failed[0][0]}", "warn")

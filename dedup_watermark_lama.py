@@ -351,19 +351,12 @@ def inpaint_mask(rgb: np.ndarray, mask: np.ndarray, stride: int = 256,
     return np.rint(np.clip(out, 0, 255)).astype(np.uint8)
 
 
-def remove_watermark_file(src, box, dst=None, pad_ratio: float = 1.8):
-    """按文件处理一张照片，输出路径规则与 dedup_watermark 保持一致。"""
-    from PIL import Image, ImageOps
+def remove_watermark_file(src, box, dst=None, pad_ratio: float = 1.8,
+                          strip_gps: bool = False):
+    """按文件处理一张照片，输出路径和保存规则（ICC/透明度/EXIF）与 dedup_watermark 一致。"""
     import dedup_watermark as wm
     src = Path(src)
-    with Image.open(src) as im:
-        transposed = ImageOps.exif_transpose(im)
-        rgb = np.asarray(transposed.convert("RGB"))
+    rgb, alpha, meta = wm._read_source(src)
     fixed = inpaint(rgb, box, pad_ratio)
     target = Path(dst) if dst else wm.output_path(src)
-    image = Image.fromarray(fixed)
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=95, subsampling=0)
-    else:
-        image.save(target)
-    return target
+    return wm._save_result(fixed, target, 95, alpha, meta, strip_gps)

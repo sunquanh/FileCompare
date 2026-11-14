@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import shutil
 import warnings
 from pathlib import Path
@@ -615,43 +616,227 @@ def pick_method(box, width: int, height: int, method: str = "auto") -> str:
     return "mirror"
 
 
-def inpaint(rgb: np.ndarray, box, method: str = "auto") -> np.ndarray:
+# ---------------------------------------------------------------- 笔画掩膜
+# 只修水印笔画：框内大部分像素其实是原图，整框重画等于白白丢掉它们。
+# 这里在框内找出「比局部背景明显亮/暗的细笔画」，只补这些像素；找不到
+# 或者结果不可信时退回整框，并在 report 里标「已回退」。
+STROKE_MIN_RATIO = 0.01       # 笔画面积占框 < 1%：当成没检测到
+STROKE_MAX_RATIO = 0.70       # > 70%：多半把纹理当成了笔画
+PANEL_LIMIT = 10.0            # 框内非笔画区整体亮度偏移超过它：像半透明底板
+DARK_PRIOR = 3.0              # 暗笔画得分要高出亮笔画这么多倍才判成深色字
+
+
+def _shift_reduce(a: np.ndarray, radius: int, axis: int, fn) -> np.ndarray:
+    """一维最小/最大滤波（edge padding），用平移 + ufunc 拼出来，纯 numpy。"""
+    if radius <= 0:
+        return a
+    pad = [(0, 0)] * a.ndim
+    pad[axis] = (radius, radius)
+    ext = np.pad(a, pad, mode="edge")
+    n = a.shape[axis]
+    out = None
+    for k in range(2 * radius + 1):
+        index = [slice(None)] * a.ndim
+        index[axis] = slice(k, k + n)
+        view = ext[tuple(index)]
+        out = view.copy() if out is None else fn(out, view, out=out)
+    return out
+
+
+def _min_filter(a: np.ndarray, radius: int) -> np.ndarray:
+    return _shift_reduce(_shift_reduce(a, radius, 0, np.minimum),
+                         radius, 1, np.minimum)
+
+
+def _max_filter(a: np.ndarray, radius: int) -> np.ndarray:
+    return _shift_reduce(_shift_reduce(a, radius, 0, np.maximum),
+                         radius, 1, np.maximum)
+
+
+def stroke_mask(rgb: np.ndarray, box, sensitivity: float = 0.5,
+                grow: int = 2):
+    """在一个框里找水印笔画，返回 (mask, info)。
+
+    mask 是整图大小的 bool，只会在框内为 True；检测不可信时返回 None，
+    info["reason"] 写原因（界面/日志标「已回退」用）。
+    做法：亮度做形态学 top-hat（开运算去掉比结构元细的亮笔画，闭运算去掉
+    暗笔画），响应超过「框外一圈背景纹理的高分位」的就是笔画，去孤立噪点
+    后膨胀 grow 像素把抗锯齿边圈进来。sensitivity 0~1，越大阈值越低、
+    抠得越多（也越容易把纹理当笔画）。
+    """
+    height, width = rgb.shape[:2]
+    y0, y1, x0, x1 = box_pixels(box, width, height)
+    bh, bw = y1 - y0, x1 - x0
+    info = {"pixels": 0, "ratio": 0.0, "reason": ""}
+    if bh < 6 or bw < 6:
+        info["reason"] = "框太小"
+        return None, info
+    radius = int(np.clip(round(min(bh, bw) * 0.12), 2, 12))
+    margin = radius + max(grow, 0) + 2
+    gy0, gy1 = max(0, y0 - margin), min(height, y1 + margin)
+    gx0, gx1 = max(0, x0 - margin), min(width, x1 + margin)
+    sub = np.asarray(rgb[gy0:gy1, gx0:gx1], dtype=np.float32)
+    luma = sub @ _LUMA_WEIGHTS
+    inner = (slice(y0 - gy0, y1 - gy0), slice(x0 - gx0, x1 - gx0))
+    in_box = np.zeros(luma.shape, dtype=bool)
+    in_box[inner] = True
+    # 框内背景的平滑估计（只用框外一圈当边界）：用来判断笔画是亮是暗、
+    # 以及后面识别半透明底板
+    bg = sub.copy()
+    _diffuse(bg, ~in_box)
+    sens = float(np.clip(sensitivity, 0.0, 1.0))
+    k = 7.0 - 5.0 * sens
+    floor = 18.0 - 13.0 * sens
+
+    def threshold(resp_full):
+        # 阈值参考框外一圈（纯背景纹理）的响应分布：草地、头发这类纹理本身
+        # top-hat 也不小，拿框内统计会被笔画自己抬高阈值；框外圈太窄时退回框内
+        ring = resp_full[~in_box]
+        if ring.size >= 200:
+            med = float(np.median(ring))
+            mad = float(np.median(np.abs(ring - med))) * 1.4826
+            tail = float(np.percentile(ring, 99.8 - 3.8 * sens))
+            return max(floor, min(med + k * mad, tail))
+        resp = resp_full[inner]
+        med = float(np.median(resp))
+        mad = float(np.median(np.abs(resp - med))) * 1.4826
+        return max(floor, med + k * mad)
+
+    # 亮 top-hat（开运算去掉细亮笔画）对白字，暗 top-hat（闭运算）对深色字；
+    # 哪个方向在框内「超出框外背景水平」的像素多，水印就是哪个方向。
+    # 不能只看框内极值：头发丝、枝条这类细暗纹理在框内外都有，会骗过极值
+    # 还要乘上「比平滑背景亮/暗多少」：密集的中文白字里，字缝也会被闭运算
+    # 当成暗笔画，但字缝其实就是背景本身，偏差接近 0，靠这一项排除
+    dev = (luma - bg @ _LUMA_WEIGHTS)[inner]
+    best = None
+    for name, sign, resp_full in (
+            ("bright", 1.0,
+             luma - _max_filter(_min_filter(luma, radius), radius)),
+            ("dark", -1.0,
+             _min_filter(_max_filter(luma, radius), radius) - luma)):
+        thr = threshold(resp_full)
+        hits = resp_full[inner] > thr
+        score = float((np.maximum(sign * dev, 0.0) * hits).mean())
+        # 水印绝大多数是白/浅灰半透明字：暗方向要明显占优（3 倍）才认，
+        # 免得框里的头发丝、树枝把判断带偏
+        weight = 1.0 if name == "bright" else 1.0 / DARK_PRIOR
+        if best is None or score * weight > best[0]:
+            best = (score * weight, name, hits)
+    info["polarity"] = best[1]
+    local = np.zeros(luma.shape, dtype=bool)
+    local[inner] = best[2]
+    # 3×3 开运算去掉孤立噪点（笔画至少两三个像素宽，噪点只有一两个），
+    # 不然膨胀后满框都是小方块，平坦天空也会被当成「有笔画」
+    core = local.astype(np.float32)
+    local = _max_filter(_min_filter(core, 1), 1) > 0.5
+    if grow > 0:
+        local = _grow_mask(local, grow)
+    local &= in_box
+    count = int(local.sum())
+    ratio = count / float(bh * bw)
+    info["pixels"], info["ratio"] = count, round(ratio, 4)
+    if ratio < STROKE_MIN_RATIO:
+        info["reason"] = "未检测到水印笔画"
+        return None, info
+    if ratio > STROKE_MAX_RATIO:
+        info["reason"] = f"笔画占比过大（{ratio:.0%}）"
+        return None, info
+    # 半透明底板（徽标、字幕条）：笔画以外的框内像素整体被压暗/提亮，
+    # 只修笔画会留下一块色块，这种直接退回整框
+    rest = in_box & ~local
+    if rest.any():
+        offset = float(np.median((luma - bg @ _LUMA_WEIGHTS)[rest]))
+        info["offset"] = round(offset, 1)
+        if abs(offset) > PANEL_LIMIT:
+            info["reason"] = f"框内像有半透明底板（亮度偏移 {offset:+.0f}）"
+            return None, info
+    mask = np.zeros((height, width), dtype=bool)
+    mask[gy0:gy1, gx0:gx1] = local
+    return mask, info
+
+
+def _fill_box(arr: np.ndarray, y0: int, y1: int, x0: int, x1: int,
+              chosen: str) -> None:
+    """按指定档位整框补（就地改 arr，只写框内）。"""
+    height, width = arr.shape[:2]
+    if chosen == "smooth":
+        _smooth_fill(arr, y0, y1, x0, x1)
+        return
+    if chosen == "strip":
+        ok = _strip_fill(arr, y0, y1, x0, x1)
+    elif chosen == "strip_v":
+        ok = _strip_fill_v(arr, y0, y1, x0, x1)
+    elif chosen == "patchmatch":
+        ok = _patchmatch_fill(arr, y0, y1, x0, x1)
+    else:
+        ok = _reflect_fill(arr, y0, y1, x0, x1)
+    if not ok.all():
+        known = np.ones((height, width), dtype=bool)
+        known[y0:y1, x0:x1] = ok
+        _diffuse(arr, known)
+
+
+def _note(report, one, mode, method, info=None, fallback=False):
+    if report is None:
+        return
+    entry = {"box": tuple(one), "mode": mode, "method": method,
+             "fallback": bool(fallback)}
+    if info:
+        entry.update({k: v for k, v in info.items() if k != "reason"})
+        if info.get("reason"):
+            entry["reason"] = info["reason"]
+    report.append(entry)
+
+
+def inpaint(rgb: np.ndarray, box, method: str = "auto", strokes: bool = False,
+            sensitivity: float = 0.5, report=None) -> np.ndarray:
     """把框覆盖的区域补掉，返回新的 uint8 RGB 数组。
 
     box 可以是一个 (x0, y0, x1, y1) 比例框，也可以是多个框的列表。
-    框内内容完全丢弃；框外像素一个都不动。
+    默认框内内容完全丢弃；strokes=True 时只补框里检测出的水印笔画，检测
+    不可信就退回整框（report 里 fallback=True、reason 写原因）。
+    无论哪种，框外像素一个都不动。
     method 取 auto / strip / strip_v / mirror / patchmatch / smooth / lama。
+    strokes=False（默认）时结果与旧版整框处理逐像素一致；strokes 为实验选项。
+    report 传一个 list 进来，会按框追加处理记录。
     """
+    boxes = as_box_list(box)
     if method == "lama":
         # 模型级修复单独一层：装不了/没模型时直接报错，让界面提示用户
         import dedup_watermark_lama as lama
-        return lama.inpaint(rgb, as_box_list(box))
+        if not strokes:
+            for one in boxes:
+                _note(report, one, "box", "lama")
+            return lama.inpaint(rgb, boxes)
+        out = np.array(rgb, dtype=np.uint8, copy=True)
+        for one in boxes:
+            mask, info = stroke_mask(out, one, sensitivity)
+            if mask is None:
+                out = lama.inpaint(out, [one])
+                _note(report, one, "box", "lama", info, fallback=True)
+            else:
+                out = lama.inpaint_mask(out, mask)
+                _note(report, one, "strokes", "lama", info)
+        return out
     out = np.array(rgb, dtype=np.uint8, copy=True)
     height, width = out.shape[:2]
     arr = out.astype(np.float32)
-    for one in as_box_list(box):
+    for one in boxes:
         y0, y1, x0, x1 = box_pixels(one, width, height)
-        chosen = pick_method(one, width, height, method)
-        if chosen == "smooth":
-            _smooth_fill(arr, y0, y1, x0, x1)
-        elif chosen in ("strip", "strip_v", "patchmatch"):
-            if chosen == "strip":
-                ok = _strip_fill(arr, y0, y1, x0, x1)
-            elif chosen == "strip_v":
-                ok = _strip_fill_v(arr, y0, y1, x0, x1)
-            else:
-                ok = _patchmatch_fill(arr, y0, y1, x0, x1)
-            if not ok.all():
-                known = np.ones((height, width), dtype=bool)
-                known[y0:y1, x0:x1] = ok
-                _diffuse(arr, known)
+        if strokes:
+            mask, info = stroke_mask(out, one, sensitivity)
+            if mask is not None:
+                _diffuse(arr, ~mask)
+                out[mask] = np.clip(np.rint(arr[mask]), 0, 255).astype(np.uint8)
+                _note(report, one, "strokes", "diffuse", info)
+                continue
         else:
-            ok = _reflect_fill(arr, y0, y1, x0, x1)
-            if not ok.all():
-                known = np.ones((height, width), dtype=bool)
-                known[y0:y1, x0:x1] = ok
-                _diffuse(arr, known)
+            info = None
+        # 整框：与 9fe0019 完全相同（auto 按框的形状/位置快速分派）
+        chosen = pick_method(one, width, height, method)
+        _fill_box(arr, y0, y1, x0, x1, chosen)
         out[y0:y1, x0:x1] = np.clip(arr[y0:y1, x0:x1], 0, 255).astype(np.uint8)
+        _note(report, one, "box", chosen, info, fallback=bool(strokes))
     return out
 
 
@@ -671,24 +856,87 @@ def output_path(src, out_dir=None, suffix: str = "_去水印",
     return candidate
 
 
+def _read_source(src):
+    """读图：返回 (rgb, alpha, meta)。
+
+    rgb 已按 EXIF 方向转正；alpha 是转正后的透明通道（没有就 None）；
+    meta 里带原图的 EXIF 和 ICC，保存时原样写回（方向标记归 1）。
+    """
+    with Image.open(src) as im:
+        try:
+            exif = im.getexif()
+        except Exception:
+            exif = None
+        icc = im.info.get("icc_profile")
+        im = ImageOps.exif_transpose(im)
+        has_alpha = (im.mode in ("RGBA", "LA", "PA")
+                     or (im.mode in ("P", "RGB", "L")
+                         and "transparency" in im.info))
+        if has_alpha:
+            rgba = im.convert("RGBA")
+            alpha = np.array(rgba.getchannel("A"))
+            rgb = np.array(rgba.convert("RGB"))
+        else:
+            alpha = None
+            rgb = np.array(im.convert("RGB"))
+    return rgb, alpha, {"exif": exif, "icc": icc}
+
+
+def _has_gps(meta) -> bool:
+    exif = (meta or {}).get("exif")
+    return bool(exif is not None and 0x8825 in exif)
+
+
+def _save_result(rgb: np.ndarray, target, quality: int = 95, alpha=None,
+                 meta=None, strip_gps: bool = False) -> Path:
+    """按扩展名保存，保留 ICC、透明度和 EXIF（方向归 1，可选去掉 GPS）。
+
+    JPEG 没有透明度，alpha 只写进 PNG/WebP/TIFF；元数据写不进去的格式
+    自动退回不带元数据保存，不让一张图因为元数据失败。
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8), "RGB")
+    suffix = target.suffix.lower()
+    if alpha is not None and suffix in (".png", ".webp", ".tif", ".tiff"):
+        image.putalpha(Image.fromarray(np.asarray(alpha, dtype=np.uint8), "L"))
+    base = {}
+    if suffix in (".jpg", ".jpeg"):
+        base = {"quality": quality, "subsampling": 0}
+    elif suffix == ".webp":
+        base = {"quality": quality}
+    extra = {}
+    meta = meta or {}
+    if meta.get("icc"):
+        extra["icc_profile"] = meta["icc"]
+    exif = meta.get("exif")
+    if exif is not None and len(exif):
+        if 0x0112 in exif:
+            exif[0x0112] = 1          # 像素已经转正，方向标记不能再转一次
+        if strip_gps and 0x8825 in exif:
+            del exif[0x8825]
+        if len(exif):
+            extra["exif"] = exif.tobytes()
+    try:
+        image.save(target, **base, **extra)
+    except Exception:
+        if not extra:
+            raise
+        image.save(target, **base)
+    return target
+
+
 def remove_watermark_file(src, box, dst=None, method: str = "auto",
-                          quality: int = 95) -> Path:
+                          quality: int = 95, strokes: bool = False,
+                          sensitivity: float = 0.5, strip_gps: bool = False,
+                          report=None) -> Path:
     """处理一张图，写到 dst（默认同目录加后缀，绝不覆盖原图）。"""
     src = Path(src)
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        arr = np.asarray(im.convert("RGB"))
-        fixed = inpaint(arr, box, method)
+    rgb, alpha, meta = _read_source(src)
+    fixed = inpaint(rgb, box, method, strokes=strokes,
+                    sensitivity=sensitivity, report=report)
     target = Path(dst) if dst else output_path(src)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.fromarray(fixed, "RGB")
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=quality, subsampling=0)
-    elif target.suffix.lower() == ".webp":
-        image.save(target, quality=quality)
-    else:
-        image.save(target)
-    return target
+    return _save_result(fixed, target, quality, alpha, meta, strip_gps)
 
 
 def iter_photos(folder):
@@ -712,34 +960,115 @@ def target_dir(path, out_dir=None, subdir: bool = False) -> Path:
     return parent / "_去水印" if subdir else parent
 
 
+PARAMS_FILE = ".去水印参数.json"
+
+
+def params_signature(**params) -> str:
+    """把一次处理用的参数（框、档位、开关）压成稳定字符串，用来判断要不要重做。"""
+    def norm(value):
+        if isinstance(value, float):
+            return round(value, 4)
+        if isinstance(value, (list, tuple)):
+            return [norm(v) for v in value]
+        return value
+    return json.dumps({k: norm(v) for k, v in sorted(params.items())},
+                      ensure_ascii=False, sort_keys=True)
+
+
+def _load_params(folder: Path) -> dict:
+    try:
+        data = json.loads((Path(folder) / PARAMS_FILE).read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _remember_params(folder: Path, name: str, signature: str) -> None:
+    """记下这张输出是用什么参数做的（存在输出目录的一个小 json 里）。"""
+    folder = Path(folder)
+    data = _load_params(folder)
+    data[name] = signature
+    try:
+        (folder / PARAMS_FILE).write_text(
+            json.dumps(data, ensure_ascii=False, indent=0), "utf-8")
+    except Exception:
+        pass
+
+
+def _should_skip(target: Path, signature: str, record: bool = True) -> bool:
+    """输出已存在时决定跳不跳过。
+
+    record=False（没设输出目录也没开分目录，输出就在照片原目录）：不读写参数
+    记录，按旧规则「输出存在就跳过」。record=True：记录里没有这张（比如
+    9fe0019 的旧产出）也按旧规则跳过、不覆盖——要重做请手动删；有记录时
+    参数相同才跳过，不同就重做（覆盖上次的输出）。
+    """
+    if not target.exists():
+        return False
+    if not record:
+        return True
+    params = _load_params(target.parent)
+    if target.name not in params:
+        return True
+    return params[target.name] == signature
+
+
+def _fallback_reason(report) -> str:
+    reasons = [r.get("reason", "") for r in report or [] if r.get("fallback")]
+    return "；".join(dict.fromkeys(x for x in reasons if x)) if reasons else ""
+
+
 def batch_remove(paths, box, out_dir=None, method: str = "auto",
                  quality: int = 95, cancel=None, on_progress=None,
-                 subdir: bool = False) -> dict:
-    """批量处理；返回 {"done", "failed", "skipped", "total"}。
+                 subdir: bool = False, strokes: bool = False,
+                 sensitivity: float = 0.5, strip_gps: bool = False) -> dict:
+    """批量处理；返回 {"done", "failed", "skipped", "total", "redone", "fallback"}。
 
-    同名输出已存在就跳过——重复点一次不会生成一堆 `_去水印(2)(3)`。
+    同名输出已存在且参数（框、档位、开关）没变才跳过——重复点一次不会生成
+    一堆 `_去水印(2)(3)`；换了框或档位会重做并覆盖上次的输出（redone 计数）。
+    参数记录只在设了 out_dir 或开了 subdir 时读写；输出在照片原目录时、
+    以及没有记录的旧产出，都按旧规则「输出存在就跳过」。
+    fallback 列出「只修笔画」没检测到笔画、退回整框的照片及原因。
     """
     paths = list(paths)
-    done = skipped = 0
-    failed = []
+    done = skipped = redone = 0
+    failed, fallback = [], []
     total = len(paths)
+    # 参数记录只放在输出侧：输出就是照片原目录时不写 json，也不按它判断
+    record = bool(out_dir or subdir)
+    signature = params_signature(mode="box", box=as_box_list(box),
+                                 method=method, quality=quality,
+                                 strokes=bool(strokes),
+                                 sensitivity=float(sensitivity),
+                                 strip_gps=bool(strip_gps))
     for index, path in enumerate(paths, 1):
         if cancel is not None and cancel.is_set():
             break
         try:
             target = output_path(path, target_dir(path, out_dir, subdir),
                                  unique=False)
-            if target.exists():
+            if _should_skip(target, signature, record):
                 skipped += 1
             else:
-                remove_watermark_file(path, box, target, method, quality)
+                existed = target.exists()
+                report = []
+                remove_watermark_file(path, box, target, method, quality,
+                                      strokes=strokes,
+                                      sensitivity=sensitivity,
+                                      strip_gps=strip_gps, report=report)
+                if record:
+                    _remember_params(target.parent, target.name, signature)
                 done += 1
+                redone += int(existed)
+                reason = _fallback_reason(report)
+                if reason:
+                    fallback.append((str(path), reason))
         except Exception as exc:  # 单张失败不影响整批
             failed.append((str(path), str(exc)))
         if on_progress is not None:
             on_progress(index, total, str(path))
     return {"done": done, "failed": failed, "skipped": skipped,
-            "total": total}
+            "total": total, "redone": redone, "fallback": fallback}
 
 
 # ---------------------------------------------------------------- 浅色水印
@@ -1236,69 +1565,78 @@ def _grow_mask(mask: np.ndarray, radius: int) -> np.ndarray:
 
 
 def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
-                     method: str = "auto") -> Path:
+                     method: str = "auto", strip_gps: bool = False,
+                     report=None) -> Path:
     """处理一张图（自动抠浅色水印），不覆盖原图。
 
     boxes 给了就先反解淡色水印，再把这些框（比如记下来的徽标位置）整块补掉：
-    徽标上的白字是不透明的，反解救不回来，只能靠补。
+    徽标上的白字是不透明的，反解救不回来，只能靠补。这里刻意不走「只修
+    笔画」：徽标多是半透明底板 + 白字，白底文档上只修笔画会留下底板。
     """
     src = Path(src)
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        arr = np.asarray(im.convert("RGB"))
-        fixed = clean_light_watermark(arr)
-        height, width = fixed.shape[:2]
-        for one in as_box_list(boxes) if boxes else []:
-            # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘
-            # 当成“要保留的内容”接回去（实测不留余量时白字会残一半）
-            y0, y1, x0, x1 = box_pixels(one, width, height)
-            pad = max(6, int((y1 - y0) * 0.35))
-            grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
-                     min(width, x1 + pad) / width, min(height, y1 + pad) / height)
-            fixed = inpaint(fixed, grown, method)
+    arr, alpha, meta = _read_source(src)
+    fixed = clean_light_watermark(arr)
+    height, width = fixed.shape[:2]
+    for one in as_box_list(boxes) if boxes else []:
+        # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘
+        # 当成“要保留的内容”接回去（实测不留余量时白字会残一半）
+        y0, y1, x0, x1 = box_pixels(one, width, height)
+        pad = max(6, int((y1 - y0) * 0.35))
+        grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
+                 min(width, x1 + pad) / width, min(height, y1 + pad) / height)
+        fixed = inpaint(fixed, grown, method, report=report)
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
     # 没改动（照片护栏直接放过、或者这张图本来就没水印）就直接拷原文件：
     # 重存一遍既费时（12 MP 约 0.4 秒）又白白损一次 JPEG 质量。
-    if not boxes and np.array_equal(fixed, arr):
+    # 要去位置信息且原图带 GPS 时例外，只能重存。
+    if (not boxes and np.array_equal(fixed, arr)
+            and not (strip_gps and _has_gps(meta))):
         shutil.copyfile(src, target)
         return target
-    image = Image.fromarray(fixed, "RGB")
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=quality, subsampling=0)
-    elif target.suffix.lower() == ".webp":
-        image.save(target, quality=quality)
-    else:
-        image.save(target)
-    return target
+    return _save_result(fixed, target, quality, alpha, meta, strip_gps)
 
 
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
-                       method: str = "auto") -> dict:
+                       method: str = "auto",
+                       strip_gps: bool = False) -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致。"""
     paths = list(paths)
-    done = skipped = 0
-    failed = []
+    done = skipped = redone = 0
+    failed, fallback = [], []
     total = len(paths)
+    record = bool(out_dir or subdir)
+    signature = params_signature(mode="light", box=as_box_list(boxes),
+                                 method=method, quality=quality,
+                                 strip_gps=bool(strip_gps))
     for index, path in enumerate(paths, 1):
         if cancel is not None and cancel.is_set():
             break
         try:
             target = output_path(path, target_dir(path, out_dir, subdir),
                                  unique=False)
-            if target.exists():
+            if _should_skip(target, signature, record):
                 skipped += 1
             else:
+                existed = target.exists()
+                report = []
                 remove_light_file(path, target, quality, boxes=boxes,
-                                  method=method)
+                                  method=method, strip_gps=strip_gps,
+                                  report=report)
+                if record:
+                    _remember_params(target.parent, target.name, signature)
                 done += 1
+                redone += int(existed)
+                reason = _fallback_reason(report)
+                if reason:
+                    fallback.append((str(path), reason))
         except Exception as exc:
             failed.append((str(path), str(exc)))
         if on_progress is not None:
             on_progress(index, total, str(path))
     return {"done": done, "failed": failed, "skipped": skipped,
-            "total": total}
+            "total": total, "redone": redone, "fallback": fallback}
 
 
 __all__ = [
@@ -1316,9 +1654,11 @@ __all__ = [
     "iter_photos",
     "normalize_box",
     "output_path",
+    "params_signature",
     "pick_method",
     "remove_light_file",
     "remove_watermark_file",
+    "stroke_mask",
     "target_dir",
     "undo_light_watermark",
 ]
