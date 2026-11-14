@@ -123,11 +123,12 @@ def augment(a: np.ndarray, r) -> np.ndarray:
 
 def build_bases(rng):
     bases = [base_scene(s) for s in range(1000, 1400)]
-    # 仓库自带的两张样例照片：补一点自然纹理，避免只见过合成矩形
-    for name in ("1051254115536994305_o.png", "1051288154197196800_o.png"):
-        path = ROOT / name
-        if not path.is_file():
-            continue
+    # 仓库根目录里现成的照片：补一点自然纹理，避免只见过合成矩形。
+    # 不写死文件名（样例照片不入库），有多少用多少，最多取 8 张。
+    samples = sorted(p for p in ROOT.glob("*")
+                     if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
+    for path in samples[:8]:
+        name = path.name
         try:
             with Image.open(path) as im:
                 rgb = im.convert("RGB")
