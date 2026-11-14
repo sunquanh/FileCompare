@@ -5590,9 +5590,10 @@ class WatermarkPage(ToolPage):
         self.btn_light.pack(fill="x")
         tk.Label(d, bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w",
                  justify="left", wraplength=s(330),
-                 text="自动找白底上的浅黄/浅色水印并反解掉，适合表格、文档截图；"
-                      "拖过的框会记住，点这里自动套用（“AI生成”这类白字徽标框"
-                      "一次就够）。照片不做反解，走上面的框选 + 高质量。"
+                 text="自动找浅黄/浅色水印并反解掉：白底文档整张找，照片只在框里"
+                      "或找到的水印区反解，底下纹理不动；拖过的框会记住，点这里"
+                      "自动套用（“AI生成”这类白字徽标框一次就够）。解不净或不透明"
+                      "的徽标，仍走上面的框选 + 高质量。"
                  ).pack(fill="x", pady=(s(6), 0))
         self.box_hint = tk.Label(d, text="区域：0 个（在右边预览上直接拖框）",
                                  bg=t.CARD, fg=t.MUTED, font=t.font(8),

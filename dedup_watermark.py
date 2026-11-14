@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """照片去水印：把用户框出的区域用四周内容补上（本地、不联网、不覆盖原图）。
 
+浅色半透明水印另有一条“反解”路：框内按局部背景估透明度反解，底纹不动；
+白底文档也可整张自动找，照片则只在找到的水印区里动手。
+已知难例：蓝水印压蓝天、绿水印压绿草地（色调与背景太近，色度信号弱）；
+整块平铺水印（占比超 70% 拒认，本路不覆盖）；任意偏离标准参考色太远
+的色调（投票靠方向投影仍能认，但 α 估计会偏）。
+
 设计取舍：
   * 不引入新依赖 —— 只用 numpy + Pillow，和项目其余部分保持一致；
   * 恢复方式用「按最近的边反射回填」：每个待补像素取它最近那条框边的
@@ -1162,16 +1168,305 @@ def _flatten_background(fixed: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out.astype(np.uint8)
 
 
+# ---------------------------------------------------------------- 框内反解（照片水印）
+# 半透明浅色水印压在照片上时，全图反解有两个死结：一是背景不再是白纸，
+# 全局门限（亮度>140、色度<45）抓不到压在深色草地/肤色上的黄字；二是照片
+# 护栏为保皮肤、汗光、天空直接放过整张图。所以改成“框内”做：框由用户拖、
+# 或由下面的网格检测给出；框内用框外一圈的中位色当地背景，逐像素按“偏离
+# 背景朝水印色方向的投影”估 α 再反解，框外一个像素不动。
+#
+# 投影分两路：全投影 (I-B)·(W-B)/|W-B|，像素 I=(1-α)B+αW 时正好等于
+# α·|W-B|（反解用）；色度投影是去掉亮度分量后再算，用来认——亮度渐变
+# （比如天空由亮到暗）会让全投影误报，色度投影对它免疫；反过来，全投影
+# 的符号还能挡掉“变暗的树叶”这类反向偏离。
+
+# 框内反解的候选色系：标准四色 + 深黄。品牌黄水印比表里的浅黄深得多
+# （如 (255,226,130)），只用标准色投票时暖墙上的深黄只能检出几十像素、
+# 直接被数量门拒掉；多一个候选，投票自己会选更贴近的那支。
+BOX_TINT_REFS = {
+    "黄": (252, 248, 196),
+    "深黄": (255, 226, 130),
+    "蓝": (196, 236, 252),
+    "粉": (252, 214, 238),
+    "绿": (214, 250, 214),
+}
+
+
+def _box_ring_mask(shape, y0, y1, x0, x1, pad):
+    """框外一圈的布尔掩膜（供估计局部背景用）。"""
+    height, width = shape
+    ring = np.zeros((height, width), dtype=bool)
+    ry0 = max(0, y0 - pad)
+    ry1 = min(height, y1 + pad)
+    rx0 = max(0, x0 - pad)
+    rx1 = min(width, x1 + pad)
+    ring[ry0:ry1, rx0:rx1] = True
+    ring[y0:y1, x0:x1] = False
+    return ring
+
+
+def _local_background(arr, ring):
+    """环内像素逐通道中位数（抗离群：环里混进一点文字/树叶不影响中位）。"""
+    if not ring.any():
+        return None
+    vals = arr[ring]
+    if vals.shape[0] < 20:
+        return None
+    return np.median(vals, axis=0).astype(np.float32)
+
+
+def _blur3(arr):
+    """3×3 均值模糊（edge padding）：算投影前先压一遍纹理噪声。
+
+    水印笔画是低频大结构，模糊不伤它；草叶、噪点是高频，模糊后投影的
+    噪声能降到三分之一，阈值才立得住。
+    """
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    pad = np.pad(arr, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    out = (pad[:-2, :-2] + pad[:-2, 1:-1] + pad[:-2, 2:]
+           + pad[1:-1, :-2] + pad[1:-1, 1:-1] + pad[1:-1, 2:]
+           + pad[2:, :-2] + pad[2:, 1:-1] + pad[2:, 2:]) / 9.0
+    return out
+
+
+def _blur_f(arr2d, radius):
+    """2D 浮点数组的大半径均值模糊（积分图实现，边缘按有效窗口平均）。
+
+    用来给投影去趋势：亮度渐变是低频，模糊后就是它自己，相减归零；
+    水印笔画是紧凑的高频结构，模糊后只剩一小部分，相减后还留大半。
+    （PIL 的 BoxBlur 不支持 F 模式，所以这里手写积分图。）
+    内存：float64 积分图，12MP 图上单格约 50MB，4 色循环峰值约 100MB
+    临时内存；框很大时留意。
+    """
+    if radius <= 0:
+        return np.asarray(arr2d, dtype=np.float32)
+    a = np.asarray(arr2d, dtype=np.float64)
+    h, w = a.shape
+    ii = np.zeros((h + 1, w + 1), dtype=np.float64)
+    ii[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+    ys = np.arange(h)
+    xs = np.arange(w)
+    y0 = np.clip(ys - radius, 0, h - 1)
+    y1 = np.clip(ys + radius, 0, h - 1)
+    x0 = np.clip(xs - radius, 0, w - 1)
+    x1 = np.clip(xs + radius, 0, w - 1)
+    s = (ii[y1 + 1][:, x1 + 1] - ii[y0][:, x1 + 1]
+         - ii[y1 + 1][:, x0] + ii[y0][:, x0])
+    cnt = (y1 - y0 + 1)[:, None] * (x1 - x0 + 1)[None, :]
+    return (s / cnt).astype(np.float32)
+
+
+def _projections(arr, bg, ref):
+    """逐像素算两路投影，返回 (全投影, 色度投影)。
+
+    全投影 = (I-B)·(W-B)/|W-B|；色度投影是去掉亮度分量后再算，亮度渐变
+    投出来是 0。
+    """
+    w = np.asarray(ref, dtype=np.float32) - bg
+    norm = float(np.sqrt(np.dot(w, w)))
+    if norm < 1.0:
+        shape = arr.shape[:2]
+        return (np.zeros(shape, dtype=np.float32),
+                np.zeros(shape, dtype=np.float32))
+    dev = arr - bg
+    full = (dev * w).sum(axis=2) / norm
+    wc = w - w.mean()
+    norm_c = float(np.sqrt(np.dot(wc, wc)))
+    if norm_c < 1.0:
+        return full, np.zeros(arr.shape[:2], dtype=np.float32)
+    dev_c = dev - dev.mean(axis=2, keepdims=True)
+    chroma = (dev_c * wc).sum(axis=2) / norm_c
+    return full, chroma
+
+
+def detect_light_in_box(rgb, box, tint=None):
+    """框内局部检测浅色水印。
+
+    返回 (tint, mask)：mask 是全图尺寸布尔阵，只有框内可能为真。
+    背景取框外一圈中位色，色调在框内投票，阈值按框内投影分布自定——
+    压在深色草地/肤色上的黄字也能被认出来，全图投“蓝”的蓝天照片不再
+    把黄水印带跑。认不出（或占比太小/太大）时返回 ("", 全假)。
+    """
+    height, width = rgb.shape[:2]
+    y0, y1, x0, x1 = box_pixels(box, width, height)
+    empty = np.zeros((height, width), dtype=bool)
+    if y1 - y0 < 8 or x1 - x0 < 8:
+        return "", empty
+    pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
+    ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
+    arr = rgb.astype(np.float32)
+    bg = _local_background(arr, ring)
+    if bg is None:
+        # 框贴边、圈外没像素：退回框的最外一圈当背景
+        edge = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        edge[0, :] = edge[-1, :] = True
+        edge[:, 0] = edge[:, -1] = True
+        bg = np.median(arr[y0:y1, x0:x1][edge], axis=0).astype(np.float32)
+    crop = _blur3(arr[y0:y1, x0:x1])
+    radius = max(8, min(crop.shape[:2]) // 8)
+    names = (tint,) if tint else tuple(BOX_TINT_REFS)
+    best_name, best_mask, best_count = "", empty, 0
+    for name in names:
+        ref = BOX_TINT_REFS[name]
+        full, chroma = _projections(crop, bg, ref)
+        # 判据 = 去趋势后的全投影：亮度渐变（天空、墙面）被模糊吃掉，
+        # 只剩紧凑的水印笔画；再加色度投影 >0 的符号门，挡掉亮绿草叶
+        # 这类“只亮不带黄色调”的偏离（暖墙上的黄水印色度信号本来就弱，
+        # 只看色度强度会漏，所以色度只作符号门，不作阈值）。
+        score = full - _blur_f(full, radius)
+        limit = _robust_threshold(score, floor=5.0, cap=12.0)
+        # α 门：只有半透明（α≤0.75）才配反解。白字徽标这类不透明的
+        # （α≈1）投影也很大，但底下什么都没剩、反解不出东西，只能整块补；
+        # 逐像素筛，混在一个框里的白字和水印能各走各的路。α 用没模糊过的
+        # 原图算：模糊会把笔画边的 α 稀释到 0.5 左右，白字轮廓就漏网了。
+        local = (score > limit) & (chroma > 0.0)
+        if local.any():
+            raw, _ = _projections(arr[y0:y1, x0:x1], bg, ref)
+            norm = float(np.sqrt(np.dot(
+                np.asarray(ref, dtype=np.float32) - bg,
+                np.asarray(ref, dtype=np.float32) - bg)))
+            local &= (raw / max(norm, 1.0) <= 0.75)
+        count = int(local.sum())
+        if count > best_count:
+            full_mask = np.zeros((height, width), dtype=bool)
+            full_mask[y0:y1, x0:x1] = local
+            best_name, best_mask, best_count = name, full_mask, count
+    # 占比太小不算水印（框内至少千分之一且 ≥100 像素）；占比超过七成
+    # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认。
+    total = (y1 - y0) * (x1 - x0)
+    if best_count < max(100, total // 1000) or best_count > total * 0.7:
+        return "", empty
+    return best_name, best_mask
+
+
+def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
+    """框内反解浅色水印。
+
+    返回 (fixed, mask, residual)：fixed 是全图 uint8（只有框内动过），
+    mask 是框内检出的水印像素，residual 是反解后框内仍检出的水印像素
+    （用来决定要不要再补）。框太小、框占图超过七成、或框内认不出水印
+    时原样返回，不动任何像素。
+    """
+    height, width = rgb.shape[:2]
+    y0, y1, x0, x1 = box_pixels(box, width, height)
+    empty = np.zeros((height, width), dtype=bool)
+    unchanged = np.array(rgb, dtype=np.uint8, copy=True)
+    if y1 - y0 < 8 or x1 - x0 < 8:
+        return unchanged, empty, empty
+    if (y1 - y0) * (x1 - x0) > height * width * 0.7:
+        return unchanged, empty, empty
+    name, mask = detect_light_in_box(rgb, box, tint=tint)
+    if not name or not mask.any():
+        return unchanged, empty, empty
+    arr = rgb.astype(np.float32)
+    crop = arr[y0:y1, x0:x1]
+    sub = mask[y0:y1, x0:x1]
+    if ref is None:
+        # 框内直接用投票赢的候选参考色。_choose_tint_ref 是给白底文档做的
+        # （按“纸面亮度”自估），用在照片框上会把参考色估跑偏、反解过头。
+        ref = BOX_TINT_REFS.get(name, LIGHT_REF)
+    pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
+    ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
+    bg = _local_background(arr, ring)
+    if bg is None:
+        return unchanged, empty, empty
+    w = np.asarray(ref, dtype=np.float32) - bg
+    norm = float(np.sqrt(np.dot(w, w)))
+    if norm < 1.0:
+        return unchanged, empty, empty
+    smooth = _blur3(crop)
+    full, _ = _projections(smooth, bg, ref)
+    alpha = np.clip(full / norm, 0.0, 0.6) * float(strength)
+    alpha[~sub] = 0.0
+    denom = np.clip(1.0 - alpha, 0.05, 1.0)
+    fixed_crop = crop.copy()
+    for ch in range(3):
+        fixed_crop[..., ch] = (crop[..., ch] - alpha * float(ref[ch])) / denom
+    out = arr.copy()
+    out[y0:y1, x0:x1] = np.clip(fixed_crop, 0, 255)
+    fixed = np.rint(np.clip(out, 0, 255)).astype(np.uint8)
+    # 反解后框内再检一次：还有多少没解掉
+    _, residual = detect_light_in_box(fixed, box, tint=name)
+    return fixed, mask, residual
+
+
+def _box_iou(a, b):
+    """两个归一化框的 IoU。"""
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    return inter / max(area_a + area_b - inter, 1e-9)
+
+
+def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
+    """一键抠在照片上的分区检测：把图切成重叠网格，逐格局部投票。
+
+    水印通常只占一角或一条边，整图投票会被主导色（蓝天、黄沙）带跑；
+    格子化后每格只看自己的一小片背景。返回归一化框列表（重叠的已合并）。
+    """
+    height, width = rgb.shape[:2]
+    cell_h = 1.0 / rows
+    cell_w = 1.0 / cols
+    found = []
+    for r in range(rows):
+        for c in range(cols):
+            y0 = max(0.0, r * cell_h - cell_h * overlap)
+            y1 = min(1.0, (r + 1) * cell_h + cell_h * overlap)
+            x0 = max(0.0, c * cell_w - cell_w * overlap)
+            x1 = min(1.0, (c + 1) * cell_w + cell_w * overlap)
+            box = (x0, y0, x1, y1)
+            _, mask = detect_light_in_box(rgb, box)
+            count = int(mask.sum())
+            py0, py1, px0, px1 = box_pixels(box, width, height)
+            total = (py1 - py0) * (px1 - px0)
+            # 证据要够强：格内至少 200 像素且占比不超过 25%（太少是噪声，
+            # 太多是整块底色）；太少时 detect 里已经返回空了，这里只补上限
+            if count >= 200 and count <= total * 0.25:
+                found.append(box)
+    # 合并重叠的格子（IoU>0.3 合成外接框），避免同一处水印反解两次。
+    # 没合并的相邻格（IoU 约 0.14）重叠区会被两个格各反解一次，是自收敛
+    # 的（第二次按重新估计的残余 α 再解，不会过冲），不是 bug。
+    merged = []
+    for box in found:
+        placed = False
+        for i, old in enumerate(merged):
+            if _box_iou(box, old) > 0.3:
+                merged[i] = (min(box[0], old[0]), min(box[1], old[1]),
+                             max(box[2], old[2]), max(box[3], old[3]))
+                placed = True
+                break
+        if not placed:
+            merged.append(box)
+    return merged
+
+
 def clean_light_watermark(rgb: np.ndarray) -> np.ndarray:
     """浅色水印一键流程：认出色调 → 反解 → 铺平平坦背景 → 补掉残影。
 
     彩色淡色水印走反解；完全没偏色的淡灰水印走“平坦区重铺背景”。
     """
-    # 照片护栏：文档截图的中位色度接近 0（白纸），人像/风景随便就 30~60。
-    # 在照片上强行“反解浅色水印”会把皮肤、汗光、天空当水印抹掉（实测一张
-    # 人像整张发灰、平均差 5.8），所以高色度图直接放过，交给框选+高质量。
+    # 照片护栏（分区版）：文档截图的中位色度接近 0（白纸），人像/风景随便
+    # 就 30~60。在照片上强行全图反解会把皮肤、汗光、天空当水印抹掉（实测
+    # 一张人像整张发灰、平均差 5.8），所以不再整张放过、也不再整张反解：
+    # 网格找水印区，只在找到的区里框内反解，区外一个像素不动；没找到就
+    # 原样返回。
     if looks_like_photo(rgb):
-        return np.array(rgb, dtype=np.uint8, copy=True)
+        out = np.array(rgb, dtype=np.uint8, copy=True)
+        for one in _grid_light_boxes(rgb):
+            fixed, mask, residual = undo_light_in_box(out, one)
+            if not mask.any():
+                continue
+            out = fixed
+            if residual.any():
+                out = _nearest4_fill(out, _grow_mask(residual, 1))
+        return out
     luma, chroma = _luma_chroma(rgb)
     stats = (luma, chroma)
 
@@ -1249,13 +1544,29 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
         fixed = clean_light_watermark(arr)
         height, width = fixed.shape[:2]
         for one in as_box_list(boxes) if boxes else []:
+            # 先反解、解不净再补：框里有浅色水印时整块补会把底纹也抹掉
+            # （草地/皮肤）；只有白字徽标这类不透明的、或反解后残留太多
+            # 的框，才按老路整块补掉。
+            _, mask0, _ = undo_light_in_box(arr, one)
             # 框只框住字也很常见；向外留一圈上下文，模型才不会把文字边缘
             # 当成“要保留的内容”接回去（实测不留余量时白字会残一半）
             y0, y1, x0, x1 = box_pixels(one, width, height)
             pad = max(6, int((y1 - y0) * 0.35))
             grown = (max(0, x0 - pad) / width, max(0, y0 - pad) / height,
                      min(width, x1 + pad) / width, min(height, y1 + pad) / height)
-            fixed = inpaint(fixed, grown, method)
+            if mask0.sum() < max(200, (y1 - y0) * (x1 - x0) * 0.02):
+                # 原图框里几乎没有可反解的浅色水印：不透明徽标（白字只剩
+                # 抗锯齿轮廓也算），整块补
+                fixed = inpaint(fixed, grown, method)
+                continue
+            # 框内有浅色水印：先在当前图上反解一次，再看残留决定
+            fixed, _, residual = undo_light_in_box(fixed, one)
+            if not residual.any():
+                continue
+            if residual.sum() <= 0.30 * mask0.sum():
+                fixed = _nearest4_fill(fixed, _grow_mask(residual, 1))
+            else:
+                fixed = inpaint(fixed, grown, method)
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
     # 没改动（照片护栏直接放过、或者这张图本来就没水印）就直接拷原文件：
@@ -1310,6 +1621,7 @@ __all__ = [
     "batch_remove_light",
     "box_pixels",
     "clean_light_watermark",
+    "detect_light_in_box",
     "detect_light_watermark",
     "estimate_tint_ref",
     "inpaint",
@@ -1320,5 +1632,6 @@ __all__ = [
     "remove_light_file",
     "remove_watermark_file",
     "target_dir",
+    "undo_light_in_box",
     "undo_light_watermark",
 ]
