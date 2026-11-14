@@ -225,6 +225,10 @@ tests/
 models/
 Dedup便携版/
 .tmp_wm_odbpa84d/
+.tmp_*/
+
+# 本地测试素材：用户样本照片，体积大、只用于验证误报/漏判
+团[0-9]*/
 
 \344
 .workbuddy-ai/
