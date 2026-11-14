@@ -1127,6 +1127,27 @@ class ScanPage(tk.Frame):
                  bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w").pack(
             side="left", padx=(s(6), 0))
 
+        # 深度特征层是可选增强：装了 onnxruntime + 模型文件就自动生效，
+        # 没有也照常工作（只是重调色/大幅裁切这类难例召回低一些）。
+        emb_text = ""
+        try:
+            import dedup_photo_embed as _pemb
+            if _pemb.available():
+                name = _pemb.model_path().name
+                emb_text = f"深度特征已启用（{name}）：重调色、大幅裁切更不容易漏判。"
+            else:
+                emb_text = "深度特征未启用（可选增强，不影响查重）。"
+        except Exception:
+            emb_text = ""
+        if emb_text:
+            emb_row = tk.Frame(note, bg=t.CARD)
+            emb_row.pack(fill="x", pady=(s(6), 0))
+            Icon(emb_row, t, "info", size=11, color=t.MUTED,
+                 bg=t.CARD).pack(side="left")
+            tk.Label(emb_row, text=emb_text, bg=t.CARD, fg=t.MUTED,
+                     font=t.font(8), anchor="w").pack(side="left",
+                                                     padx=(s(6), 0))
+
         # 右侧：扫描选项
         opt_card = Card(options, t, padding=12)
         opt_card.grid(row=0, column=1, sticky="n", padx=(s(8), 0))
@@ -5416,8 +5437,15 @@ class WatermarkPage(ToolPage):
         # 照片列表只在真正需要时扫（页面首次显示 / 手动刷新），
         # 不在构建界面时去 rglob 用户目录
         self._photos_cache = None
+        # 直接用文件对话框选来的几张（None = 跟鲏文件夹）；
+        # 零散选的照片可以来自不同文件夹，输出也按张算
+        self._files = None
         # 要补的区域（归一化坐标），在预览上拖框就能加，一张图可以有多个
-        self.boxes = []
+        # 上一次框的位置存着，下次打开（哪怕换了一组照片）直接套用：
+        # 自己加的徽标位置基本固定，只该框一次
+        saved = self.settings.get("wm_boxes") or []
+        self.boxes = [tuple(float(v) for v in b) for b in saved
+                      if isinstance(b, (list, tuple)) and len(b) == 4]
         self._drag = None
         self._thumb_rect = None
         self._warm_started = False
@@ -5438,10 +5466,24 @@ class WatermarkPage(ToolPage):
 
         self.path_var = tk.StringVar(value=self.settings.get("wm_dir")
                                      or self.settings.get("last_dir", ""))
-        entry = self._path_card(self.page, "照片所在文件夹", self.path_var,
-                                self._browse,
+        entry = self._path_card(self.page, "照片文件夹（或直接选照片）",
+                                self.path_var, self._browse,
                                 "处理结果默认存到「_去水印」子文件夹")
         entry.bind("<Return>", lambda e: self.refresh_preview())
+
+        # 不想跟文件夹打交道时，直接挑几张照片（可以跨文件夹、多选）
+        pick = tk.Frame(self.page, bg=t.BG)
+        pick.pack(fill="x", pady=(s(10), 0))
+        CanvasButton(pick, t, "选择照片…", command=self._browse_files,
+                     kind="secondary", icon="image", height=34, size=9,
+                     padding=14, bg=t.BG).pack(side="left")
+        self.files_hint = tk.Label(pick, text="可以只选一两张，不必整个文件夹",
+                                   bg=t.BG, fg=t.MUTED, font=t.font(8),
+                                   anchor="w")
+        self.files_hint.pack(side="left", padx=(s(12), 0))
+        self.btn_clear_files = CanvasButton(
+            pick, t, "改用整个文件夹", command=self._clear_files, kind="ghost",
+            height=34, size=9, padding=12, bg=t.BG)
 
         body = tk.Frame(self.page, bg=t.BG)
         body.pack(fill="x", pady=(s(16), 0))
@@ -5513,8 +5555,10 @@ class WatermarkPage(ToolPage):
                  bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
                  justify="left").pack(side="left")
         self.hq_ready = wlama.available()
+        # 默认就开：几何填充在人像/皮肤上会明显穿帮，LaMa 是质量最好的一档
         self.sw_hq = Switch(hq_opt, t, bg=t.CARD,
-                            value=bool(self.settings.get("wm_hq", False))
+                            value=bool(self.settings.get("wm_hq",
+                                                         self.hq_ready))
                             and self.hq_ready,
                             command=self._hq_toggled)
         self.sw_hq.pack(side="right")
@@ -5546,9 +5590,9 @@ class WatermarkPage(ToolPage):
         self.btn_light.pack(fill="x")
         tk.Label(d, bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w",
                  justify="left", wraplength=s(330),
-                 text="不用拖框：自动找白底上的浅黄/浅色平铺水印并反解掉，"
-                      "适合表格、文档截图。不透明贴纸、彩色 logo 请用上面的"
-                      "拖框 + 高质量模式。"
+                 text="自动找白底上的浅黄/浅色水印并反解掉，适合表格、文档截图；"
+                      "拖过的框会记住，点这里自动套用（“AI生成”这类白字徽标框"
+                      "一次就够）。照片不做反解，走上面的框选 + 高质量。"
                  ).pack(fill="x", pady=(s(6), 0))
         self.box_hint = tk.Label(d, text="区域：0 个（在右边预览上直接拖框）",
                                  bg=t.CARD, fg=t.MUTED, font=t.font(8),
@@ -5566,7 +5610,7 @@ class WatermarkPage(ToolPage):
         self.canvas.bind("<Button-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        self.status = tk.Label(p, text="选一个文件夹，自动预览第一张",
+        self.status = tk.Label(p, text="选一个文件夹或几张照片，自动预览第一张",
                                bg=t.CARD, fg=t.MUTED, font=t.font(8),
                                anchor="w", justify="left")
         self.status.pack(fill="x", pady=(s(8), 0))
@@ -5619,13 +5663,23 @@ class WatermarkPage(ToolPage):
             self.app.toast("区域太小了，宽高至少 1%", "warn")
             return
         self.boxes.append(box)
+        self._remember_boxes()
         self._update_box_hint()
         self._redraw()
 
     def _clear_boxes(self):
         self.boxes = []
+        self._remember_boxes()
         self._update_box_hint()
         self._redraw()
+
+    def _remember_boxes(self):
+        """把当前区域记到设置里，下次自动套用（不联网、只存一行坐标）。"""
+        self.settings["wm_boxes"] = [list(b) for b in self.boxes]
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 拖框
     def _canvas_to_box(self, x0, y0, x1, y1):
@@ -5661,19 +5715,61 @@ class WatermarkPage(ToolPage):
         box = self._canvas_to_box(start[0], start[1], event.x, event.y)
         if box and (box[2] - box[0]) * (box[3] - box[1]) > 0.0004:
             self.boxes.append(box)
+            self._remember_boxes()
             self._update_box_hint()
         self._redraw()
 
     def _browse(self):
         self._browse_into(self.path_var, "选择照片文件夹")
+        self._files = None            # 回到文件夹模式
         self.refresh_preview()
 
+    def _browse_files(self):
+        """直接选照片（可多选、可跨文件夹）。"""
+        folder = self.path_var.get().strip().strip('"')
+        initial = (folder if folder and os.path.isdir(folder)
+                   else self.settings.get("wm_dir") or str(Path.home()))
+        if not os.path.isdir(initial):
+            initial = str(Path.home())
+        chosen = filedialog.askopenfilenames(
+            parent=self, title="选择要处理的照片", initialdir=initial,
+            filetypes=[("照片", " ".join("*" + e
+                                    for e in sorted(models.PHOTO_EXT))),
+                       ("所有文件", "*.*")])
+        files = [Path(p) for p in chosen if Path(p).is_file()]
+        if not files:
+            return
+        self._files = files
+        self.refresh_preview()
+
+    def _clear_files(self):
+        self._files = None
+        self.refresh_preview()
+
+    def _sync_files_hint(self):
+        """小提示跟着模式变，让用户一眼看出现在处理的是哪一批。"""
+        if not hasattr(self, "files_hint"):
+            return
+        total = len(self._photos_cache or [])
+        if self._files is not None:
+            self.files_hint.configure(
+                text=f"已选 {total:,} 张照片（可跨文件夹）", fg=self.theme.GREEN)
+            self.btn_clear_files.pack(side="left", padx=(self.theme.s(10), 0))
+        else:
+            self.files_hint.configure(text="可以只选一两张，不必整个文件夹",
+                                      fg=self.theme.MUTED)
+            self.btn_clear_files.pack_forget()
+
     def _refresh_dir(self):
+        if self._files is not None:
+            return                    # 零散选的照片不该改写文件夹记忆
         folder = self.path_var.get().strip().strip('"')
         if folder and os.path.isdir(folder):
             self.settings["wm_dir"] = folder
 
     def _photos(self):
+        if self._files is not None:
+            return [p for p in self._files if Path(p).is_file()]
         folder = self.path_var.get().strip().strip('"')
         if not folder or not os.path.isdir(folder):
             return []
@@ -5700,12 +5796,13 @@ class WatermarkPage(ToolPage):
 
     def refresh_preview(self):
         self._photos_cache = self._photos()
+        self._sync_files_hint()
         self._redraw()
 
     def _redraw(self):
         """只用已缓存的文件列表重画（窗口缩放时会被反复触发）。"""
         if self._photos_cache is None:
-            self._placeholder("选一个文件夹，自动预览第一张")
+            self._placeholder("选一个文件夹或几张照片，自动预览第一张")
             return
         self.render_preview()
 
@@ -5714,7 +5811,7 @@ class WatermarkPage(ToolPage):
             return
         photos = self._photos_cache or []
         if not photos:
-            self._placeholder("选一个文件夹，自动预览第一张")
+            self._placeholder("选一个文件夹或几张照片，自动预览第一张")
             return
         first = photos[0]
         width = max(int(self.canvas.winfo_width()), 200)
@@ -5809,17 +5906,15 @@ class WatermarkPage(ToolPage):
         if photos is None:
             photos = self._photos()
         if not photos:
-            self.app.toast("先选一个有照片的文件夹", "warn")
+            self.app.toast("先选照片或文件夹", "warn")
             return
         self._refresh_dir()
-        out_dir = None
-        if self.sw_subdir.value:
-            out_dir = Path(photos[0]).parent / "_去水印"
-            try:
-                out_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                self.app.toast(f"建不了输出目录：{exc}", "err")
-                return
+        out_dir, where, subdir = self._output_plan(photos)
+        if out_dir is False:
+            return
+        method = ("lama" if self.sw_hq.value
+                  else "patchmatch" if getattr(self, "sw_pm", None)
+                  and self.sw_pm.value else "auto")
         self.busy = True
         self._last_mode = "light"
         self._cancel = threading.Event()
@@ -5829,7 +5924,6 @@ class WatermarkPage(ToolPage):
         self.app.set_status("正在抠浅色水印…", self.theme.ACCENT)
         total = len(photos)
         cancel = self._cancel
-        where = str(out_dir) if out_dir else "原图目录"
 
         def work():
             def prog(index, count, _path):
@@ -5837,8 +5931,12 @@ class WatermarkPage(ToolPage):
                     self.app.post(("wm_progress",
                                    (index, count, os.path.basename(_path))))
             try:
+                # 记下的框（比如徽标位置）一并套用：白字不透明，反解救不回来，
+                # 只能反解完再把它整块补掉
                 result = wmark.batch_remove_light(
-                    photos, out_dir=out_dir, cancel=cancel, on_progress=prog)
+                    photos, out_dir=out_dir, cancel=cancel, on_progress=prog,
+                    subdir=subdir, boxes=list(self.boxes) or None,
+                    method=method)
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -5854,18 +5952,13 @@ class WatermarkPage(ToolPage):
         if photos is None:
             photos = self._photos()
         if not photos:
-            self.app.toast("先选一个有照片的文件夹", "warn")
+            self.app.toast("先选照片或文件夹", "warn")
             return
         self._refresh_dir()
         box = list(self.boxes) or [self._box()]
-        out_dir = None
-        if self.sw_subdir.value:
-            out_dir = Path(photos[0]).parent / "_去水印"
-            try:
-                out_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                self.app.toast(f"建不了输出目录：{exc}", "err")
-                return
+        out_dir, where, subdir = self._output_plan(photos)
+        if out_dir is False:
+            return
         for key in ("left", "top", "width", "height"):
             self.settings["wm_" + key] = self.vars[key].get()
         self.settings["wm_subdir"] = bool(self.sw_subdir.value)
@@ -5888,7 +5981,6 @@ class WatermarkPage(ToolPage):
         self.app.set_status("正在去水印…", self.theme.ACCENT)
         total = len(photos)
         cancel = self._cancel
-        where = str(out_dir) if out_dir else "原图目录"
 
         def work():
             def prog(index, count, _path):
@@ -5898,7 +5990,7 @@ class WatermarkPage(ToolPage):
             try:
                 result = wmark.batch_remove(photos, box, out_dir=out_dir,
                                             cancel=cancel, on_progress=prog,
-                                            method=method)
+                                            method=method, subdir=subdir)
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -5935,14 +6027,36 @@ class WatermarkPage(ToolPage):
         if done and self._last_mode == "light":
             self._show_light_preview(where, done)
 
+    def _output_plan(self, photos):
+        """算输出目录，返回 (out_dir, 说明文字, subdir)；出错时 out_dir 为 False。
+
+        文件夹模式统一放一处（子目录里的照片不会散得到处都是）；
+        零散选来的几张则按各自的目录算。
+        """
+        subdir = bool(self.sw_subdir.value)
+        if self._files is not None:
+            self._last_out = (None, subdir)
+            where = "各照片旁边（_去水印）" if subdir else "各照片旁边"
+            return None, where, subdir
+        out_dir = wmark.target_dir(photos[0], None, subdir)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.app.toast(f"建不了输出目录：{exc}", "err")
+            return False, "", False
+        self._last_out = (out_dir, False)
+        return out_dir, str(out_dir), False
+
     def _show_light_preview(self, where, done):
         """处理完直接弹出前后对照，省得自己去文件夹里翻。"""
         photos = self._photos_cache or []
         if not photos:
             return
-        out_dir = None if where == "原图目录" else Path(where)
+        out_dir, subdir = getattr(self, "_last_out", (None, False))
         try:
-            after = wmark.output_path(photos[0], out_dir, unique=False)
+            after = wmark.output_path(
+                photos[0], wmark.target_dir(photos[0], out_dir, subdir),
+                unique=False)
         except Exception:
             return
         if not Path(after).is_file():
