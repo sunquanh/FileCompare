@@ -1066,6 +1066,10 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
     if ref is None:
         ref = TINT_REFS.get(tint, LIGHT_REF) if tint else LIGHT_REF
     arr = rgb.astype(np.float32)
+    # 护栏用原像素亮度：反解后比原像素暗超 40 的视为参考色估错，直接保留原值
+    # （蓝灰底被误认成蓝水印、亮参考色反解时，(I-αW)/(1-α) 会把背景打成近黑
+    # 的横杠；正常反解是把水印色往背景推，结果不会比原像素暗，只会更亮或相近）。
+    orig_luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
     wr, wg, wb = float(ref[0]), float(ref[1]), float(ref[2])
     luma = 0.299 * r + 0.587 * g + 0.114 * b
@@ -1083,6 +1087,11 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
         np.subtract(ch, alpha * wc, out=ch)
         np.divide(ch, denom, out=ch)
     np.clip(arr, 0, 255, out=arr)
+    # 护栏：反解不该把像素打得比原像素暗太多。只拦 alpha>0 的像素（没动的
+    # 本来就不会暗）；暗超 40 的恢复原值。
+    fixed_luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    too_dark = (alpha > 0) & (fixed_luma < orig_luma - 40.0)
+    arr[too_dark] = rgb.astype(np.float32)[too_dark]
     return arr.astype(np.uint8)
 
 
