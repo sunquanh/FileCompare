@@ -595,6 +595,46 @@ class TestDarkGuard(unittest.TestCase):
         luma = 0.299 * a[..., 0].astype(np.float32) + 0.587 * a[..., 1].astype(np.float32) + 0.114 * a[..., 2].astype(np.float32)
         return float((luma < 80).mean() * 100)
 
+    def test_global_undo_never_darkens(self):
+        """第六批：全局反解 undo_light_watermark 也不得把像素打黑。
+
+        用户真图走的是文档路径（looks_like_photo=False），调的是全局
+        undo_light_watermark，不是 undo_light_in_box——探针证实后者一次
+        都没被调到。所以护栏也要加在全局反解上：反解后比原像素暗超 40
+        的恢复原值。本测试只验“不变暗”这条不变量（烟雾测试，见提交说明）。
+        """
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        rng = np.random.default_rng(7)
+        H, Wd = 600, 800
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(196, 208), (213, 221), (237, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 20)
+        except Exception:
+            font = ImageFont.load_default()
+        for i in range(15):
+            d.text((30, 30 + i * 34), f"SELECT col{i} FROM t WHERE x={i}",
+                   font=font, fill=(60, 60, 60))
+        arr = np.asarray(img).astype(np.uint8)
+        orig_luma = (0.299 * arr[..., 0].astype(np.float32)
+                     + 0.587 * arr[..., 1].astype(np.float32)
+                     + 0.114 * arr[..., 2].astype(np.float32))
+        for tint in ("蓝", "粉", "黄", "深黄", "绿"):
+            fixed = W.undo_light_watermark(arr, tint=tint)
+            fixed_luma = (0.299 * fixed[..., 0].astype(np.float32)
+                          + 0.587 * fixed[..., 1].astype(np.float32)
+                          + 0.114 * fixed[..., 2].astype(np.float32))
+            worst = float((orig_luma - fixed_luma).max())
+            self.assertLessEqual(
+                worst, 40.0 + 1e-6,
+                f"全局反解 tint={tint} 把像素打暗 {worst:.1f}（>40），护栏失效")
+
     def test_one_click_does_not_create_dark_bars(self):
         """蓝灰底照片一键抠后，暗像素占比不得明显上涨（杠子就是暗像素暴涨）。"""
         import numpy as np
