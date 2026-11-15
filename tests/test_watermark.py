@@ -588,5 +588,47 @@ class TestRealPhoto(unittest.TestCase):
         self.assertEqual(fstatus.status, "partial")
 
 
+class TestDarkGuard(unittest.TestCase):
+    """第五批：反解不该把背景打黑（横杠噪点护栏回归）。"""
+
+    def _dark_frac(self, a):
+        luma = 0.299 * a[..., 0].astype(np.float32) + 0.587 * a[..., 1].astype(np.float32) + 0.114 * a[..., 2].astype(np.float32)
+        return float((luma < 80).mean() * 100)
+
+    def test_one_click_does_not_create_dark_bars(self):
+        """蓝灰底照片一键抠后，暗像素占比不得明显上涨（杠子就是暗像素暴涨）。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        rng = np.random.default_rng(11)
+        H, Wd = 768, 1024
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(177, 208), (186, 221), (207, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 24)
+            wmf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except Exception:
+            font = ImageFont.load_default(); wmf = font
+        for i in range(12):
+            d.text((40, 50 + i * 52), f"SELECT a{i} FROM t WHERE x = {i}", font=font, fill=(52, 52, 58, 255))
+        wm = Image.new("RGBA", (Wd, H), (0, 0, 0, 0))
+        dw = ImageDraw.Draw(wm)
+        dw.text((200, 150), "1102", font=wmf, fill=(180, 195, 130, 128))
+        wm = wm.rotate(-18, resample=Image.BICUBIC, center=(Wd // 2, H // 2))
+        img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(1))
+        arr = np.asarray(img).astype(np.float32)
+        arr = np.clip(arr + rng.normal(0, 8, arr.shape), 0, 255).astype(np.uint8)
+        before = self._dark_frac(arr)
+        fixed, st = W.clean_light_watermark(arr)
+        after = self._dark_frac(fixed)
+        self.assertLessEqual(after, before + 1.0,
+                             f"一键抠后暗像素 {before:.2f}% -> {after:.2f}%，疑似打黑出杠子")
+
+
 if __name__ == "__main__":
     unittest.main()

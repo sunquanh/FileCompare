@@ -1522,6 +1522,15 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
     fixed_crop = crop.copy()
     for ch in range(3):
         fixed_crop[..., ch] = (crop[..., ch] - alpha * float(ref[ch])) / denom
+    # 护栏：反解不该把像素打得比背景暗太多。参考色/α 一旦估错
+    # （比如蓝灰底被误认成蓝水印、亮参考色反解），(I-αW)/(1-α) 会
+    # 把背景打成近黑的横杠。反解后的合理结果应贴近背景 bg；比 bg
+    # 暗超过 40 的像素视为估错，直接保留原值。
+    bg_luma = float(0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2])
+    fixed_luma = (0.299 * fixed_crop[..., 0] + 0.587 * fixed_crop[..., 1]
+                  + 0.114 * fixed_crop[..., 2])
+    too_dark = sub & (fixed_luma < bg_luma - 40.0)
+    fixed_crop[too_dark] = crop[too_dark]
     out = arr.copy()
     out[y0:y1, x0:x1] = np.clip(fixed_crop, 0, 255)
     fixed = np.rint(np.clip(out, 0, 255)).astype(np.uint8)
