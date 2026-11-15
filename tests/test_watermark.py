@@ -475,5 +475,118 @@ class TestSkyBlueFix(unittest.TestCase):
         self.assertIn(status.status, ("clean", "partial"))
 
 
+class TestRealPhoto(unittest.TestCase):
+    """真实照片（拍屏幕）回归：蓝灰底色不再误认成“蓝”水印，
+    深色 SQL 文字不再误认成水印，淡黄斜字水印要能去掉；
+    状态要诚实（没去净报 partial）。
+
+    图是合成的“屏幕照片”（蓝灰渐变底 + 淡色 SQL 文本行 + 蓝色关键字 +
+    淡黄斜字水印），不用用户原图——原图不进公开仓库。
+    文字要淡、小，水印要大：锐利的深色文字会在照片路径里压过水印
+    （真实照片里文字边缘是糊的），所以图里先做了轻微失焦 + 噪声。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _screen_photo(self, alpha=0.5):
+        """返回 (clean, wm, text_bbox)：clean 是无水印的屏幕照片。"""
+        rng = np.random.default_rng(11)
+        yy = np.linspace(0, 1, HEIGHT)[:, None]
+        xx = np.linspace(0, 1, WIDTH)[None, :]
+        base = np.stack([(196 - 12 * yy) * np.ones_like(xx),
+                         (213 - 8 * yy) * np.ones_like(xx),
+                         (237 - 6 * xx) * np.ones_like(yy)], axis=2)
+        base = base + rng.normal(0, 5, base.shape)
+        img = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(img)
+        font = _font(20)
+        lines = [("SELECT diff = 0, value_diff = 0,", (70, 70, 70)),
+                 ("  COALESCE(SUM(n_cnt), 0) AS new_rows,", (40, 40, 180)),
+                 ("  COALESCE(SUM(o_cnt), 0) AS only_old,", (40, 40, 180)),
+                 ("WHERE a = 1 AND NOT (o_used <=> n_used", (70, 70, 70))]
+        y = 150
+        for text, color in lines:
+            draw.text((15, y), text, font=font, fill=color)
+            y += 36
+        clean = np.asarray(img)
+        # 淡黄斜字水印：颜料色 (180,195,130)，α=0.5 时观测色约 (188,204,183)，
+        # 接近真实裁块的观测中位色 (194,206,182)，比写死的“深黄”淡得多
+        overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        wm_font = _font(60)
+        a = int(round(alpha * 255))
+        od.text((60, 20), "1102", font=wm_font,
+                fill=(180, 195, 130, a))
+        wm_arr = np.asarray(overlay).astype(np.float32)
+        al = wm_arr[..., 3:4] / 255.0
+        ref = np.array([180.0, 195.0, 130.0], dtype=np.float32)
+        out = (1 - al) * clean.astype(np.float32) + al * ref
+        bbox = od.textbbox((60, 20), "1102", font=wm_font)
+        wm = np.clip(out, 0, 255).astype(np.uint8)
+        # 拍屏幕照片：轻微失焦 + 传感器噪声。否则锐利的深色文字边缘会在
+        # 照片路径里被当成水印（真实照片里文字边缘是糊的）；噪声对 clean
+        # 和 wm 用同一份，框误差里噪声抵消，只量水印处理本身。
+        from PIL import ImageFilter
+        clean_b = np.asarray(Image.fromarray(clean).filter(
+            ImageFilter.GaussianBlur(1))).astype(np.float32)
+        wm_b = np.asarray(Image.fromarray(wm).filter(
+            ImageFilter.GaussianBlur(1))).astype(np.float32)
+        noise = rng.normal(0, 8, (HEIGHT, WIDTH, 3))
+        clean2 = np.clip(clean_b + noise, 0, 255).astype(np.uint8)
+        wm2 = np.clip(wm_b + noise, 0, 255).astype(np.uint8)
+        return clean2, wm2, bbox
+
+    def test_screen_photo_no_blue_false_positive(self):
+        # 蓝灰底色以前在 3 格里投出 2 格“蓝”假阳性；两道门之后，
+        # 网格里不该再有“蓝”，淡黄水印那格要保留
+        _clean, wm, _bbox = self._screen_photo()
+        dets = W._grid_light_boxes(wm)
+        self.assertTrue(any(d.tint in ("黄", "深黄") for d in dets),
+                        f"黄水印格丢了：{[(d.tint, round(d.score, 2)) for d in dets]}")
+        self.assertFalse(any(d.tint == "蓝" for d in dets),
+                         f"仍有蓝假阳性：{[(d.tint, round(d.score, 2)) for d in dets]}")
+
+    def test_screen_photo_yellow_removed(self):
+        # 一键抠后水印框误差至少降一半，状态是 clean 或轻微残留的 partial
+        clean, wm, bbox = self._screen_photo()
+        x0, y0, x1, y1 = bbox
+        before = _box_err(wm, clean, y0, y1, x0, x1)
+        fixed, status = W.clean_light_watermark(wm)
+        after = _box_err(fixed, clean, y0, y1, x0, x1)
+        self.assertLess(after, before * 0.5,
+                        f"水印没去净：{before:.2f} -> {after:.2f}")
+        self.assertIn(status.status, ("clean", "partial"))
+
+    def test_big_watermark_reports_partial(self):
+        # 大字水印（跨多个网格格）一遍反解+小补解不净时，
+        # clean_light_watermark 要报 partial 而不是 clean；
+        # 文件流同样报 partial，绝不能降级成 unchanged
+        clean, _wm, _bbox = self._screen_photo(alpha=0.5)
+        ref = np.array(W.TINT_REFS["黄"], dtype=np.float32)
+        overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        od.text((20, 130), "WATERMARK", font=_font(110),
+                fill=(int(ref[0]), int(ref[1]), int(ref[2]), int(0.5 * 255)))
+        arr = np.asarray(overlay).astype(np.float32)
+        al = arr[..., 3:4] / 255.0
+        wm = np.clip((1 - al) * clean.astype(np.float32) + al * ref,
+                     0, 255).astype(np.uint8)
+        x0, y0, x1, y1 = od.textbbox((20, 130), "WATERMARK", font=_font(110))
+        before = _box_err(wm, clean, y0, y1, x0, x1)
+        fixed, status = W.clean_light_watermark(wm)
+        after = _box_err(fixed, clean, y0, y1, x0, x1)
+        self.assertLess(after, before)
+        self.assertEqual(status.status, "partial")
+        src = self.tmp / "screen.jpg"
+        Image.fromarray(wm).save(src, quality=95)
+        _dst, fstatus = W.remove_light_file(src)
+        self.assertEqual(fstatus.status, "partial")
+
+
 if __name__ == "__main__":
     unittest.main()

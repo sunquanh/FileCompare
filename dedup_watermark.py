@@ -1386,6 +1386,26 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
                     np.asarray(ref, dtype=np.float32) - bg)))
                 local &= (raw / max(norm, 1.0) <= 0.75)
             count = int(local.sum())
+            # 偏离幅度门（逐色系）：这个色系的掩膜相对背景的中位偏离太小，
+            # 说明它只是底色本身的波动，不是真水印——不让它参与赢家投票。
+            # 否则一个假阳性色系会靠数量赢过真水印，再在事后把整格判死
+            # （实测：拍屏幕照片的蓝灰底色在蓝/粉/绿/黄四系上都投出几千
+            # 像素、偏离只有个位数；真水印偏离数十，裁块逐格实测 47~119）。
+            # 极淡水印（α<0.15）可能被这道门漏掉，宁可漏不硬认。
+            if count:
+                sub = arr[y0:y1, x0:x1][local]
+                med = np.median(sub, axis=0)
+                dev = float(np.max(np.abs(med - bg)))
+                if dev < 15.0:
+                    continue
+                # 亮度门（逐色系）：掩膜中位亮度比背景暗太多，说明是深色
+                # 文字/内容，不是浅色水印。实测：真实裁块的深色 SQL 文字
+                # 亮度下降约 45~144，淡黄水印只降 9~17，矩阵 24 格水印全是
+                # 更亮（下降为负）；门限 30 介于两者之间。
+                bg_luma = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+                med_luma = 0.299 * med[0] + 0.587 * med[1] + 0.114 * med[2]
+                if bg_luma - med_luma > 30.0:
+                    continue
             if count > best_count:
                 full_mask = np.zeros((height, width), dtype=bool)
                 full_mask[y0:y1, x0:x1] = local
@@ -1424,6 +1444,33 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
     return det2 if det2.found else det1
 
 
+def _estimate_box_ref(arr, det, fixed_ref):
+    """从检出掩膜估计水印参考色：方向取掩膜中位色，幅度取写死表。
+
+    写死色是“标准”水印色，真水印往往比它淡得多（拍屏幕照片的黄水印
+    中位色 (194,206,182)，写死的“深黄”是 (255,226,130)，R 高出 60，
+    反解时 R 会被多减、掩膜区越解越暗）。直接拿中位色当参考色也不行：
+    它是水印和背景的混合色，幅度太小，α 被高估、框误差反而变差
+    （矩阵实测 3~10 倍）。折中：方向（色相）信实测中位色，幅度
+    （|W-B|）信写死表——α 标定不变，R 不再多减。护栏：中位偏离太小
+    或方向与写死色相反时返回 None（调用方退回写死表）。
+    """
+    if det.mask is None or not det.mask.any() or det.bg is None:
+        return None
+    bg = np.asarray(det.bg, dtype=np.float32)
+    med = np.median(np.asarray(arr, dtype=np.float32)[det.mask], axis=0)
+    d = med - bg
+    n = float(np.sqrt(np.dot(d, d)))
+    wv = np.asarray(fixed_ref, dtype=np.float32) - bg
+    m = float(np.sqrt(np.dot(wv, wv)))
+    if n < 1.0 or m < 1.0:
+        return None
+    if float(np.dot(d, wv)) / (n * m) < 0.0:
+        return None
+    est = bg + d / n * m
+    return tuple(float(v) for v in np.clip(est, 0, 255))
+
+
 def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
     """框内反解浅色水印。
 
@@ -1448,9 +1495,11 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
     crop = arr[y0:y1, x0:x1]
     sub = mask[y0:y1, x0:x1]
     if ref is None:
-        # 框内直接用投票赢的候选参考色。_choose_tint_ref 是给白底文档做的
-        # （按“纸面亮度”自估），用在照片框上会把参考色估跑偏、反解过头。
-        ref = BOX_TINT_REFS.get(name, LIGHT_REF)
+        # 参考色：方向取掩膜中位色（实测水印色相），幅度取写死表
+        # （α 标定）。_choose_tint_ref 是给白底文档做的（按“纸面亮度”
+        # 自估），用在照片框上同样会估跑偏。估不出时退回写死表。
+        fixed = BOX_TINT_REFS.get(name, LIGHT_REF)
+        ref = _estimate_box_ref(arr, det, fixed) or fixed
     # 反解用检测那遍的背景：框外环背景在大格子 + 渐变底色上会偏
     # （sky 蓝的格子环中位色比文字处 R 低 16），偏了的偏差近乎无色，
     # α 估计和色度判断都跟着错。检测里第二遍已用掩膜外一圈重估过
@@ -1636,6 +1685,12 @@ def clean_light_watermark(rgb: np.ndarray):
                 changed += 1
         if not changed:
             return out, LightStatus("unchanged", "水印区已处理过")
+        # 处理后复检：反解没解净的，报 partial 不报 clean，跟文件流的
+        # 校验（_verify_light_watermark）对齐；直接调这个函数的调用方
+        # 拿到的也是诚实的状态。
+        verify = _verify_light_watermark(out)
+        if verify is not None:
+            return out, verify
         return out, LightStatus("clean", f"{changed} 个水印区已反解")
     luma, chroma = _luma_chroma(rgb)
     stats = (luma, chroma)
@@ -1744,7 +1799,7 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
         box_notes = []
         rejected = None
         partial = None
-        cleaned = auto.status == "clean"
+        cleaned = auto.status in ("clean", "partial")
         for one in as_box_list(boxes) if boxes else []:
             # 探：先在原图上检测（框里有什么），再在当前图上重建；重建决策
             # 集中在 reconstruct_light，这里只汇总每框的结论
@@ -1780,19 +1835,28 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
         image.save(target)
     if rejected is not None and not cleaned and partial is None:
         # 唯一结果就是被拒：什么都没动，如实报 rejected
-        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+        notes = ([auto.detail]
+                 if auto.status in ("clean", "partial") and auto.detail
                  else []) + box_notes
         detail = "；".join(notes) if notes else rejected
         base = LightStatus("rejected", detail)
     elif partial is not None:
         # 反解没解干净，不得不整块补图——纹理被重建，报 partial
-        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+        notes = ([auto.detail]
+                 if auto.status in ("clean", "partial") and auto.detail
                  else []) + box_notes
         detail = "；".join(notes) if notes else partial
         base = LightStatus("partial", detail)
+    elif auto.status == "partial":
+        # 自动抠已报 partial（处理后仍有残留）：如实报 partial，不降级成
+        # unchanged，也不升成 clean；文件流的校验随后会再补一句。
+        notes = ([auto.detail] if auto.detail else []) + box_notes
+        detail = "；".join(notes) if notes else "水印未除净"
+        base = LightStatus("partial", detail)
     elif cleaned:
         # 框被拒但水印已被自动抠清掉：结论仍是 clean，拒的框只记一句
-        notes = ([auto.detail] if auto.status == "clean" and auto.detail
+        notes = ([auto.detail]
+                 if auto.status in ("clean", "partial") and auto.detail
                  else []) + box_notes
         detail = "；".join(notes)
         base = LightStatus("clean", detail or "水印已清")
@@ -1805,7 +1869,9 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     if verify is not None:
         if base.status == "clean":
             base = verify
-        else:
+        elif verify.detail not in base.detail:
+            # auto 已报 partial 时里面已含同一份校验结论（同一张图、
+            # 没过框），不再重复追加；框改过图、结论变了时才追加。
             base = LightStatus(base.status,
                                base.detail + "；" + verify.detail)
     return target, base
