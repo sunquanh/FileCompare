@@ -787,6 +787,59 @@ class TestMaskCap(unittest.TestCase):
         self.assertIn(det.tint, ("黄", "深黄"))
 
 
+class TestTopSignalDeviation(unittest.TestCase):
+    """第十批：偏离门改看信号最强的像素（而非整掩膜中位）。
+
+    根因（2026-11-16 用户真图 probe_box2.py 实测）：黄掩膜 27.8 万像素
+    （占框 13.8%），但整掩膜中位偏离仅 6.4 < 15——掩膜里 99% 是底色
+    渐变像素，真水印笔画只占一小撮，中位被底色拉走；蓝掩膜 33.7% 已被
+    第九批上限门拦住，结果五个色系全被拦、found=False。
+    修法：偏离门与亮度门改用 score 最高的前 10% 像素的中位色。
+    注：本测试是烟雾测试——768×1024 合成图上旧代码也能检出（变异验证
+    未变红），未能复现用户真图 4096×3072 上“整掩膜中位偏离 6.4 被拦”
+    的场景（半径 31 vs 126、梯度污染程度不同）。真正验收以用户真图
+    probe_box2.py 为准。"""
+
+    def _big_gradient_photo(self):
+        """大图 + 强蓝灰渐变 + 淡黄水印字 + 深色 SQL 文字（框占图约 16%）。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        rng = np.random.default_rng(11)
+        H, Wd = 768, 1024
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(177, 208), (186, 221), (207, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 24)
+            wmf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except Exception:
+            font = ImageFont.load_default(); wmf = font
+        for i in range(12):
+            d.text((40, 50 + i * 52), f"SELECT a{i} FROM t WHERE x = {i}", font=font, fill=(52, 52, 58, 255))
+        wm = Image.new("RGBA", (Wd, H), (0, 0, 0, 0))
+        dw = ImageDraw.Draw(wm)
+        dw.text((200, 150), "1102", font=wmf, fill=(180, 195, 130, 128))
+        wm = wm.rotate(-18, resample=Image.BICUBIC, center=(Wd // 2, H // 2))
+        img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(1))
+        arr = np.asarray(img).astype(np.float32)
+        arr = np.clip(arr + rng.normal(0, 8, arr.shape), 0, 255).astype(np.uint8)
+        return arr
+
+    def test_faint_watermark_detected_despite_noisy_mask(self):
+        """大框里黄掩膜混进大量底色像素；新逻辑看最强信号像素，
+        应检出黄/深黄（烟雾测试：旧代码在此合成图上也通过）。"""
+        arr = self._big_gradient_photo()
+        box = (0.007, 0.0, 0.494, 0.329)
+        det = W.detect_light_in_box(arr, box, source="box")
+        self.assertTrue(det.found, "应检出水印（旧代码在此图上 found=False）")
+        self.assertIn(det.tint, ("黄", "深黄"))
+
+
 class TestDarkGuard(unittest.TestCase):
     """第五批：反解不该把背景打黑（横杠噪点护栏回归）。"""
 

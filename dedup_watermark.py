@@ -1402,7 +1402,16 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
             # 像素、偏离只有个位数；真水印偏离数十，裁块逐格实测 47~119）。
             # 极淡水印（α<0.15）可能被这道门漏掉，宁可漏不硬认。
             if count:
+                # 偏离门改看信号最强的像素：掩膜常混进大量底色渐变像素，
+                # 整掩膜中位被底色拉走（实测黄掩膜 27.8 万像素、中位偏离
+                # 仅 6.4）；真水印只占其中一小撮笔画。取 score 最高的前
+                # 10%（至少 100 像素）算中位色，再判偏离与亮度。
+                sub_scores = score[local]
                 sub = arr[y0:y1, x0:x1][local]
+                k = max(100, count // 10)
+                if count > k:
+                    idx = np.argpartition(sub_scores, -k)[-k:]
+                    sub = sub[idx]
                 med = np.median(sub, axis=0)
                 dev = float(np.max(np.abs(med - bg)))
                 if dev < 15.0:
