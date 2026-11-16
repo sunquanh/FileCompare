@@ -1472,20 +1472,34 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
 
 
 def _estimate_box_ref(arr, det, fixed_ref):
-    """从检出掩膜估计水印参考色：方向取掩膜中位色，幅度取写死表。
+    """从检出掩膜估计水印参考色：方向取实测色，幅度取写死表。
 
     写死色是“标准”水印色，真水印往往比它淡得多（拍屏幕照片的黄水印
     中位色 (194,206,182)，写死的“深黄”是 (255,226,130)，R 高出 60，
     反解时 R 会被多减、掩膜区越解越暗）。直接拿中位色当参考色也不行：
     它是水印和背景的混合色，幅度太小，α 被高估、框误差反而变差
-    （矩阵实测 3~10 倍）。折中：方向（色相）信实测中位色，幅度
+    （矩阵实测 3~10 倍）。折中：方向（色相）信实测色，幅度
     （|W-B|）信写死表——α 标定不变，R 不再多减。护栏：中位偏离太小
     或方向与写死色相反时返回 None（调用方退回写死表）。
+    方向取法分两档：整掩膜中位偏离 >= 15 时用它（掩膜干净、中位
+    就是水印色，最准）；偏离 < 15 时掩膜里混进大量底色像素、中位
+    被底色拉走（用户真图黄掩膜 39.5 万像素、中位与背景只差 (7,4,-1)，
+    估出的参考色贴近底色、反解残留 38%），改取偏离背景最大的前 10%
+    （至少 100 像素）的中位色——那才是水印笔画本身。
+    注：这里的 15 只是“中位色是否可信”的干净掩膜线，与检测偏离门
+    （现为 8）用途不同，数值相同纯属巧合，改一处时别误改另一处。
     """
     if det.mask is None or not det.mask.any() or det.bg is None:
         return None
     bg = np.asarray(det.bg, dtype=np.float32)
-    med = np.median(np.asarray(arr, dtype=np.float32)[det.mask], axis=0)
+    sub = np.asarray(arr, dtype=np.float32)[det.mask]
+    med = np.median(sub, axis=0)
+    if float(np.max(np.abs(med - bg))) < 15.0:
+        dev = np.max(np.abs(sub - bg), axis=1)
+        k = max(100, len(sub) // 10)
+        if len(sub) > k:
+            sub = sub[np.argpartition(dev, -k)[-k:]]
+        med = np.median(sub, axis=0)
     d = med - bg
     n = float(np.sqrt(np.dot(d, d)))
     wv = np.asarray(fixed_ref, dtype=np.float32) - bg
