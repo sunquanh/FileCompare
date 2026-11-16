@@ -696,6 +696,97 @@ class TestLightBoxes(unittest.TestCase):
             self.assertTrue(np.array_equal(fixed, arr))
 
 
+class TestMaskCap(unittest.TestCase):
+    """第九批：框内单色系掩膜上限（占框超 30% 就跳过该色系）。
+
+    注：本测试是烟雾测试——合成图上蓝掩膜最高只到约 28%，到不了 30%
+    门，触发不了上限。真正的验收以用户真图探针为准：用户框里蓝掩膜
+    占框 34.6%（>30%），修后应被跳过、黄水印获胜。"""
+
+    def _wave_photo(self, period=200, amp=60):
+        """蓝灰底 + 长周期蓝波 + 淡黄水印字 + 深色 SQL 文字。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        rng = np.random.default_rng(11)
+        H, Wd = 768, 1024
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(177, 208), (186, 221), (207, 241)]):
+            base[..., c] = a + (b - a) * t
+        wave = amp * np.sin(xx / period * 2 * np.pi)
+        base[..., 2] += wave
+        base[..., 0] -= wave * 0.4
+        base = np.clip(base, 0, 255)
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 24)
+            wmf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except Exception:
+            font = ImageFont.load_default(); wmf = font
+        for i in range(12):
+            d.text((40, 50 + i * 52), f"SELECT a{i} FROM t WHERE x = {i}", font=font, fill=(52, 52, 58, 255))
+        wm = Image.new("RGBA", (Wd, H), (0, 0, 0, 0))
+        dw = ImageDraw.Draw(wm)
+        dw.text((200, 150), "1102", font=wmf, fill=(180, 195, 130, 128))
+        wm = wm.rotate(-18, resample=Image.BICUBIC, center=(Wd // 2, H // 2))
+        img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(1))
+        arr = np.asarray(img).astype(np.float32)
+        arr = np.clip(arr + rng.normal(0, 8, arr.shape), 0, 255).astype(np.uint8)
+        return arr
+
+    def test_mask_cap_does_not_fire_below_threshold(self):
+        """蓝掩膜约 28%（<30%）：上限不触发，蓝仍获胜——门限确为 30%，不是更低。"""
+        import numpy as np
+        arr = self._wave_photo()
+        box = (0.15, 0.10, 0.55, 0.45)
+        det = W.detect_light_in_box(arr, box, source="box")
+        self.assertTrue(det.found)
+        self.assertEqual(det.tint, "蓝")
+        h, w = arr.shape[:2]
+        x0, y0 = int(box[0] * w), int(box[1] * h)
+        x1, y1 = int(box[2] * w), int(box[3] * h)
+        area = (x1 - x0) * (y1 - y0)
+        ratio = det.mask.sum() / area
+        self.assertLess(ratio, 0.30)
+        self.assertGreater(ratio, 0.20)
+
+    def test_normal_yellow_still_wins(self):
+        """无蓝波的正常图：黄水印仍获胜，上限没误伤正常检测。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        rng = np.random.default_rng(11)
+        H, Wd = 768, 1024
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(177, 208), (186, 221), (207, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 24)
+            wmf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except Exception:
+            font = ImageFont.load_default(); wmf = font
+        for i in range(12):
+            d.text((40, 50 + i * 52), f"SELECT a{i} FROM t WHERE x = {i}", font=font, fill=(52, 52, 58, 255))
+        wm = Image.new("RGBA", (Wd, H), (0, 0, 0, 0))
+        dw = ImageDraw.Draw(wm)
+        dw.text((200, 150), "1102", font=wmf, fill=(180, 195, 130, 128))
+        wm = wm.rotate(-18, resample=Image.BICUBIC, center=(Wd // 2, H // 2))
+        img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(1))
+        arr = np.asarray(img).astype(np.float32)
+        arr = np.clip(arr + rng.normal(0, 8, arr.shape), 0, 255).astype(np.uint8)
+        box = (0.15, 0.10, 0.55, 0.45)
+        det = W.detect_light_in_box(arr, box, source="box")
+        self.assertTrue(det.found)
+        self.assertIn(det.tint, ("黄", "深黄"))
+
+
 class TestDarkGuard(unittest.TestCase):
     """第五批：反解不该把背景打黑（横杠噪点护栏回归）。"""
 

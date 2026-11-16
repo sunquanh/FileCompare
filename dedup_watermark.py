@@ -1415,6 +1415,11 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
                 med_luma = 0.299 * med[0] + 0.587 * med[1] + 0.114 * med[2]
                 if bg_luma - med_luma > 30.0:
                     continue
+                # 掩膜上限门（逐色系）：单个色系掩膜占框超 30%，说明它是底色
+                # 渐变、不是水印——不让它参与赢家投票。否则蓝灰底会靠数量压过
+                # 真水印（实测：用户真图框里蓝掩膜占框 34.6%，黄水印只有几万像素）。
+                if count > (y1 - y0) * (x1 - x0) * 0.30:
+                    continue
             if count > best_count:
                 full_mask = np.zeros((height, width), dtype=bool)
                 full_mask[y0:y1, x0:x1] = local
