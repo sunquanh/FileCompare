@@ -5588,6 +5588,10 @@ class WatermarkPage(ToolPage):
             auto_card, t, "一键抠浅色水印", command=self.start_light,
             kind="secondary", height=36, size=10, padding=16, bg=t.CARD)
         self.btn_light.pack(fill="x")
+        self.btn_light_box = CanvasButton(
+            auto_card, t, "框选去浅色", command=self.start_light_boxes,
+            kind="secondary", height=36, size=10, padding=16, bg=t.CARD)
+        self.btn_light_box.pack(fill="x", pady=(s(8), 0))
         tk.Label(d, bg=t.CARD, fg=t.MUTED, font=t.font(8), anchor="w",
                  justify="left", wraplength=s(330),
                  text="自动找浅黄/浅色水印并反解掉：白底文档整张找，照片只在框里"
@@ -5921,6 +5925,7 @@ class WatermarkPage(ToolPage):
         self._cancel = threading.Event()
         self.btn_light.set_text("处理中…")
         self.btn_light.set_enabled(False)
+        self.btn_light_box.set_enabled(False)
         self.btn_run.set_enabled(False)
         self.app.set_status("正在抠浅色水印…", self.theme.ACCENT)
         total = len(photos)
@@ -5945,6 +5950,52 @@ class WatermarkPage(ToolPage):
 
         threading.Thread(target=work, daemon=True,
                          name="watermark-light").start()
+
+    def start_light_boxes(self):
+        """框选去浅色水印：只在拖好的框里反解，不跑自动检测，不整块补图。"""
+        if self.busy:
+            return
+        if not self.boxes:
+            self.app.toast("先在右边预览上拖框选出水印区", "warn")
+            return
+        photos = self._photos_cache
+        if photos is None:
+            photos = self._photos()
+        if not photos:
+            self.app.toast("先选照片或文件夹", "warn")
+            return
+        self._refresh_dir()
+        out_dir, where, subdir = self._output_plan(photos)
+        if out_dir is False:
+            return
+        self.busy = True
+        self._last_mode = "light"
+        self._cancel = threading.Event()
+        self.btn_light_box.set_text("处理中…")
+        self.btn_light_box.set_enabled(False)
+        self.btn_light.set_enabled(False)
+        self.btn_run.set_enabled(False)
+        self.app.set_status("正在框选去浅色水印…", self.theme.ACCENT)
+        total = len(photos)
+        cancel = self._cancel
+        boxes = list(self.boxes)
+
+        def work():
+            def prog(index, count, _path):
+                if index % 5 == 0 or index == count:
+                    self.app.post(("wm_progress",
+                                   (index, count, os.path.basename(_path))))
+            try:
+                result = wmark.batch_remove_light_boxes(
+                    photos, boxes, out_dir=out_dir, cancel=cancel,
+                    on_progress=prog, subdir=subdir)
+            except Exception as exc:
+                result = {"done": 0, "skipped": 0, "total": total,
+                          "failed": [(str(exc), str(exc))]}
+            self.app.post(("wm_done", (result, where)))
+
+        threading.Thread(target=work, daemon=True,
+                         name="watermark-light-box").start()
 
     def start(self):
         if self.busy:
@@ -5979,6 +6030,8 @@ class WatermarkPage(ToolPage):
         self._cancel = threading.Event()
         self.btn_run.set_text("处理中…")
         self.btn_run.set_enabled(False)
+        self.btn_light.set_enabled(False)
+        self.btn_light_box.set_enabled(False)
         self.app.set_status("正在去水印…", self.theme.ACCENT)
         total = len(photos)
         cancel = self._cancel
@@ -6010,6 +6063,9 @@ class WatermarkPage(ToolPage):
         self.btn_run.set_enabled(True)
         self.btn_light.set_text("一键抠浅色水印")
         self.btn_light.set_enabled(True)
+        if getattr(self, "btn_light_box", None) is not None:
+            self.btn_light_box.set_text("框选去浅色")
+            self.btn_light_box.set_enabled(True)
         done = result.get("done", 0)
         skipped = result.get("skipped", 0)
         failed = result.get("failed") or []
