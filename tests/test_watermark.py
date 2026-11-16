@@ -635,6 +635,42 @@ class TestDarkGuard(unittest.TestCase):
                 worst, 40.0 + 1e-6,
                 f"全局反解 tint={tint} 把像素打暗 {worst:.1f}（>40），护栏失效")
 
+    def test_oversized_mask_returns_unchanged(self):
+        """第七批：掩膜过大护栏——底色被误判成水印时不得处理。
+
+        用户真图探针：detect_tint 投“蓝”，detect_light_watermark 掩膜
+        51.80%（半张图都被当成水印），_flatten_background 把整片背景重铺，
+        暗像素 2.74%→11.38%。水印占比不会这么大，掩膜超 30% 就原样返回。
+        为触发文档路径，这里把 looks_like_photo 临时打桩成 False。
+        """
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        H, Wd = 600, 800
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(196, 208), (213, 221), (237, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 20)
+        except Exception:
+            font = ImageFont.load_default()
+        for i in range(15):
+            d.text((30, 30 + i * 34), f"SELECT col{i} FROM t WHERE x={i}",
+                   font=font, fill=(60, 60, 60))
+        arr = np.asarray(img).astype(np.uint8)
+        orig = W.looks_like_photo
+        W.looks_like_photo = lambda rgb, limit=25: False
+        try:
+            out, st = W.clean_light_watermark(arr)
+        finally:
+            W.looks_like_photo = orig
+        self.assertEqual(st.status, "unchanged")
+        self.assertTrue(np.array_equal(out, arr),
+                        "掩膜过大时应原样返回，一个像素都不该动")
+
     def test_one_click_does_not_create_dark_bars(self):
         """蓝灰底照片一键抠后，暗像素占比不得明显上涨（杠子就是暗像素暴涨）。"""
         import numpy as np
