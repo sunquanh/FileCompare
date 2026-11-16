@@ -1736,6 +1736,13 @@ def clean_light_watermark(rgb: np.ndarray):
     if not mask.any():
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
+    # 掩膜过大护栏：水印是盖在图上的小字/小图，占比不会大。掩膜占图超三成
+    # 说明检测把底色本身当成了水印（实测：拍屏幕照片的蓝灰底被投成“蓝”，
+    # 掩膜 51.8%），再往下反解+铺平会把整片背景重铺，铺平用的模糊背景一旦
+    # 沾到附近深色文字就整片打黑出横杠。直接原样返回，不处理。
+    if float(mask.mean()) > 0.30:
+        return (np.array(rgb, dtype=np.uint8, copy=True),
+                LightStatus("unchanged", "水印占比过大（疑似底色误判），未处理"))
     ref = _choose_tint_ref(rgb, mask, tint)
     first = undo_light_watermark(rgb, tint=tint, ref=ref)
     first = _flatten_background(first, mask)
