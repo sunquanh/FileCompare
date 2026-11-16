@@ -1938,6 +1938,80 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
             "total": total, "results": results, **counts}
 
 
+def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
+                            cancel=None, on_progress=None,
+                            subdir: bool = False) -> dict:
+    """批量框选去浅色水印：只在用户框里做浅色反解，不跑自动检测，不整块补图。
+
+    每个框走 reconstruct_light（allow_inpaint=False）：先反解，残留小补；
+    框里没水印就不动；框占图超 70% 或平铺水印会被拒。返回格式与
+    batch_remove_light 一致（results 是 [(原路径, 状态, 一句人话)]）。
+    """
+    paths = list(paths)
+    boxes = as_box_list(boxes) if boxes else []
+    done = skipped = 0
+    failed = []
+    results = []
+    counts = {"clean": 0, "partial": 0, "unchanged": 0, "rejected": 0}
+    total = len(paths)
+    for index, path in enumerate(paths, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        try:
+            target = output_path(path, target_dir(path, out_dir, subdir),
+                                 unique=False)
+            if target.exists():
+                skipped += 1
+            else:
+                with Image.open(path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    arr = np.asarray(im.convert("RGB"))
+                fixed = np.array(arr, dtype=np.uint8, copy=True)
+                notes = []
+                cleaned = False
+                rejected = None
+                for one in boxes:
+                    det = detect_light_in_box(arr, one, source="box")
+                    fixed, action, detail = reconstruct_light(
+                        fixed, one, det=det, allow_inpaint=False)
+                    if action == "rejected":
+                        rejected = detail
+                        notes.append(f"框已拒绝：{detail}")
+                    elif action in ("unblend", "fill"):
+                        cleaned = True
+                        notes.append(f"框：{detail}")
+                    # action "none"：框里没水印，不记
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not cleaned and np.array_equal(fixed, arr):
+                    shutil.copyfile(path, target)
+                    if rejected is not None:
+                        status = LightStatus("rejected", rejected)
+                    else:
+                        status = LightStatus("unchanged", "框里未找到浅色水印")
+                else:
+                    image = Image.fromarray(fixed, "RGB")
+                    if target.suffix.lower() in (".jpg", ".jpeg"):
+                        image.save(target, quality=quality, subsampling=0)
+                    elif target.suffix.lower() == ".webp":
+                        image.save(target, quality=quality)
+                    else:
+                        image.save(target)
+                    if rejected is not None and not cleaned:
+                        status = LightStatus("rejected", rejected)
+                    else:
+                        status = LightStatus(
+                            "clean", "；".join(notes) or "框内水印已反解")
+                results.append((str(path), status.status, status.detail))
+                counts[status.status] += 1
+                done += 1
+        except Exception as exc:
+            failed.append((str(path), str(exc)))
+        if on_progress is not None:
+            on_progress(index, total, str(path))
+    return {"done": done, "failed": failed, "skipped": skipped,
+            "total": total, "results": results, **counts}
+
+
 __all__ = [
     "LIGHT_REF",
     "METHOD_LABELS",
@@ -1947,6 +2021,7 @@ __all__ = [
     "as_box_list",
     "batch_remove",
     "batch_remove_light",
+    "batch_remove_light_boxes",
     "box_pixels",
     "clean_light_watermark",
     "detect_light_in_box",

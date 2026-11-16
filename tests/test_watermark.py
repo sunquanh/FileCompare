@@ -588,6 +588,114 @@ class TestRealPhoto(unittest.TestCase):
         self.assertEqual(fstatus.status, "partial")
 
 
+class TestLightBoxes(unittest.TestCase):
+    """第八批：框选去浅色水印（batch_remove_light_boxes）。"""
+
+    def _screen_photo(self):
+        """蓝灰底 + 淡黄斜字水印 + 深色 SQL 文字（与 TestRealPhoto 同款底）。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+        rng = np.random.default_rng(11)
+        H, Wd = 768, 1024
+        yy, xx = np.mgrid[0:H, 0:Wd].astype(np.float32)
+        t = (xx / Wd + yy / H) / 2
+        base = np.zeros((H, Wd, 3), dtype=np.float32)
+        for c, (a, b) in enumerate([(177, 208), (186, 221), (207, 241)]):
+            base[..., c] = a + (b - a) * t
+        img = Image.fromarray(base.astype(np.uint8))
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 24)
+            wmf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except Exception:
+            font = ImageFont.load_default(); wmf = font
+        for i in range(12):
+            d.text((40, 50 + i * 52), f"SELECT a{i} FROM t WHERE x = {i}", font=font, fill=(52, 52, 58, 255))
+        wm = Image.new("RGBA", (Wd, H), (0, 0, 0, 0))
+        dw = ImageDraw.Draw(wm)
+        dw.text((200, 150), "1102", font=wmf, fill=(180, 195, 130, 128))
+        wm = wm.rotate(-18, resample=Image.BICUBIC, center=(Wd // 2, H // 2))
+        img = Image.alpha_composite(img.convert("RGBA"), wm).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(1))
+        arr = np.asarray(img).astype(np.float32)
+        arr = np.clip(arr + rng.normal(0, 8, arr.shape), 0, 255).astype(np.uint8)
+        return arr
+
+    def test_box_light_removes_watermark_only_inside_box(self):
+        """框住水印字：框内水印去掉，框外一个像素不动。"""
+        import numpy as np
+        from PIL import Image
+        import tempfile
+        arr = self._screen_photo()
+        # 水印字“1102”约在 (200,150)-(500,300) 一带，框给大一点
+        box = (0.15, 0.10, 0.55, 0.45)
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "a.png"
+            Image.fromarray(arr).save(src)
+            out_dir = Path(td) / "out"
+            res = W.batch_remove_light_boxes([src], [box], out_dir=str(out_dir))
+            self.assertEqual(res["clean"], 1)
+            self.assertEqual(res["done"], 1)
+            fixed = np.asarray(Image.open(W.output_path(src, str(out_dir), unique=False)).convert("RGB"))
+            # 框内：必须有改动（水印被反解掉），且改动后框内像素离背景更近。
+            # 背景约 (195,205,225)：用框内像素与背景中位色的平均距离衡量。
+            h, w = arr.shape[:2]
+            x0, y0 = int(box[0] * w), int(box[1] * h)
+            x1, y1 = int(box[2] * w), int(box[3] * h)
+            bg = np.median(arr[y0:y1, x0:x1].reshape(-1, 3), axis=0)
+            before_d = np.abs(arr[y0:y1, x0:x1].astype(np.float32) - bg).mean()
+            after_d = np.abs(fixed[y0:y1, x0:x1].astype(np.float32) - bg).mean()
+            self.assertLess(after_d, before_d,
+                            "框内反解后应离背景更近（水印去掉）")
+            # 框外：逐像素相等
+            mask = np.ones(arr.shape[:2], dtype=bool)
+            mask[y0:y1, x0:x1] = False
+            self.assertTrue(np.array_equal(fixed[mask], arr[mask]),
+                            "框选去浅色不得动框外像素")
+
+    def test_oversized_box_reports_rejected(self):
+        """框占图超 70% 且框里有水印：应报 rejected（不是 unchanged），输出原样。"""
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        import tempfile
+        # 大字标准黄水印：框再大检测也能找到它，70% 门才会触发
+        H, Wd = 768, 1024
+        arr = np.zeros((H, Wd, 3), dtype=np.uint8) + 210
+        img = Image.fromarray(arr)
+        d = ImageDraw.Draw(img, "RGBA")
+        try:
+            f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 110)
+        except Exception:
+            f = ImageFont.load_default()
+        d.text((100, 300), "WATERMARK", font=f, fill=(252, 248, 196, 255))
+        arr = np.asarray(img.convert("RGB"))
+        box = (0.05, 0.05, 0.95, 0.95)  # 占图 81%，超 70% 门
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "a.png"
+            Image.fromarray(arr).save(src)
+            out_dir = Path(td) / "out"
+            res = W.batch_remove_light_boxes([src], [box], out_dir=str(out_dir))
+            self.assertEqual(res["rejected"], 1)
+            fixed = np.asarray(Image.open(W.output_path(src, str(out_dir), unique=False)).convert("RGB"))
+            self.assertTrue(np.array_equal(fixed, arr))
+
+    def test_box_without_watermark_unchanged(self):
+        """框里没水印：原样返回，状态 unchanged。"""
+        import numpy as np
+        from PIL import Image
+        import tempfile
+        arr = self._screen_photo()
+        box = (0.75, 0.75, 0.95, 0.95)  # 右下角空白底色，无水印
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "a.png"
+            Image.fromarray(arr).save(src)
+            out_dir = Path(td) / "out"
+            res = W.batch_remove_light_boxes([src], [box], out_dir=str(out_dir))
+            self.assertEqual(res["unchanged"], 1)
+            fixed = np.asarray(Image.open(W.output_path(src, str(out_dir), unique=False)).convert("RGB"))
+            self.assertTrue(np.array_equal(fixed, arr))
+
+
 class TestDarkGuard(unittest.TestCase):
     """第五批：反解不该把背景打黑（横杠噪点护栏回归）。"""
 
