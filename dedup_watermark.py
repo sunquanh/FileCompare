@@ -1896,8 +1896,8 @@ def _negligible_change(before: np.ndarray, after: np.ndarray) -> bool:
 # 拍屏幕出现的摩尔纹是两组周期性栅格（相机像素 × 屏幕像素）拍出来的差频，
 # 在频域里就是一对对远离中心的孤立谱峰，画面上是一层斜向彩色细条。它对浅色
 # 水印这一路有两个害处：多了层假纹理；而且条纹本身会被检测读成“淡色水印
-# 笔画”——实测一张合成屏摄页，流程会改动 2.5 万像素、留下 37 个被压暗 40 级
-# 以上的点。
+# 笔画”——实测一张合成屏摄页，流程会改动 2.5 万像素、留下 37 个被压暗到 40 级
+# （反解护栏上限）的点。
 #
 # 处理不必上模型：把谱峰（连同中心对称的那一个）在频谱上压掉即可，纯 numpy，
 # 一组谱峰一次 FFT。关键是**只在真的检出谱峰时才动手**——扫描件、纯文档页
@@ -1914,7 +1914,7 @@ def _moire_peaks(rgb: np.ndarray) -> list:
     裁片就够认出频率；而全图 FFT 在 12 MP 上要几秒、还要几百兆内存。归一化
     频率与裁片大小无关，拿到全图上照样能定位。
 
-    四道门，全过了才认：
+    五道门，全过了才认：
     - 离中心够远：low_frac=0.02 即周期 50 像素以内才算“条纹”，纸张渐变、
       光照不均这类慢变分量不算；
     - 纵向、横向分量都不为零：表格线、扫描行的谱峰落在 fx=0 / fy=0 的轴上
@@ -1924,16 +1924,20 @@ def _moire_peaks(rgb: np.ndarray) -> list:
     - **绝对幅度**：把谱峰换算成正弦幅度（幅度 A 的正弦，谱峰 |X| = A·N/2），
       要求 A ≥ min_amp·rms。只比环带的相对门在没有噪声的图上形同虚设：
       干净合成页上文字抗锯齿也能凑出“孤立尖峰”，但 A/rms 只有 0.05；
-      真摩尔纹的 A/rms 是 0.35~0.64（实测）。这一条是把它拦下来的关键。
+      真摩尔纹的 A/rms 是 0.35~1.06（实测）。这一条是把它拦下来的关键；
+    - **与最强峰同量级**：A ≥ share·A最强。文字被摩尔纹调制出的边带只有
+      最强峰的 0.15，压掉它们会在字形旁留下残影，反而被水印检测误读。
 
     先减掉 5×5 均值（去低频）再变换：谱峰位置不变，但 1/f 的底噪被压平，
     环带中位数才代表得了局部噪声；rms 也从这张高通图上算，量的是“条纹级”
     的起伏，而不是画面本身的明暗。
     """
     # 选峰参数：最多 8 个峰、峰/环带 ≥ 8 倍、正弦幅度 ≥ 0.15·rms、
-    # 周期 < 50 像素（low_frac=0.02）才算条纹、频谱在居中的 1024² 裁片上算
-    keep, ratio, min_amp, low_frac, crop = 8, 8.0, 0.15, 0.02, 1024
-    radius = MOIRE_RADIUS
+    # 只用最强峰的 1/4 以上、周期 < 50 像素（low_frac=0.02）才算条纹、
+    # 频谱在居中的 1024² 裁片上算
+    keep, ratio, min_amp, share = 8, 8.0, 0.15, 0.25
+    low_frac, crop, radius = 0.02, 1024, MOIRE_RADIUS
+    top = 0.0
     height, width = rgb.shape[:2]
     side = int(min(height, width, crop))
     if side < 64:
@@ -1970,8 +1974,17 @@ def _moire_peaks(rgb: np.ndarray) -> list:
         base = float(np.median(win[ring_sel]))
         if float(mag[py, px]) < ratio * max(base, 1e-6):
             break                     # 后面的峰只会更小，不用再看
-        if 2.0 * float(mag[py, px]) / float(side * side) < min_amp * rms:
+        amp = 2.0 * float(mag[py, px]) / float(side * side)
+        if amp < min_amp * rms:
             break                     # 绝对幅度不够：是纹素/抗锯齿的碎峰
+        # 占比门：摩尔纹是几组强干涉，峰与峰同量级；文字被摩尔纹调制出来的
+        # 边带只有最强峰的 0.14~0.15（实测 4.3 MP 屏摄页）。压这些边带等于
+        # 在字形周围挖掉一条窄频带，留下与水印笔画极像的周期残影——实测
+        # 多压这 4 个峰，水印流程就会把整页当成淡黄水印去反解（改 3.7 万
+        # 像素、报 clean）；不碰它们，同一张图原地不动。
+        if top > 0.0 and amp < share * top:
+            break
+        top = max(top, amp)
         peaks.append((float(fy[py, px]), float(fx[py, px])))
         work[py - radius:py + radius + 1,
              px - radius:px + radius + 1] = 0.0
