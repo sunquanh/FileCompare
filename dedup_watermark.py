@@ -833,6 +833,38 @@ def _robust_threshold(score: np.ndarray, floor: float = 3.0,
     return float(np.clip(4.0 * 1.4826 * mad, floor, cap))
 
 
+def _local_trend(score: np.ndarray, valid: np.ndarray,
+                 radius: int = 48) -> np.ndarray:
+    """局部“纸面基准”：只用 valid 像素算的归一化均值趋势。
+
+    score 减掉它就是相对周围纸面的偏色：整片彩色、渐变色块、整条高亮行
+    都是低频，减完归零，不再把全图门限抬上去，极淡的水印（只差 1.5~3）
+    也就不会再沉到门限以下；水印笔画是紧凑的高频结构，减完还剩大半。
+    和 detect_light_in_box 里“全投影减去自身模糊”是同一个思路，只是这里
+    在 1/8 分辨率上算趋势，12 MP 也只要几十毫秒。
+
+    为什么不按 128×128 分块取中位数：块内取常数、或把块中位数插值回去，
+    遇到“灰表头压着暖色纸”这种色调边界时整片暖纸相对基准都是正的（实测
+    15% 的画面被判成淡黄）；均值趋势下大块区域的残差为零，只剩边界一圈。
+    """
+    height, width = score.shape
+    step = 8 if min(height, width) >= 64 else 1
+    small = np.asarray(score[::step, ::step], dtype=np.float32)
+    vs = np.asarray(valid[::step, ::step], dtype=bool)
+    if not vs.any():
+        return np.zeros_like(score, dtype=np.float32)
+    r = max(2, int(round(radius / step)))
+    acc, cnt = _box_blur_known(small, vs, r)
+    trend = acc[..., 0]
+    # 窗口里没有 valid 像素（整片彩色/整块高亮）：退回全图中位，不能拿 0 当基准
+    trend = np.where(cnt >= 1, trend, float(np.median(small[vs])))
+    if step > 1:
+        # 趋势本来就是低频量，最近邻放大到原尺寸：8 像素一级台阶只有零点几
+        # 级色阶，够不着阈值
+        trend = np.repeat(np.repeat(trend, step, axis=0), step, axis=1)
+    return np.ascontiguousarray(trend[:height, :width], dtype=np.float32)
+
+
 def detect_tint(rgb: np.ndarray, gmin: int = 120,
                 luma_gate: float = 140.0, stats=None) -> str:
     """判断这张图上的浅色水印偏哪种颜色（黄/蓝/粉/绿），全没就返回空串。"""
@@ -845,8 +877,13 @@ def detect_tint(rgb: np.ndarray, gmin: int = 120,
     best, best_count = "", 0
     scores = _tint_scores(arr)
     for name, score in scores.items():
-        limit = _robust_threshold(score[pale])
-        count = int(((score > limit) & pale).sum())
+        # 减掉局部纸面趋势：整片彩色抬高不了门限，极淡的水印也能进投票
+        resid = score - _local_trend(score, pale)
+        limit = _robust_threshold(resid[pale], floor=2.0, cap=8.0)
+        # 还要“绝对方向上真的偏这个色”：局部基准只能说明它比周围纸面淡，
+        # 而彩色纸上的白字、高光边缘同样“更不像那个底色”（实测蓝灰底
+        # 屏幕照片会被投成淡黄），它们自身的偏色其实是 0。
+        count = int(((resid > limit) & pale & (score > 0.5)).sum())
         if count > best_count:
             best, best_count = name, count
     # 占比太小就不算水印（至少千分之一）
@@ -858,8 +895,10 @@ def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
                            tint=None, stats=None) -> np.ndarray:
     """找浅色（淡黄/淡蓝/淡粉/淡绿）半透明水印的像素。
 
-    判据：偏那种颜色 + 够亮 + 不饱和。低饱和是为了避开彩色 logo、选中框
-    这类真·彩色元素；阈值默认由图自身的噪声自动定，不再写死。
+    判据：相对周围纸面的偏色 + 够亮 + 不饱和。低饱和是为了避开彩色 logo、
+    选中框这类真·彩色元素；基准取局部纸面趋势（_local_trend），
+    所以整片彩色（图表、高亮行）不再把门限抬高，交替底色的表格上也能抓住
+    相对周围只差 1.5~3 的极淡水印；阈值仍由图自身的噪声自动定。
     """
     g = rgb[..., 1]
     luma, chroma = stats if stats is not None else _luma_chroma(rgb)
@@ -870,8 +909,14 @@ def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
         return np.zeros(luma.shape, dtype=bool)
     arr = rgb.astype(np.float32)
     score = _tint_score(arr, name)
-    limit = float(diff) if diff is not None else _robust_threshold(score[pale])
-    return (score > limit) & pale
+    if diff is not None:
+        # 复检残影时调用方给的是绝对差门（要问“还剩多少偏色”），照旧直接用
+        return (score > float(diff)) & pale
+    resid = score - _local_trend(score, pale)
+    limit = _robust_threshold(resid[pale], floor=2.0, cap=8.0)
+    # 绝对方向门（同 detect_tint）：彩色底上的白字/高光“比周围纸面淡”，
+    # 但它自己并不偏这个色，偏色量≈0，不能当成水印
+    return (resid > limit) & pale & (score > 0.5)
 
 
 def estimate_tint_ref(rgb: np.ndarray, mask: np.ndarray,
@@ -946,7 +991,8 @@ def _choose_tint_ref(rgb: np.ndarray, mask: np.ndarray, tint: str,
                  + np.asarray(estimated, dtype=np.float32)) * 0.5)
     best, best_cost = base, float("inf")
     for ref in (base, estimated, mid):
-        fixed = undo_light_watermark(probe_rgb, strength, ref=ref, tint=tint)
+        fixed = undo_light_watermark(probe_rgb, strength, ref=ref, tint=tint,
+                                     mask=probe_mask)
         cost = float(np.abs(_tint_score(fixed.astype(np.float32),
                                         tint)[probe_mask]).mean())
         if cost < best_cost:
@@ -978,8 +1024,7 @@ def _run_lengths(mask: np.ndarray):
     return run_row, run_col
 
 
-def _neutral_mask(rgb: np.ndarray, max_run: int = 60,
-                  stats=None) -> np.ndarray:
+def _neutral_mask(rgb: np.ndarray, stats=None) -> np.ndarray:
     """淡灰色水印：没有偏色，只是比纸面暗一点点。
 
     难点：灰色网格线和灰色水印亮度几乎一样，只能看形状——网格线很长、
@@ -990,7 +1035,30 @@ def _neutral_mask(rgb: np.ndarray, max_run: int = 60,
     deficit = background - luma
     candidate = (chroma < 6.0) & (deficit > 1.5) & (deficit < 40.0)
     run_row, run_col = _run_lengths(candidate)
-    return candidate & (run_row < max_run) & (run_col < max_run)
+    # 60 像素以上的连续段算“长直线”（表格线、扫描行），不算笔画
+    return candidate & (run_row < 60) & (run_col < 60)
+
+
+def _near_dark(mask: np.ndarray, luma: np.ndarray, radius: int = 8) -> np.ndarray:
+    """掩膜里的像素附近有没有深色内容（正文笔画、表格线、阴影）。
+
+    重铺背景是从 ~mask 估出来的平滑色，铺到“字的抗锯齿边”上就是把字刷掉
+    一半：合成文字页实测 10536 个 AA 像素被重铺，改动中位 73 级。AA 边在
+    亮度/色度上和淡灰水印一模一样（中性、比纸暗二十几级），唯一的分界是
+    位置——水印盖在空白纸上，AA 边紧贴笔画。
+    大图降到 1/2 分辨率算（同 _flatten_background 与残影补洞那两处），半径
+    同步减半；只看附近的已知像素（掩膜自身不算“深色内容”，否则粗笔画会
+    自己把自己挡住）。
+    """
+    known = ~mask
+    step = 2 if luma.size > 4_000_000 else 1
+    known_small = known[::step, ::step]
+    dark_small = (luma[::step, ::step] < 145) & known_small
+    frac = _box_blur_known(dark_small.astype(np.float32), known_small,
+                           max(3, radius // step))[0][..., 0]
+    if step > 1:
+        frac = _upsample2(frac, luma.shape)
+    return frac > 0.0
 
 
 def _nearest4_fill(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -1046,52 +1114,119 @@ def _nearest4_fill(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
-def _safe_den(value: float) -> float:
-    """反解分母的下限保护：绿色参考色的 Wr-Wb 正好是 0，直接除会出 inf。"""
-    if abs(value) >= 4.0:
-        return value
-    return 4.0 if value >= 0 else -4.0
+def _undo_exclude(arr: np.ndarray, ref: np.ndarray, luma: np.ndarray,
+                  mask) -> np.ndarray:
+    """估局部背景时要排除的像素：给了掩膜就用它，没给就先粗找一遍。
+
+    背景里一旦混进水印色，B̂ 被拉向水印，α 系统性偏小、解不干净，所以
+    排除区必须比掩膜略大（膨胀 2 像素把抗锯齿边缘一起排除）。
+    没传掩膜时用最亮的一成像素当纸面粗估 α，把明显偏色的像素当排除区：
+    只是个引导量，不求准，够让第一版 B̂ 落在纸上就行。
+    """
+    if mask is not None:
+        return _grow_mask(np.asarray(mask, dtype=bool), 2)
+    paper = np.median(arr[luma >= np.percentile(luma, 90.0)], axis=0)
+    w = ref - paper
+    den = float(np.dot(w, w))
+    if den < 64.0:
+        return np.zeros(luma.shape, dtype=bool)
+    return (arr - paper) @ w / den > 0.05
+
+
+def _local_paper(arr: np.ndarray, unknown: np.ndarray, radius: int = 12):
+    """只用水印外的已知像素估局部底层色 B̂（纸面、灰表头、暖色底都算进来）。
+
+    _box_blur_known 是归一化盒滤波：窗口里没有已知像素的位置会摊到最近的
+    已知色上，所以水印笔画很密（60 px 大字）时也能越过笔画取到两侧纸面。
+    大图降一半分辨率算——B̂ 本来就是平滑量，省掉 3/4 的积分图开销。
+    返回 (background, count)；没有可用像素时返回 None。
+    """
+    known = ~unknown
+    height, width = arr.shape[:2]
+    if int(known.sum()) < 64:
+        return None
+    if known.size <= 1_000_000:
+        return _box_blur_known(arr, known, radius)
+    # B̂ 是“这张纸是什么颜色”级别的平滑量：1/2、1/4 分辨率都够用，而三通道
+    # 积分图的代价按面积走，12 MP 上 1/4 比分半又快一倍
+    step = 2 if known.size <= 4_000_000 else 4
+    sub = arr[::step, ::step]
+    background, count = _box_blur_known(sub, known[::step, ::step],
+                                        max(2, radius // step))
+    background = np.repeat(np.repeat(background, step, axis=0), step, axis=1)
+    count = np.repeat(np.repeat(count, step, axis=0), step, axis=1)
+    return background[:height, :width], count[:height, :width]
 
 
 def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
-                        ref=None, tint=None) -> np.ndarray:
+                        ref=None, tint=None, mask=None) -> np.ndarray:
     """把半透明浅色水印“解”掉，而不是“补”掉。
 
-    I = (1-α)·背景 + α·参考色，背景（纸张、表格底）近似中性，于是
-    α 可以由 (R-B)/(Wr-Wb)、(G-B)/(Wg-Wb) 估出来，再反解背景。
-    这样文字和表格线的像素压根没被动过，不会留下补图常见的暗边。
-    strength 是修正强度（1.0 全解，0.5 只解一半），改小可以少伤原图的暖色调。
-    ref 显式传入时优先（传自估值）；否则按 tint 查固定表。
+    I = (1-α)·B + α·W，逐像素用局部背景 B̂ 做投影估 α：
+    α = ⟨I-B̂, W-B̂⟩ / ‖W-B̂‖²，再反解 B = (I - αW)/(1-α)。
+
+    为什么必须用局部 B̂：原先把背景当中性色，直接拿 (R-B)/(Wr-Wb)、
+    (G-B)/(Wg-Wb) 的均值估 α，等于丢掉 (1-α)(Br-Bb) —— 灰表头、淡蓝底、
+    暖色纸上 α 全估偏，只能靠 clip((luma-200)/40, 0.35, 1) 硬压修正强度，
+    表头亮度 210~225 时只有 0.35 的力度，黄印解不干净、还留一道浅影。
+    换成局部背景后，背景自身的色偏被投影吸收，那个补偿系数整个不需要了。
+
+    中性变暗（灰色表格线、阴影）不能当成水印：它的色度偏离是 0，投影却
+    因为 ‖W-B̂‖ 里那个大负分量而偏大，所以再加一道色度同向门——只认色度
+    往 W 那边偏的像素，正文和表格线压根不动。
+    strength 是修正强度（1.0 全解，0.5 只解一半）。
+    ref 显式传入时优先（传自估值）；否则按 tint 查固定表。mask 是水印像素
+    （不给就自己粗找，见 _undo_exclude）。
     """
     if ref is None:
         ref = TINT_REFS.get(tint, LIGHT_REF) if tint else LIGHT_REF
     arr = rgb.astype(np.float32)
-    # 护栏用原像素亮度：反解后比原像素暗超 40 的视为参考色估错，直接保留原值
-    # （蓝灰底被误认成蓝水印、亮参考色反解时，(I-αW)/(1-α) 会把背景打成近黑
-    # 的横杠；正常反解是把水印色往背景推，结果不会比原像素暗，只会更亮或相近）。
-    orig_luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    wr, wg, wb = float(ref[0]), float(ref[1]), float(ref[2])
-    luma = 0.299 * r + 0.587 * g + 0.114 * b
-    # 灰底（例如表格表头）上反解容易把灰色解出色斑，亮度越低解越少
-    scale = np.clip((luma - 200.0) / 40.0, 0.35, 1.0) * float(strength)
-    alpha = ((r - b) / _safe_den(wr - wb)
-             + (g - b) / _safe_den(wg - wb)) * 0.5 * scale
-    alpha = np.clip(alpha, 0.0, 0.6, out=alpha)
+    wref = np.asarray(ref, dtype=np.float32)
+    luma = np.tensordot(arr, _LUMA_WEIGHTS, axes=([2], [0]))
+    unknown = _undo_exclude(arr, wref, luma, mask)
+    paper = _local_paper(arr, unknown, 12)
+    if paper is None:
+        return np.array(rgb, dtype=np.uint8, copy=True)   # 全图都是“水印”：无从反解
+    background, count = paper
+    lost = count <= 0
+    if lost.any():
+        # 窗口里一个已知像素都没有（整片都被排除）：退回整图中位色，
+        # 别拿积分图的 0 当纸面（那会把像素解到溢出）
+        rest = arr[~unknown]
+        background[lost] = (np.median(rest, axis=0) if rest.size
+                            else arr.mean(axis=(0, 1)))
+    w = wref - background
+    den = np.einsum("ijk,ijk->ij", w, w)
+    dev = arr - background
+    dot = np.einsum("ijk,ijk->ij", dev, w)
+    alpha = np.clip(dot / np.maximum(den, 64.0) * float(strength), 0.0, 0.6)
     alpha[(luma < 150.0) | (alpha < 0.015)] = 0.0
+    if mask is None:
+        # 没有掩膜时会整幅反解，必须挡掉“中性变暗”（灰色表格线、阴影）：
+        # 它们的色度偏离是 0，投影却因为 ‖W-B̂‖ 里那个大负分量而偏大。
+        # 色度同向门 = Σ_c(dev_c-d̄)(w_c-w̄) = dev·w - 3·d̄·w̄，不用另开数组。
+        # 有掩膜时已经限定在掩膜内，这一趟 12 MP 的求均值可以省掉。
+        chroma_dot = dot - 3.0 * (dev.mean(axis=2) * w.mean(axis=2))
+        alpha[chroma_dot <= 0.0] = 0.0
+    if mask is not None:
+        # 只在“水印像素（含抗锯齿外扩一圈）”上反解：局部背景在色调边界上
+        # 必然估不准，放开就是边界两侧互相“纠正”、把好像素洗出色偏。
+        # 掩膜外的像素本来就该一个都不动。
+        alpha[~unknown] = 0.0
     denom = np.clip(1.0 - alpha, 0.05, 1.0)
     # 逐通道就地在 arr 上算：(arr - α·W) / (1-α)。原来走的是
     # (arr - alpha[...,None]*W)/denom[...,None]，要多开两个 12 MP×3 通道的
     # 临时数组（各 144 MB），整次反解 0.7 秒里一半花在分配和填零上。
-    for ch, wc in ((arr[..., 0], wr), (arr[..., 1], wg), (arr[..., 2], wb)):
+    for ch, wc in ((arr[..., 0], wref[0]), (arr[..., 1], wref[1]),
+                   (arr[..., 2], wref[2])):
         np.subtract(ch, alpha * wc, out=ch)
         np.divide(ch, denom, out=ch)
     np.clip(arr, 0, 255, out=arr)
-    # 护栏：反解不该把像素打得比原像素暗太多。只拦 alpha>0 的像素（没动的
-    # 本来就不会暗）；暗超 40 的恢复原值。
-    fixed_luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    too_dark = (alpha > 0) & (fixed_luma < orig_luma - 40.0)
-    arr[too_dark] = rgb.astype(np.float32)[too_dark]
+    # 护栏：反解不该把像素打得比原像素暗太多（参考色估错、蓝灰底被误认成
+    # 蓝水印时，(I-αW)/(1-α) 会把背景打成近黑）。暗超 40 的恢复原值。
+    fixed_luma = np.tensordot(arr, _LUMA_WEIGHTS, axes=([2], [0]))
+    too_dark = (alpha > 0) & (fixed_luma < luma - 40.0)
+    arr[too_dark] = rgb[too_dark]
     return arr.astype(np.uint8)
 
 
@@ -1164,20 +1299,21 @@ def _flatten_background(fixed: np.ndarray, mask: np.ndarray) -> np.ndarray:
     # 12 MP 上两次三通道积分图从 4.5 秒降到 1.2 秒，肉眼看不出差别。
     step = 2 if luma.size > 4_000_000 else 1
     if step > 1:
-        background = _upsample2(
-            _box_blur_known(fixed[::step, ::step], known[::step, ::step], 6)[0],
-            fixed.shape[:2])
-        dark_small = ((luma[::step, ::step] < 145)
-                      & known[::step, ::step]).astype(np.float32)
-        dark_frac = _upsample2(
-            _box_blur_known(dark_small, known[::step, ::step], 5)[0][..., 0],
-            luma.shape)
+        background, count = _box_blur_known(
+            fixed[::step, ::step], known[::step, ::step], 6)
+        background = _upsample2(background, fixed.shape[:2])
+        # 半分辨率上抽样的 known 与全分辨率不是一一对应的：某个位置周围
+        # 其实有已知像素，它的抽样格却可能整格都是“未知”。计数为 0 的格子
+        # 拿到的是积分图的 0，铺上去就是纯黑——所以计数也要一起放大回来。
+        count = _upsample2(count, fixed.shape[:2])
     else:
-        background, _ = _box_blur_known(fixed, known, 12)
-        dark = ((luma < 145) & known).astype(np.float32)
-        dark_frac = _box_blur_known(dark, known, 10)[0][..., 0]
+        background, count = _box_blur_known(fixed, known, 12)
     std = _local_std(luma, 6)
-    flat = (std < 0.8) & (dark_frac <= 1e-6) & (luma > 195) & grow
+    # count == 0 表示窗口里一个已知像素都没有（周围一整圈都是掩膜），
+    # 这时盒滤波拿到的是积分图的 0，铺上去就是一片黑——“打黑出横杠”的
+    # 根源之一，直接不填。
+    flat = ((std < 0.8) & ~_near_dark(grow, luma, 10) & (luma > 195) & grow
+            & (count > 0))
     out = fixed.astype(np.float32)
     out[flat] = background[flat]
     np.clip(out, 0, 255, out=out)
@@ -1709,8 +1845,211 @@ def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
     return merged
 
 
+def _thin_strokes(mask: np.ndarray) -> np.ndarray:
+    """只留“笔画”：长游程占多数的检测直接不认，零星长带像素丢掉。
+
+    半透明水印是细笔画，横竖游程都短；“灰表头压着暖色纸”这种色调边界、
+    整条高亮行、整块色块是一整条长带（游程几百上千）。局部基准对色调
+    边界天生敏感（暖纸相对灰表头就是“淡黄”），没有这一道，边界那一圈
+    会被当成水印，反解时把暖纸洗成冷调（实测 15% 画面被改、最大差 62 级）。
+    门限随图幅走：小图 64 像素起，大图放到 1/16 边长的级别，60 px 字号的
+    笔画仍然过得去。长带占多数时整格返回空掩膜——宁可不动，也不把底色
+    当水印洗一遍。
+    """
+    if not mask.any():
+        return mask
+    height, width = mask.shape
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    # 只在掩膜的包围盒里算游程：边角水印是常见情形，全图算白花两秒
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    crop = mask[y0:y1, x0:x1]
+    limit = max(64, min(height, width) // 16)
+    run_row, run_col = _run_lengths(crop)
+    band = (run_row >= limit) | (run_col >= limit)
+    # 分母是掩膜像素本身，不是包围盒：包围盒里大片空白会把比例稀释掉
+    if float(band.sum()) > 0.5 * float(crop.sum()):
+        return np.zeros_like(mask)
+    out = np.zeros_like(mask)
+    out[y0:y1, x0:x1] = crop & ~band
+    return out
+
+
+def _negligible_change(before: np.ndarray, after: np.ndarray) -> bool:
+    """改完几乎没动过（只有零星几个像素差一两级）就别声称清理成功。
+
+    块内基准比全图基准灵敏：白字、高光的抗锯齿边缘在彩色底上也会被读成
+    “相对纸面偏色”，这些像素在反解时都被“不许变暗”的护栏拦回去了，真正
+    落地的改动只剩个位数色阶。这种情况如实报“未找到”，并且原样返回——
+    “没水印的图一个像素都不动”这条不变量比“报个 clean”重要。
+    """
+    cut_before, cut_after = before[::2, ::2], after[::2, ::2]
+    diff = np.abs(np.subtract(np.asarray(cut_after), np.asarray(cut_before),
+                              dtype=np.int16))
+    changed = int((diff.max(axis=2) > 2).sum())
+    # 抽样后阈值同比例缩回去（2×2 抽样，像素数少 4 倍）
+    return changed <= max(16, cut_before.shape[0] * cut_before.shape[1] // 2000)
+
+
+# ------------------------------------------------------- 屏摄水波纹（摩尔纹）
+# 拍屏幕出现的摩尔纹是两组周期性栅格（相机像素 × 屏幕像素）拍出来的差频，
+# 在频域里就是一对对远离中心的孤立谱峰，画面上是一层斜向彩色细条。它对浅色
+# 水印这一路有两个害处：多了层假纹理；而且条纹本身会被检测读成“淡色水印
+# 笔画”——实测一张合成屏摄页，流程会改动 2.5 万像素、留下 37 个被压暗 40 级
+# 以上的点。
+#
+# 处理不必上模型：把谱峰（连同中心对称的那一个）在频谱上压掉即可，纯 numpy，
+# 一组谱峰一次 FFT。关键是**只在真的检出谱峰时才动手**——扫描件、纯文档页
+# 没有这种孤立斜峰，一个像素都不碰。
+
+MOIRE_STRENGTH = 0.9      # 陷波后保留的幅度比例（0.9 = 压掉九成）
+MOIRE_RADIUS = 3          # 陷波半径（全图频谱上的像素）
+
+
+def _moire_peaks(rgb: np.ndarray) -> list:
+    """找摩尔纹谱峰，返回归一化频率 [(fy, fx), ...]（周期/像素），最多 8 个。
+
+    只在居中的 crop×crop 裁片上看频谱：摩尔纹是遍布全图的寄生条纹，一小块
+    裁片就够认出频率；而全图 FFT 在 12 MP 上要几秒、还要几百兆内存。归一化
+    频率与裁片大小无关，拿到全图上照样能定位。
+
+    四道门，全过了才认：
+    - 离中心够远：low_frac=0.02 即周期 50 像素以内才算“条纹”，纸张渐变、
+      光照不均这类慢变分量不算；
+    - 纵向、横向分量都不为零：表格线、扫描行的谱峰落在 fx=0 / fy=0 的轴上
+      （实测合成页的行距 34 px 峰就在 fy=0.029、fx=0），摩尔纹是斜的，
+      这一条把两者分开；
+    - 峰值比同半径环带的中位数高 ratio 倍：真条纹是尖峰，噪声毛刺不是；
+    - **绝对幅度**：把谱峰换算成正弦幅度（幅度 A 的正弦，谱峰 |X| = A·N/2），
+      要求 A ≥ min_amp·rms。只比环带的相对门在没有噪声的图上形同虚设：
+      干净合成页上文字抗锯齿也能凑出“孤立尖峰”，但 A/rms 只有 0.05；
+      真摩尔纹的 A/rms 是 0.35~0.64（实测）。这一条是把它拦下来的关键。
+
+    先减掉 5×5 均值（去低频）再变换：谱峰位置不变，但 1/f 的底噪被压平，
+    环带中位数才代表得了局部噪声；rms 也从这张高通图上算，量的是“条纹级”
+    的起伏，而不是画面本身的明暗。
+    """
+    # 选峰参数：最多 8 个峰、峰/环带 ≥ 8 倍、正弦幅度 ≥ 0.15·rms、
+    # 周期 < 50 像素（low_frac=0.02）才算条纹、频谱在居中的 1024² 裁片上算
+    keep, ratio, min_amp, low_frac, crop = 8, 8.0, 0.15, 0.02, 1024
+    radius = MOIRE_RADIUS
+    height, width = rgb.shape[:2]
+    side = int(min(height, width, crop))
+    if side < 64:
+        return []
+    y0 = (height - side) // 2
+    x0 = (width - side) // 2
+    gray = np.tensordot(rgb[y0:y0 + side, x0:x0 + side].astype(np.float32),
+                        _LUMA_WEIGHTS, axes=([2], [0]))
+    gray = gray - _blur_f(gray, 2)
+    rms = float(np.sqrt((gray ** 2).mean()))
+    mag = np.abs(np.fft.fftshift(np.fft.fft2(gray)))
+    cy, cx = side // 2, side // 2
+    ys = (np.arange(side) - cy) / float(side)
+    xs = (np.arange(side) - cx) / float(side)
+    fy = ys[:, None] + np.zeros((1, side), dtype=np.float32)
+    fx = xs[None, :] + np.zeros((side, 1), dtype=np.float32)
+    # 低频盘和两条轴带都不参与选峰
+    work = np.where((fy ** 2 + fx ** 2 > low_frac ** 2)
+                    & (np.abs(fy) > 0.01) & (np.abs(fx) > 0.01), mag, 0.0)
+    r_out = 8 * radius
+    grid_y = np.arange(2 * r_out + 1)
+    dist = np.sqrt((grid_y[:, None] - r_out) ** 2
+                   + (grid_y[None, :] - r_out) ** 2)
+    ring_sel = (dist >= 4 * radius) & (dist <= r_out)
+    peaks = []
+    for _ in range(keep):
+        idx = int(np.argmax(work))
+        if work.flat[idx] <= 0.0:
+            break
+        py, px = divmod(idx, side)
+        if py < r_out or py >= side - r_out or px < r_out or px >= side - r_out:
+            break                     # 贴边的峰算不出环带底噪，不认
+        win = mag[py - r_out:py + r_out + 1, px - r_out:px + r_out + 1]
+        base = float(np.median(win[ring_sel]))
+        if float(mag[py, px]) < ratio * max(base, 1e-6):
+            break                     # 后面的峰只会更小，不用再看
+        if 2.0 * float(mag[py, px]) / float(side * side) < min_amp * rms:
+            break                     # 绝对幅度不够：是纹素/抗锯齿的碎峰
+        peaks.append((float(fy[py, px]), float(fx[py, px])))
+        work[py - radius:py + radius + 1,
+             px - radius:px + radius + 1] = 0.0
+    return peaks
+
+
+def moire_notch(rgb: np.ndarray) -> tuple:
+    """屏摄水波纹陷波：只在检出谱峰时动手。
+
+    返回 (image, detail)。detail 为空字符串表示“没检出谱峰，原样返回”——
+    这时返回的是副本，像素与原图逐一相同。
+
+    陷波是在频域乘一个掩膜：每个谱峰连同中心对称的共轭峰，在半径
+    MOIRE_RADIUS 的圆盘上乘 (1-MOIRE_STRENGTH)。对实图来说谱必然是中心对称
+    的，只压一边会算出复数残差，所以两边都要压。
+
+    代价与分辨率成正比：12 MP 上三通道各一次 fft2，约 3~4 秒、峰值内存约
+    600 MB，且只在真检出摩尔纹时才走这条路。压掉之后再用实际改动量复核一遍
+    （标准差 < 0.5 级就当没动），免得“检出了但压不动”的图被白白重存一次。
+    """
+    peaks = _moire_peaks(rgb)
+    if not peaks:
+        return np.array(rgb, dtype=np.uint8, copy=True), ""
+    arr = rgb.astype(np.float32)
+    height, width = arr.shape[:2]
+    cy, cx = height // 2, width // 2
+    keep = np.float32(1.0 - MOIRE_STRENGTH)
+    band = MOIRE_RADIUS
+    mask = np.ones((height, width), dtype=np.float32)
+    for peak_y, peak_x in peaks:
+        for sign in (1, -1):
+            py = cy + int(round(sign * peak_y * height))
+            px = cx + int(round(sign * peak_x * width))
+            y0, y1 = max(0, py - band), min(height, py + band + 1)
+            x0, x1 = max(0, px - band), min(width, px + band + 1)
+            gy = np.arange(y0, y1) - py
+            gx = np.arange(x0, x1) - px
+            cut = (gy[:, None] ** 2 + gx[None, :] ** 2) <= band * band
+            sub = mask[y0:y1, x0:x1]
+            sub[cut] = np.minimum(sub[cut], keep)
+    out = np.empty_like(arr)
+    for channel in range(3):
+        spec = np.fft.fftshift(np.fft.fft2(arr[..., channel]))
+        spec *= mask
+        out[..., channel] = np.real(np.fft.ifft2(np.fft.ifftshift(spec)))
+    np.clip(out, 0, 255, out=out)
+    fixed = np.rint(out).astype(np.uint8)
+    removed = fixed.astype(np.float32) - arr
+    # 复核两道：压掉的量太小，或者改动只落在画面一小块里，都不算摩尔纹——
+    # 摩尔纹是整幅铺开的寄生条纹，改动必然遍布全图（实测干净页覆盖 0%，
+    # 合成屏摄页 100%）。这一步挡住“检出了但其实是局部网点/花斑”的误动。
+    cover = float((np.abs(removed).max(axis=2) > 1.0).mean())
+    if float(removed.std()) < 0.5 or cover < 0.15:
+        return np.array(rgb, dtype=np.uint8, copy=True), ""
+    return fixed, f"屏摄水波纹已陷波（{len(peaks)} 组频率）"
+
+
 def clean_light_watermark(rgb: np.ndarray):
-    """浅色水印一键流程：认出色调 → 反解 → 铺平平坦背景 → 补掉残影。
+    """浅色水印一键流程：屏摄水波纹陷波 → 认出色调 → 反解 → 补残影。
+
+    水波纹是前置的一级，只在检出谱峰时生效（见 moire_notch）。放在反解之前
+    是因为条纹比水印笔画强得多，夹在里面会把“相对局部背景的偏离”整片抬高，
+    检测阈值跟着水涨船高，淡色水印反而认不出来。
+    状态语义不变：unchanged 仍然是“没找到水印”的结论，水波纹压掉了会在
+    detail 里写明，免得调用方以为这张图一个像素都没动。
+    """
+    notched, moire_detail = moire_notch(rgb)
+    fixed, status = _clean_light_core(notched)
+    if not moire_detail:
+        return fixed, status
+    if status.status == "unchanged":
+        return fixed, LightStatus("unchanged", f"{moire_detail}，未找到水印")
+    return fixed, LightStatus(status.status,
+                              f"{status.detail}；{moire_detail}".lstrip("；"))
+
+
+def _clean_light_core(rgb: np.ndarray):
+    """浅色水印本体流程（不含水波纹陷波，见 clean_light_watermark）。
 
     彩色淡色水印走反解；完全没偏色的淡灰水印走“平坦区重铺背景”。
     返回 (image, LightStatus)：照片走网格检测 + 统一重建决策
@@ -1757,6 +2096,14 @@ def clean_light_watermark(rgb: np.ndarray):
         if neutral.mean() > 0.05:
             return (np.array(rgb, dtype=np.uint8, copy=True),
                     LightStatus("unchanged", "疑似照片纹理，未处理"))
+        # 邻域深色门：淡灰水印是盖在空白纸上的小字，四下没有深色内容；
+        # 文字的抗锯齿边同样“中性、比纸暗”，却紧贴着笔画。合成文字页实测
+        # 掩膜 10536 像素全是 AA 边（2 万多的重铺改动、中位 73 级），这一道
+        # 把它们全部排掉后该页一个像素不动。
+        neutral &= ~_near_dark(neutral, stats[0])
+        if int(neutral.sum()) < max(300, neutral.size // 500):
+            return (np.array(rgb, dtype=np.uint8, copy=True),
+                    LightStatus("unchanged", "未找到浅色水印"))
         grow = _grow_mask(neutral, 2)
         background, _ = _box_blur_known(rgb, ~grow, 10)
         out = rgb.astype(np.float32)
@@ -1764,7 +2111,7 @@ def clean_light_watermark(rgb: np.ndarray):
         return (np.clip(out, 0, 255).astype(np.uint8),
                 LightStatus("clean", "淡灰水印已重铺背景"))
 
-    mask = detect_light_watermark(rgb, tint=tint, stats=stats)
+    mask = _thin_strokes(detect_light_watermark(rgb, tint=tint, stats=stats))
     if not mask.any():
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
@@ -1776,7 +2123,9 @@ def clean_light_watermark(rgb: np.ndarray):
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "水印占比过大（疑似底色误判），未处理"))
     ref = _choose_tint_ref(rgb, mask, tint)
-    first = undo_light_watermark(rgb, tint=tint, ref=ref)
+    # 把掩膜一起传下去：局部背景 B̂ 只从水印外的像素估，混进水印色会把
+    # B̂ 拉向水印、α 系统性偏小
+    first = undo_light_watermark(rgb, tint=tint, ref=ref, mask=mask)
     first = _flatten_background(first, mask)
     # 反解后的亮度/色度算一次就够：残影检测与紧跟的“附近有没有深色内容”
     # 都要用同一张图，不传下去就是同一次归约算两遍（12 MP 约 0.5 秒）。
@@ -1787,34 +2136,43 @@ def clean_light_watermark(rgb: np.ndarray):
     if residual.any():
         # 文字、表格线旁边不补：那里的“残余黄点”其实是笔画自身的抗锯齿边缘，
         # 补下去会把字吐成毛边（实测表头字母会被吞出锯齿）
-        known = ~residual
-        luma = stats2[0]
-        # 又是“附近有没有深色内容”的均值判定：1/2 分辨率算，半径同步减半
-        step = 2 if luma.size > 4_000_000 else 1
-        small = luma[::step, ::step] < 145
-        known_small = known[::step, ::step]
-        dark_frac = _box_blur_known(
-            (small & known_small).astype(np.float32), known_small,
-            max(3, 8 // step))[0][..., 0]
-        if step > 1:
-            dark_frac = _upsample2(dark_frac, luma.shape)
-        residual &= dark_frac <= 0.0
+        residual &= ~_near_dark(residual, stats2[0])
     if residual.any():
         residual = _grow_mask(residual, 1)
-        return (_nearest4_fill(first, residual),
-                LightStatus("clean", f"{tint}色水印已反解"))
+        first = _nearest4_fill(first, residual)
+    if _negligible_change(rgb, first):
+        return (np.array(rgb, dtype=np.uint8, copy=True),
+                LightStatus("unchanged", "未找到浅色水印"))
     return first, LightStatus("clean", f"{tint}色水印已反解")
 
 
+def _shift_or(mask: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    """沿一个轴膨胀 radius（边界外当空，绝不跨边卷绕）。"""
+    if radius <= 0:
+        return np.asarray(mask, dtype=bool).copy()
+    src = np.asarray(mask, dtype=bool)
+    out = src.copy()
+    for s in range(1, radius + 1):
+        if axis == 0:
+            out[s:] |= src[:-s]
+            out[:-s] |= src[s:]
+        else:
+            out[:, s:] |= src[:, :-s]
+            out[:, :-s] |= src[:, s:]
+    return out
+
+
 def _grow_mask(mask: np.ndarray, radius: int) -> np.ndarray:
-    """方形膨胀：把笔画边缘抗锯齿留下的淡黄一起圈进来。"""
+    """方形膨胀：把笔画边缘抗锯齿留下的淡黄一起圈进来。
+
+    可分离实现（先竖后横），半径 r 只要 2r 次数组运算而不是 r² 个位移；
+    结果与方形结构元一致，但不再用 np.roll —— 贴边的掩膜不会从对边卷回
+    来一份（贴右边缘的水印以前会在左边缘凭空多出一片掩膜，去水印时连带
+    把那里也改掉）。
+    """
     if radius <= 0:
         return mask
-    out = mask.copy()
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            out |= np.roll(np.roll(mask, dy, 0), dx, 1)
-    return out
+    return _shift_or(_shift_or(mask, radius, 0), radius, 1)
 
 
 def _verify_light_watermark(arr):
@@ -2061,6 +2419,7 @@ __all__ = [
     "estimate_tint_ref",
     "inpaint",
     "iter_photos",
+    "moire_notch",
     "normalize_box",
     "output_path",
     "pick_method",
