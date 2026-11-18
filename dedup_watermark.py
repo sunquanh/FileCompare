@@ -1463,8 +1463,13 @@ class LightStatus:
     """一张图的处理结论：只报结果，不报过程。
 
     status：clean（水印已清，纹理保留）；partial（反解没解干净，不得不
-    整块补图，纹理被重建）；unchanged（没找到水印，什么都没动）；
-    rejected（平铺水印或框过大，明确不处理）。detail 是一句人话。
+    整块补图，纹理被重建）；unchanged（没找到水印）；rejected（平铺水印或
+    框过大，明确不处理）。detail 是一句人话。
+
+    status 说的是**水印结论**，不是“这张图的像素有没有变”：屏摄页的水波纹
+    是前置处理，压掉它可能改动七成画面（整幅条纹都要重建），但只要没找到
+    水印仍报 unchanged，并在 detail 里写明“屏摄水波纹已陷波（N 组频率），
+    未找到水印”。要判断图有没有被改，比较数组，不要看 status。
     """
 
     status: str  # "clean" | "partial" | "unchanged" | "rejected"
@@ -2048,8 +2053,9 @@ def clean_light_watermark(rgb: np.ndarray):
     水波纹是前置的一级，只在检出谱峰时生效（见 moire_notch）。放在反解之前
     是因为条纹比水印笔画强得多，夹在里面会把“相对局部背景的偏离”整片抬高，
     检测阈值跟着水涨船高，淡色水印反而认不出来。
-    状态语义不变：unchanged 仍然是“没找到水印”的结论，水波纹压掉了会在
-    detail 里写明，免得调用方以为这张图一个像素都没动。
+    状态语义不变：unchanged 仍然是“没找到水印”的结论（status 只描述水印），
+    水波纹压掉了会在 detail 里写明，免得调用方以为这张图一个像素都没动
+    （详见 LightStatus）。
     """
     notched, moire_detail = moire_notch(rgb)
     fixed, status = _clean_light_core(notched)
