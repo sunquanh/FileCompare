@@ -1000,28 +1000,39 @@ def _choose_tint_ref(rgb: np.ndarray, mask: np.ndarray, tint: str,
     return best
 
 
-def _run_lengths(mask: np.ndarray):
-    """每个像素所在连续段有多长（横、竖各一张），用来区分“笔画”和“长直线”。"""
+def _run_spans(mask: np.ndarray):
+    """每个像素到所在连续段左/右、上/下断点的距离（四张图）。
+
+    注意这不是“整段长度”：长直线中间的值大、两个端头小。_run_lengths 取
+    每对里较小的那个，刚好是“到最近断点的距离”（区分笔画和长直线够用）；
+    而要判“这一整条是不是长直线”，得把两个方向加起来减一（见
+    _neutral_mask）——只看最近断点的话，长直线的两个端头各 max_run 像素
+    会被当成短笔画漏过去。
+    """
     height, width = mask.shape
     # int16 而不是默认的 int64：大图上这四道 accumulate 原本占 2.8 秒，窄类型
     # 把内存带宽降下来一半又一半（结果完全一样；超宽图才退回 int32）
     dtype = np.int16 if max(height, width) < 32000 else np.int32
     rows = np.broadcast_to(np.arange(width, dtype=dtype),
                            (height, width))
-    row_start = np.maximum.accumulate(np.where(mask, 0, rows + 1), axis=1)
-    run_row = rows - row_start + 1
-    row_end = np.minimum.accumulate(
-        np.where(mask, width, rows - 1)[:, ::-1], axis=1)[:, ::-1]
-    run_row = np.minimum(run_row, row_end - rows + 1)
+    left = rows - np.maximum.accumulate(np.where(mask, 0, rows + 1),
+                                        axis=1) + 1
+    right = np.minimum.accumulate(
+        np.where(mask, width, rows - 1)[:, ::-1], axis=1)[:, ::-1] - rows + 1
 
     cols = np.broadcast_to(np.arange(height, dtype=dtype)[:, None],
                            (height, width))
-    col_start = np.maximum.accumulate(np.where(mask, 0, cols + 1), axis=0)
-    run_col = cols - col_start + 1
-    col_end = np.minimum.accumulate(
-        np.where(mask, height, cols - 1)[::-1], axis=0)[::-1]
-    run_col = np.minimum(run_col, col_end - cols + 1)
-    return run_row, run_col
+    up = cols - np.maximum.accumulate(np.where(mask, 0, cols + 1),
+                                      axis=0) + 1
+    down = np.minimum.accumulate(
+        np.where(mask, height, cols - 1)[::-1], axis=0)[::-1] - cols + 1
+    return left, right, up, down
+
+
+def _run_lengths(mask: np.ndarray):
+    """每个像素到最近断点的距离（横、竖各一张），用来区分“笔画”和“长直线”。"""
+    left, right, up, down = _run_spans(mask)
+    return np.minimum(left, right), np.minimum(up, down)
 
 
 def _neutral_mask(rgb: np.ndarray, stats=None) -> np.ndarray:
@@ -1034,9 +1045,13 @@ def _neutral_mask(rgb: np.ndarray, stats=None) -> np.ndarray:
     background = float(np.percentile(luma, 90))
     deficit = background - luma
     candidate = (chroma < 6.0) & (deficit > 1.5) & (deficit < 40.0)
-    run_row, run_col = _run_lengths(candidate)
-    # 60 像素以上的连续段算“长直线”（表格线、扫描行），不算笔画
-    return candidate & (run_row < 60) & (run_col < 60)
+    left, right, up, down = _run_spans(candidate)
+    # 60 像素以上的连续段算“长直线”（表格线、扫描行），不算笔画。这里必须
+    # 用整段长度（左 + 右 - 1）：只看“到最近断点的距离”时，一条长直线的
+    # 两个端头各有 60 像素会被当成短笔画，重铺背景时就把线的两端刷成纸色
+    # （实测一张 1300×1000 的文字页上，水印洗得干净但 845 个线色像素被改）。
+    return (candidate & ((left + right - 1) < 60)
+            & ((up + down - 1) < 60))
 
 
 def _near_dark(mask: np.ndarray, luma: np.ndarray, radius: int = 8) -> np.ndarray:
@@ -1462,7 +1477,7 @@ class LightDetection:
 class LightStatus:
     """一张图的处理结论：只报结果，不报过程。
 
-    status：clean（水印已清，纹理保留）；partial（反解没解干净，不得不
+        status：clean（水印已清，纹理保留）；partial（反解没解干净，不得不
     整块补图，纹理被重建）；unchanged（没找到水印）；rejected（平铺水印或
     框过大，明确不处理）。detail 是一句人话。
 
@@ -2125,8 +2140,13 @@ def _clean_light_core(rgb: np.ndarray):
                     LightStatus("unchanged", "未找到浅色水印"))
         grow = _grow_mask(neutral, 2)
         background, _ = _box_blur_known(rgb, ~grow, 10)
+        # 外扩 2 像素是为了盖住水印笔画的抗锯齿边；这一圈只铺回“纸色”像素，
+        # 比纸明显暗的一律不动——否则紧贴着水印、刚好落在外扩圈里的浅灰表格
+        # 线会被顺带刷成纸色（线色比纸暗 24 级，远没到“深色内容”的门限）。
+        paper = float(np.percentile(stats[0], 90))
+        paint = grow & (neutral | ((paper - stats[0]) < 1.5))
         out = rgb.astype(np.float32)
-        out[grow] = background[grow]
+        out[paint] = background[paint]
         return (np.clip(out, 0, 255).astype(np.uint8),
                 LightStatus("clean", "淡灰水印已重铺背景"))
 
