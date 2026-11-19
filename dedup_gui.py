@@ -5536,6 +5536,18 @@ class WatermarkPage(ToolPage):
                                 value=bool(self.settings.get("wm_subdir", True)))
         self.sw_subdir.pack(side="right")
 
+        # GPS：拍摄地点默认照原样带过去，转发前想抹掉就打开这个
+        gps_opt = tk.Frame(d, bg=t.CARD)
+        gps_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(gps_opt, text="抹掉 GPS 定位\r\n输出图不带拍摄地点，其余 EXIF 和 ICC 照旧保留",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_gps = Switch(gps_opt, t, bg=t.CARD,
+                             value=bool(self.settings.get("wm_strip_gps",
+                                                          False)),
+                             command=self._gps_toggled)
+        self.sw_gps.pack(side="right")
+
         # 中档：纯 numpy 纹理合成，不用模型，重复纹理比自动几何填充自然
         pm_opt = tk.Frame(d, bg=t.CARD)
         pm_opt.pack(fill="x", pady=(s(12), 0))
@@ -5876,6 +5888,10 @@ class WatermarkPage(ToolPage):
         self.settings["wm_pm"] = bool(value)
         save_settings(self.settings)
 
+    def _gps_toggled(self, value):
+        self.settings["wm_strip_gps"] = bool(value)
+        save_settings(self.settings)
+
     def prewarm_model(self):
         """后台把模型会话建好：首次加载要几十秒，别让用户点“开始”后才等。"""
         if not self.hq_ready or self._warm_started:
@@ -5942,7 +5958,7 @@ class WatermarkPage(ToolPage):
                 result = wmark.batch_remove_light(
                     photos, out_dir=out_dir, cancel=cancel, on_progress=prog,
                     subdir=subdir, boxes=list(self.boxes) or None,
-                    method=method)
+                    method=method, strip_gps=bool(self.sw_gps.value))
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -5988,7 +6004,8 @@ class WatermarkPage(ToolPage):
             try:
                 result = wmark.batch_remove_light_boxes(
                     photos, boxes, out_dir=out_dir, cancel=cancel,
-                    on_progress=prog, subdir=subdir)
+                    on_progress=prog, subdir=subdir,
+                    strip_gps=bool(self.sw_gps.value))
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
@@ -6014,6 +6031,7 @@ class WatermarkPage(ToolPage):
         for key in ("left", "top", "width", "height"):
             self.settings["wm_" + key] = self.vars[key].get()
         self.settings["wm_subdir"] = bool(self.sw_subdir.value)
+        self.settings["wm_strip_gps"] = bool(self.sw_gps.value)
         self.settings["wm_hq"] = bool(self.sw_hq.value)
         self.settings["wm_pm"] = bool(getattr(self, "sw_pm", None)
                                       and self.sw_pm.value)
@@ -6044,7 +6062,8 @@ class WatermarkPage(ToolPage):
             try:
                 result = wmark.batch_remove(photos, box, out_dir=out_dir,
                                             cancel=cancel, on_progress=prog,
-                                            method=method, subdir=subdir)
+                                            method=method, subdir=subdir,
+                                            strip_gps=bool(self.sw_gps.value))
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}

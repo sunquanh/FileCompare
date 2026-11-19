@@ -700,18 +700,24 @@ def _open_for_edit(src):
             alpha = im.getchannel("A").copy()
         exif = im.getexif()
         if len(exif):
-            exif[0x0112] = 1
-        meta = (im.info.get("icc_profile"), exif if len(exif) else None)
+            exif[0x0112] = 1        # 像素已摆正，方向标签必须归 1
+        else:
+            exif = None
+        meta = (im.info.get("icc_profile"), exif)
         arr = np.asarray(im.convert("RGB"))
     return arr, alpha, meta
 
 
-def _save_result(image, target, quality: int = 95, meta=None,
+def _save_result(image, target, quality: int = 95, meta=None, alpha=None,
                  strip_gps: bool = False) -> None:
-    """按扩展名保存，把源图的 ICC / EXIF 一并写回；strip_gps 时去掉 GPS。
+    """按扩展名保存，把源图的 ICC / EXIF 写回，alpha 该带就带回。
 
     GPS 只在明确要求时才抹：默认保留拍摄信息，发图前要抹地点的人自己关。
+    透明通道只在 PNG/WebP/TIFF 这类装得下的格式上贴回，JPEG 装不下就不贴。
     """
+    suffix = target.suffix.lower()
+    if alpha is not None and suffix in (".png", ".webp", ".tif", ".tiff"):
+        image.putalpha(alpha)
     kwargs = {}
     if meta is not None:
         icc, exif = meta
@@ -723,7 +729,6 @@ def _save_result(image, target, quality: int = 95, meta=None,
             data = exif.tobytes()
             if data:
                 kwargs["exif"] = data
-    suffix = target.suffix.lower()
     if suffix in (".jpg", ".jpeg"):
         image.convert("RGB").save(target, quality=quality, subsampling=0,
                                   **kwargs)
@@ -746,11 +751,8 @@ def remove_watermark_file(src, box, dst=None, method: str = "auto",
     fixed = inpaint(arr, box, method)
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.fromarray(fixed, "RGB")
-    if alpha is not None and target.suffix.lower() in (
-            ".png", ".webp", ".tif", ".tiff"):
-        image.putalpha(alpha)
-    _save_result(image, target, quality, meta, strip_gps)
+    _save_result(Image.fromarray(fixed, "RGB"), target, quality, meta,
+                 alpha=alpha, strip_gps=strip_gps)
     return target
 
 
@@ -777,10 +779,11 @@ def target_dir(path, out_dir=None, subdir: bool = False) -> Path:
 
 def batch_remove(paths, box, out_dir=None, method: str = "auto",
                  quality: int = 95, cancel=None, on_progress=None,
-                 subdir: bool = False) -> dict:
+                 subdir: bool = False, strip_gps: bool = False) -> dict:
     """批量处理；返回 {"done", "failed", "skipped", "total"}。
 
     同名输出已存在就跳过——重复点一次不会生成一堆 `_去水印(2)(3)`。
+    strip_gps 透传给 remove_watermark_file：转发前要抹掉拍摄地点时打开。
     """
     paths = list(paths)
     done = skipped = 0
@@ -795,7 +798,8 @@ def batch_remove(paths, box, out_dir=None, method: str = "auto",
             if target.exists():
                 skipped += 1
             else:
-                remove_watermark_file(path, box, target, method, quality)
+                remove_watermark_file(path, box, target, method, quality,
+                                      strip_gps=strip_gps)
                 done += 1
         except Exception as exc:  # 单张失败不影响整批
             failed.append((str(path), str(exc)))
@@ -2293,7 +2297,7 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     决策（reconstruct_light：先反解、解不净再补、不透明徽标整块补、
     平铺水印明确拒绝）。boxes 给了就先反解淡色水印，再把这些框（比如
     记下来的徽标位置）整块补掉：徽标上的白字是不透明的，反解救不回来，
-    只能靠补。
+    只能靠补。strip_gps=True 时不再走原文件拷贝，重存一份并抹掉 GPS。
     """
     src = Path(src)
     arr, alpha, meta = _open_for_edit(src)
@@ -2328,11 +2332,8 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     if not boxes and not strip_gps and np.array_equal(fixed, arr):
         shutil.copyfile(src, target)
         return target, LightStatus("unchanged", "未找到浅色水印")
-    image = Image.fromarray(fixed, "RGB")
-    if alpha is not None and target.suffix.lower() in (
-            ".png", ".webp", ".tif", ".tiff"):
-        image.putalpha(alpha)
-    _save_result(image, target, quality, meta, strip_gps)
+    _save_result(Image.fromarray(fixed, "RGB"), target, quality, meta,
+                 alpha=alpha, strip_gps=strip_gps)
     if rejected is not None and not cleaned and partial is None:
         # 唯一结果就是被拒：什么都没动，如实报 rejected
         notes = ([auto.detail]
@@ -2379,11 +2380,12 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
 
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
-                       method: str = "auto") -> dict:
+                       method: str = "auto", strip_gps: bool = False) -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致，再加逐张状态。
 
     results 是 [(原路径, 状态, 一句人话)]，供界面逐张报“干净 / 残留 /
     未找到 / 拒绝”；clean/partial/unchanged/rejected 是各状态的张数。
+    strip_gps 透传给 remove_light_file。
     """
     paths = list(paths)
     done = skipped = 0
@@ -2401,7 +2403,8 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                 skipped += 1
             else:
                 _, status = remove_light_file(path, target, quality,
-                                              boxes=boxes, method=method)
+                                              boxes=boxes, method=method,
+                                              strip_gps=strip_gps)
                 results.append((str(path), status.status, status.detail))
                 counts[status.status] += 1
                 done += 1
@@ -2415,12 +2418,15 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
 
 def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
                             cancel=None, on_progress=None,
-                            subdir: bool = False) -> dict:
+                            subdir: bool = False,
+                            strip_gps: bool = False) -> dict:
     """批量框选去浅色水印：只在用户框里做浅色反解，不跑自动检测，不整块补图。
 
     每个框走 reconstruct_light（allow_inpaint=False）：先反解，残留小补；
     框里没水印就不动；框占图超 70% 或平铺水印会被拒。返回格式与
     batch_remove_light 一致（results 是 [(原路径, 状态, 一句人话)]）。
+    strip_gps 与另外两个批量入口一致：打开就不拷原文件（拷贝会把 GPS 一起
+    带过去），重存一份只抹掉位置的。
     """
     paths = list(paths)
     boxes = as_box_list(boxes) if boxes else []
@@ -2438,9 +2444,7 @@ def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
             if target.exists():
                 skipped += 1
             else:
-                with Image.open(path) as im:
-                    im = ImageOps.exif_transpose(im)
-                    arr = np.asarray(im.convert("RGB"))
+                arr, alpha, meta = _open_for_edit(path)
                 fixed = np.array(arr, dtype=np.uint8, copy=True)
                 notes = []
                 cleaned = False
@@ -2457,20 +2461,16 @@ def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
                         notes.append(f"框：{detail}")
                     # action "none"：框里没水印，不记
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if not cleaned and np.array_equal(fixed, arr):
+                if not cleaned and not strip_gps and np.array_equal(fixed, arr):
                     shutil.copyfile(path, target)
                     if rejected is not None:
                         status = LightStatus("rejected", rejected)
                     else:
                         status = LightStatus("unchanged", "框里未找到浅色水印")
                 else:
-                    image = Image.fromarray(fixed, "RGB")
-                    if target.suffix.lower() in (".jpg", ".jpeg"):
-                        image.save(target, quality=quality, subsampling=0)
-                    elif target.suffix.lower() == ".webp":
-                        image.save(target, quality=quality)
-                    else:
-                        image.save(target)
+                    _save_result(Image.fromarray(fixed, "RGB"), target,
+                                 quality, meta, alpha=alpha,
+                                 strip_gps=strip_gps)
                     if rejected is not None and not cleaned:
                         status = LightStatus("rejected", rejected)
                     else:

@@ -827,19 +827,37 @@ class TestMetadata(unittest.TestCase):
             self.assertTrue(np.array_equal(np.asarray(im)[..., 3], alpha))
             self.assertEqual(im.info.get("icc_profile"), self.icc)
 
-    def test_light_file_honours_strip_gps(self):
-        # 浅色路径没改动时直接拷原文件（元数据天然保留）；一旦要求去 GPS，
-        # 就不能再拷贝，必须重存一份去掉 GPS 的
+    def test_strip_gps_reaches_every_entry_point(self):
+        # 单张、框选批量、浅色批量三个入口都得真的把 GPS 抹掉，
+        # 别只在某一个函数里生效
+        for entry in ("single", "batch", "light"):
+            with self.subTest(entry=entry):
+                src = self._jpeg(f"{entry}.jpg")
+                out = self.tmp / f"out_{entry}"
+                if entry == "single":
+                    dst = W.remove_watermark_file(
+                        src, (0.7, 0.7, 0.95, 0.95), out / "one.jpg",
+                        strip_gps=True)
+                else:
+                    batch = (W.batch_remove if entry == "batch"
+                             else W.batch_remove_light)
+                    args = (([src], (0.7, 0.7, 0.95, 0.95))
+                            if entry == "batch" else ([src],))
+                    result = batch(*args, out_dir=out, strip_gps=True)
+                    self.assertEqual(result["done"], 1)
+                    dst = W.output_path(src, out, unique=False)
+                with Image.open(dst) as im:
+                    self.assertNotIn(0x8825, im.getexif())
+                    self.assertEqual(im.getexif().get(0x010F), "TestCam")
+                    self.assertEqual(im.info.get("icc_profile"), self.icc)
+
+    def test_light_file_copy_keeps_metadata_when_unchanged(self):
+        # 没改动时浅色路径直接拷原文件，元数据（含 GPS）天然保留；
+        # 只有明确要求去 GPS 时才改走重存（见上一条）
         src = self._jpeg()
         kept, _ = W.remove_light_file(src, self.tmp / "kept.jpg")
         with Image.open(kept) as im:
             self.assertIn(0x8825, im.getexif())
-            self.assertEqual(im.info.get("icc_profile"), self.icc)
-        stripped, _ = W.remove_light_file(src, self.tmp / "nogps.jpg",
-                                          strip_gps=True)
-        with Image.open(stripped) as im:
-            self.assertNotIn(0x8825, im.getexif())
-            self.assertEqual(im.getexif().get(0x010F), "TestCam")
             self.assertEqual(im.info.get("icc_profile"), self.icc)
 
 
