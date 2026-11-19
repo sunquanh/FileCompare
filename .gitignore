@@ -235,3 +235,5 @@ Dedup便携版/
 
 \344
 .workbuddy-ai/
+# 本地调试残留备份（probe/diag 脚本与图片、未入库测试的快照）
+_backup_*/
