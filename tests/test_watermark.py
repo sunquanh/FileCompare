@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageCms, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -763,6 +763,84 @@ class TestDarkGuard(unittest.TestCase):
         after = self._dark_frac(fixed)
         self.assertLessEqual(after, before + 1.0,
                              f"一键抠后暗像素 {before:.2f}% -> {after:.2f}%，疑似打黑出杠子")
+
+
+class TestMetadata(unittest.TestCase):
+    """输出必须带上源图的 ICC / EXIF；alpha 不许丢；GPS 只在要求时抹。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix=".tmp_meta_"))
+        self.icc = ImageCms.ImageCmsProfile(
+            ImageCms.createProfile("sRGB")).tobytes()
+
+    def tearDown(self):
+        for item in sorted(self.tmp.rglob("*"), reverse=True):
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                item.rmdir()
+        self.tmp.rmdir()
+
+    def _jpeg(self, name="src.jpg"):
+        img = Image.fromarray(_background("wall"))
+        exif = Image.Exif()
+        exif[0x010F] = "TestCam"
+        exif[0x0112] = 6                 # 带方向的手机照片很常见
+        exif.get_ifd(0x8825)[1] = "N"    # GPS 纬度参考
+        path = self.tmp / name
+        img.save(path, quality=95, icc_profile=self.icc, exif=exif)
+        return path
+
+    def test_jpeg_keeps_icc_exif_and_resets_orientation(self):
+        src = self._jpeg()
+        dst = W.remove_watermark_file(src, (0.7, 0.7, 0.95, 0.95),
+                                      self.tmp / "out.jpg")
+        with Image.open(dst) as im:
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+            exif = im.getexif()
+            self.assertEqual(exif.get(0x010F), "TestCam")
+            self.assertEqual(exif.get(0x0112), 1, "像素已摆正，方向标签要归 1")
+            self.assertIn(0x8825, exif, "默认应保留拍摄地点")
+            self.assertEqual(im.size, (HEIGHT, WIDTH), "方向 6 没转过来")
+
+    def test_strip_gps_removes_only_gps(self):
+        src = self._jpeg()
+        dst = W.remove_watermark_file(src, (0.7, 0.7, 0.95, 0.95),
+                                      self.tmp / "nogps.jpg", strip_gps=True)
+        with Image.open(dst) as im:
+            exif = im.getexif()
+            self.assertNotIn(0x8825, exif)
+            self.assertEqual(dict(exif.get_ifd(0x8825)), {})
+            self.assertEqual(exif.get(0x010F), "TestCam", "只该抹 GPS")
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+
+    def test_png_alpha_kept(self):
+        alpha = np.tile(np.linspace(0, 255, WIDTH, dtype=np.uint8),
+                        (HEIGHT, 1))
+        src = self.tmp / "t.png"
+        Image.fromarray(np.dstack([_background("wall"), alpha]),
+                        "RGBA").save(src, icc_profile=self.icc)
+        dst = W.remove_watermark_file(src, (0.6, 0.6, 0.9, 0.9),
+                                      self.tmp / "t_out.png")
+        with Image.open(dst) as im:
+            self.assertEqual(im.mode, "RGBA")
+            self.assertTrue(np.array_equal(np.asarray(im)[..., 3], alpha))
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+
+    def test_light_file_honours_strip_gps(self):
+        # 浅色路径没改动时直接拷原文件（元数据天然保留）；一旦要求去 GPS，
+        # 就不能再拷贝，必须重存一份去掉 GPS 的
+        src = self._jpeg()
+        kept, _ = W.remove_light_file(src, self.tmp / "kept.jpg")
+        with Image.open(kept) as im:
+            self.assertIn(0x8825, im.getexif())
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+        stripped, _ = W.remove_light_file(src, self.tmp / "nogps.jpg",
+                                          strip_gps=True)
+        with Image.open(stripped) as im:
+            self.assertNotIn(0x8825, im.getexif())
+            self.assertEqual(im.getexif().get(0x010F), "TestCam")
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
 
 
 if __name__ == "__main__":

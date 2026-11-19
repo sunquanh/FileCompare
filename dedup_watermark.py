@@ -684,23 +684,73 @@ def output_path(src, out_dir=None, suffix: str = "_去水印",
     return candidate
 
 
-def remove_watermark_file(src, box, dst=None, method: str = "auto",
-                          quality: int = 95) -> Path:
-    """处理一张图，写到 dst（默认同目录加后缀，绝不覆盖原图）。"""
-    src = Path(src)
+def _open_for_edit(src):
+    """读图：按 EXIF 方向摆正、取 RGB 数组，并把要跟着走的元数据带出来。
+
+    返回 (arr, alpha, meta)：alpha 只有源图带透明通道时才有值（PNG/WebP
+    的水印处理在 RGB 上做，透明度不该被顺手丢掉）；meta 是
+    (icc_profile, exif)，方向标签已归 1——像素已经被 exif_transpose 转正，
+    再带着原始方向值会让看图软件又转一次。
+    """
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im)
+        alpha = None
+        if (im.mode in ("RGBA", "LA", "PA")
+                or (im.mode == "P" and "transparency" in im.info)):
+            alpha = im.getchannel("A").copy()
+        exif = im.getexif()
+        if len(exif):
+            exif[0x0112] = 1
+        meta = (im.info.get("icc_profile"), exif if len(exif) else None)
         arr = np.asarray(im.convert("RGB"))
-        fixed = inpaint(arr, box, method)
+    return arr, alpha, meta
+
+
+def _save_result(image, target, quality: int = 95, meta=None,
+                 strip_gps: bool = False) -> None:
+    """按扩展名保存，把源图的 ICC / EXIF 一并写回；strip_gps 时去掉 GPS。
+
+    GPS 只在明确要求时才抹：默认保留拍摄信息，发图前要抹地点的人自己关。
+    """
+    kwargs = {}
+    if meta is not None:
+        icc, exif = meta
+        if icc:
+            kwargs["icc_profile"] = icc
+        if exif is not None:
+            if strip_gps:
+                exif.pop(0x8825, None)
+            data = exif.tobytes()
+            if data:
+                kwargs["exif"] = data
+    suffix = target.suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        image.convert("RGB").save(target, quality=quality, subsampling=0,
+                                  **kwargs)
+    elif suffix == ".webp":
+        image.save(target, quality=quality, **kwargs)
+    else:
+        image.save(target, **kwargs)
+
+
+def remove_watermark_file(src, box, dst=None, method: str = "auto",
+                          quality: int = 95, strip_gps: bool = False) -> Path:
+    """处理一张图，写到 dst（默认同目录加后缀，绝不覆盖原图）。
+
+    元数据跟着走：ICC 色彩配置和 EXIF 都写进输出，方向标签归 1（像素已被
+    exif_transpose 摆正）；strip_gps=True 时去掉 GPS 信息。PNG/WebP 的
+    透明通道原样保留——补图只动 RGB，透明度没理由被一起抹掉。
+    """
+    src = Path(src)
+    arr, alpha, meta = _open_for_edit(src)
+    fixed = inpaint(arr, box, method)
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
     image = Image.fromarray(fixed, "RGB")
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=quality, subsampling=0)
-    elif target.suffix.lower() == ".webp":
-        image.save(target, quality=quality)
-    else:
-        image.save(target)
+    if alpha is not None and target.suffix.lower() in (
+            ".png", ".webp", ".tif", ".tiff"):
+        image.putalpha(alpha)
+    _save_result(image, target, quality, meta, strip_gps)
     return target
 
 
@@ -2236,7 +2286,7 @@ def _verify_light_watermark(arr):
 
 
 def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
-                     method: str = "auto"):
+                     method: str = "auto", strip_gps: bool = False):
     """处理一张图（自动抠浅色水印），不覆盖原图。
 
     返回 (目标路径, LightStatus)：先跑一键自动抠，再按用户框走统一重建
@@ -2246,47 +2296,43 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     只能靠补。
     """
     src = Path(src)
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        arr = np.asarray(im.convert("RGB"))
-        fixed, auto = clean_light_watermark(arr)
-        box_notes = []
-        rejected = None
-        partial = None
-        cleaned = auto.status in ("clean", "partial")
-        for one in as_box_list(boxes) if boxes else []:
-            # 探：先在原图上检测（框里有什么），再在当前图上重建；重建决策
-            # 集中在 reconstruct_light，这里只汇总每框的结论
-            det = detect_light_in_box(arr, one, source="box")
-            fixed, action, detail = reconstruct_light(
-                fixed, one, det=det, method=method, allow_inpaint=True)
-            if action == "rejected":
-                rejected = detail
-                box_notes.append(f"框已拒绝：{detail}")
-            elif action == "inpaint-residual":
-                partial = detail
-                box_notes.append(f"框：{detail}")
-            elif action == "inpaint-opaque":
-                cleaned = True
-                box_notes.append(f"框：{detail}")
-            elif action in ("unblend", "fill"):
-                cleaned = True
-                box_notes.append(f"框：{detail}")
-            # action "none"：框里没水印，不记
+    arr, alpha, meta = _open_for_edit(src)
+    fixed, auto = clean_light_watermark(arr)
+    box_notes = []
+    rejected = None
+    partial = None
+    cleaned = auto.status in ("clean", "partial")
+    for one in as_box_list(boxes) if boxes else []:
+        # 探：先在原图上检测（框里有什么），再在当前图上重建；重建决策
+        # 集中在 reconstruct_light，这里只汇总每框的结论
+        det = detect_light_in_box(arr, one, source="box")
+        fixed, action, detail = reconstruct_light(
+            fixed, one, det=det, method=method, allow_inpaint=True)
+        if action == "rejected":
+            rejected = detail
+            box_notes.append(f"框已拒绝：{detail}")
+        elif action == "inpaint-residual":
+            partial = detail
+            box_notes.append(f"框：{detail}")
+        elif action == "inpaint-opaque":
+            cleaned = True
+            box_notes.append(f"框：{detail}")
+        elif action in ("unblend", "fill"):
+            cleaned = True
+            box_notes.append(f"框：{detail}")
+        # action "none"：框里没水印，不记
     target = Path(dst) if dst else output_path(src)
     target.parent.mkdir(parents=True, exist_ok=True)
     # 没改动（照片护栏直接放过、或者这张图本来就没水印）就直接拷原文件：
     # 重存一遍既费时（12 MP 约 0.4 秒）又白白损一次 JPEG 质量。
-    if not boxes and np.array_equal(fixed, arr):
+    if not boxes and not strip_gps and np.array_equal(fixed, arr):
         shutil.copyfile(src, target)
         return target, LightStatus("unchanged", "未找到浅色水印")
     image = Image.fromarray(fixed, "RGB")
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=quality, subsampling=0)
-    elif target.suffix.lower() == ".webp":
-        image.save(target, quality=quality)
-    else:
-        image.save(target)
+    if alpha is not None and target.suffix.lower() in (
+            ".png", ".webp", ".tif", ".tiff"):
+        image.putalpha(alpha)
+    _save_result(image, target, quality, meta, strip_gps)
     if rejected is not None and not cleaned and partial is None:
         # 唯一结果就是被拒：什么都没动，如实报 rejected
         notes = ([auto.detail]
