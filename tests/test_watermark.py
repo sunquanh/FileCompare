@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from PIL import Image, ImageCms, ImageDraw, ImageFont
@@ -850,6 +851,46 @@ class TestMetadata(unittest.TestCase):
                     self.assertNotIn(0x8825, im.getexif())
                     self.assertEqual(im.getexif().get(0x010F), "TestCam")
                     self.assertEqual(im.info.get("icc_profile"), self.icc)
+
+    def test_lama_backend_shares_metadata_rules(self):
+        # LaMa 后端以前自己写保存逻辑：ICC/EXIF 丢、PNG alpha 平、没有 GPS
+        # 开关。这里把 inpaint 换成恒等函数（不需要 onnxruntime 和模型），
+        # 只验证读写这一层与主模块同套规则。
+        import dedup_watermark_lama as lama
+
+        def identity(rgb, box, pad_ratio=1.8):
+            return np.array(rgb, dtype=np.uint8, copy=True)
+
+        src = self._jpeg()
+        with mock.patch.object(lama, "inpaint", identity):
+            dst = lama.remove_watermark_file(
+                src, (0.7, 0.7, 0.95, 0.95), self.tmp / "lama.jpg")
+            plain = lama.remove_watermark_file(
+                self._jpeg("gps.jpg"), (0.7, 0.7, 0.95, 0.95),
+                self.tmp / "lama_nogps.jpg", strip_gps=True)
+            alpha = np.tile(np.linspace(0, 255, WIDTH, dtype=np.uint8),
+                            (HEIGHT, 1))
+            png = self.tmp / "lama_src.png"
+            Image.fromarray(np.dstack([_background("wall"), alpha]),
+                            "RGBA").save(png, icc_profile=self.icc)
+            png_out = lama.remove_watermark_file(
+                png, (0.6, 0.6, 0.9, 0.9), self.tmp / "lama_out.png")
+
+        with Image.open(dst) as im:
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+            exif = im.getexif()
+            self.assertEqual(exif.get(0x010F), "TestCam")
+            self.assertEqual(exif.get(0x0112), 1, "像素已摆正，方向标签要归 1")
+            self.assertIn(0x8825, exif, "默认应保留拍摄地点")
+            self.assertEqual(im.size, (HEIGHT, WIDTH), "方向 6 没转过来")
+        with Image.open(plain) as im:
+            self.assertNotIn(0x8825, im.getexif())
+            self.assertEqual(im.getexif().get(0x010F), "TestCam", "只该抹 GPS")
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
+        with Image.open(png_out) as im:
+            self.assertEqual(im.mode, "RGBA")
+            self.assertTrue(np.array_equal(np.asarray(im)[..., 3], alpha))
+            self.assertEqual(im.info.get("icc_profile"), self.icc)
 
     def test_light_file_copy_keeps_metadata_when_unchanged(self):
         # 没改动时浅色路径直接拷原文件，元数据（含 GPS）天然保留；

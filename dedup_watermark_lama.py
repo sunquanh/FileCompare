@@ -351,19 +351,23 @@ def inpaint_mask(rgb: np.ndarray, mask: np.ndarray, stride: int = 256,
     return np.rint(np.clip(out, 0, 255)).astype(np.uint8)
 
 
-def remove_watermark_file(src, box, dst=None, pad_ratio: float = 1.8):
-    """按文件处理一张照片，输出路径规则与 dedup_watermark 保持一致。"""
-    from PIL import Image, ImageOps
+def remove_watermark_file(src, box, dst=None, pad_ratio: float = 1.8,
+                          quality: int = 95, strip_gps: bool = False) -> Path:
+    """按文件处理一张照片，读写规则与 dedup_watermark 完全同套。
+
+    曾经这里自己写了一份保存逻辑，结果是 ICC 色彩配置和 EXIF 全丢、PNG 的
+    alpha 被抹平、也拿不到“抹掉 GPS”这个开关。现在统一走主模块的
+    _open_for_edit / _save_result：像素按 EXIF 方向摆正且方向标签归 1，
+    ICC 与 EXIF 写回，PNG/WebP/TIFF 的透明通道原样贴回，GPS 只在
+    strip_gps=True 时剔除。
+    """
+    from PIL import Image
     import dedup_watermark as wm
     src = Path(src)
-    with Image.open(src) as im:
-        transposed = ImageOps.exif_transpose(im)
-        rgb = np.asarray(transposed.convert("RGB"))
+    rgb, alpha, meta = wm._open_for_edit(src)
     fixed = inpaint(rgb, box, pad_ratio)
     target = Path(dst) if dst else wm.output_path(src)
-    image = Image.fromarray(fixed)
-    if target.suffix.lower() in (".jpg", ".jpeg"):
-        image.save(target, quality=95, subsampling=0)
-    else:
-        image.save(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    wm._save_result(Image.fromarray(fixed, "RGB"), target, quality, meta,
+                    alpha=alpha, strip_gps=strip_gps)
     return target

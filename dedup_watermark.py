@@ -919,6 +919,29 @@ def _local_trend(score: np.ndarray, valid: np.ndarray,
     return np.ascontiguousarray(trend[:height, :width], dtype=np.float32)
 
 
+def _stroke_density(mask: np.ndarray, min_neighbours: int = 3) -> float:
+    """掩膜里“像笔画”的像素占比：3×3 内至少 min_neighbours 个邻居也是掩膜。
+
+    真实水印字是连成条的（实测文档 0.99、平铺 1.00、屏摄 0.86）；白纸上的
+    彩色噪点、照片里的零星偏色是散的（实测 0.00~0.07）。少了这一条，一张
+    干净屏摄图会被投成“粉”并整幅反解——基准里它于是改了 56% 的像素。
+    """
+    if not mask.any():
+        return 0.0
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    crop = mask[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    pad = np.pad(crop.astype(np.uint8), 1)
+    height, width = crop.shape
+    acc = np.zeros_like(crop, dtype=np.uint8)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == 1 and dx == 1:
+                continue
+            acc += pad[dy:dy + height, dx:dx + width]
+    return float((acc[crop] >= min_neighbours).mean())
+
+
 def detect_tint(rgb: np.ndarray, gmin: int = 120,
                 luma_gate: float = 140.0, stats=None) -> str:
     """判断这张图上的浅色水印偏哪种颜色（黄/蓝/粉/绿），全没就返回空串。"""
@@ -937,7 +960,11 @@ def detect_tint(rgb: np.ndarray, gmin: int = 120,
         # 还要“绝对方向上真的偏这个色”：局部基准只能说明它比周围纸面淡，
         # 而彩色纸上的白字、高光边缘同样“更不像那个底色”（实测蓝灰底
         # 屏幕照片会被投成淡黄），它们自身的偏色其实是 0。
-        count = int(((resid > limit) & pale & (score > 0.5)).sum())
+        hit = (resid > limit) & pale & (score > 0.5)
+        count = int(hit.sum())
+        # 连贯度门：真水印是连着的笔画，噪点是散的（见 _stroke_density）
+        if count and _stroke_density(hit) < 0.5:
+            continue
         if count > best_count:
             best, best_count = name, count
     # 占比太小就不算水印（至少千分之一）
@@ -1296,6 +1323,9 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
     fixed_luma = np.tensordot(arr, _LUMA_WEIGHTS, axes=([2], [0]))
     too_dark = (alpha > 0) & (fixed_luma < luma - 40.0)
     arr[too_dark] = rgb[too_dark]
+    # 试过两条过冲护栏（封顶到纸面 +8、只允许“更靠近纸面”的像素生效）：
+    # 基准上 doc_yellow 0.46→0.51、doc_tiled 0.40→0.39，总均值持平，
+    # 收益抵不上多两趟全图运算，所以不带。屏摄那例的过冲仍待解。
     return arr.astype(np.uint8)
 
 
@@ -1545,7 +1575,7 @@ class LightStatus:
     detail: str = ""
 
 
-def detect_light_in_box(rgb, box, tint=None, source="box"):
+def detect_light_in_box(rgb, box, tint=None, source="box", sens=0.0):
     """框内局部检测浅色水印，返回 LightDetection。
 
     背景取框外一圈中位色，色调在框内投票，阈值按框内投影分布自定——
@@ -1592,7 +1622,12 @@ def detect_light_in_box(rgb, box, tint=None, source="box"):
             # 这类“只亮不带黄色调”的偏离（暖墙上的黄水印色度信号本来就弱，
             # 只看色度强度会漏，所以色度只作符号门，不作阈值）。
             score = full - _blur_f(full, radius)
-            limit = _robust_threshold(score, floor=5.0, cap=12.0)
+            # 灵敏度旋钮：门限整体往下推（0 原样，1 推 45%），给“保守/激进”
+            # 一个可调档。合成薄笔画确实要降门限才回得来（细尺度去趋势在
+            # 基准上零收益、还把屏摄图检出弄没了，所以不做）；降太多会吃掉
+            # 照片护栏，所以默认 0。
+            limit = (_robust_threshold(score, floor=5.0, cap=12.0)
+                     * (1.0 - 0.45 * float(np.clip(sens, 0.0, 1.0))))
             # α 门：只有半透明（α≤0.75）才配反解。白字徽标这类不透明的
             # （α≈1）投影也很大，但底下什么都没剩、反解不出东西，只能整块补；
             # 逐像素筛，混在一个框里的白字和水印能各走各的路。α 用没模糊过的
@@ -1722,7 +1757,7 @@ def _estimate_box_ref(arr, det, fixed_ref):
     return tuple(float(v) for v in np.clip(est, 0, 255))
 
 
-def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
+def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0, sens=0.0):
     """框内反解浅色水印。
 
     返回 (fixed, mask, residual)：fixed 是全图 uint8（只有框内动过），
@@ -1738,7 +1773,7 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
         return unchanged, empty, empty
     if (y1 - y0) * (x1 - x0) > height * width * 0.7:
         return unchanged, empty, empty
-    det = detect_light_in_box(rgb, box, tint=tint)
+    det = detect_light_in_box(rgb, box, tint=tint, sens=sens)
     if not det.found:
         return unchanged, empty, empty
     name, mask = det.tint, det.mask
@@ -1786,13 +1821,13 @@ def undo_light_in_box(rgb, box, tint=None, ref=None, strength=1.0):
     out[y0:y1, x0:x1] = np.clip(fixed_crop, 0, 255)
     fixed = np.rint(np.clip(out, 0, 255)).astype(np.uint8)
     # 反解后框内再检一次：还有多少没解掉（没检出就是空掩膜，不是 None）
-    res_det = detect_light_in_box(fixed, box, tint=name)
+    res_det = detect_light_in_box(fixed, box, tint=name, sens=sens)
     residual = res_det.mask if res_det.mask is not None else empty
     return fixed, mask, residual
 
 
 def reconstruct_light(arr, box, det=None, method="auto", allow_inpaint=True,
-                      source="box"):
+                      source="box", sens=0.0):
     """重建决策：检测和重建之间唯一的分叉点。
 
     输入检测记录（没给就现检），按同一套规则决定反解、补残影还是整块补，
@@ -1814,7 +1849,7 @@ def reconstruct_light(arr, box, det=None, method="auto", allow_inpaint=True,
     y0, y1, x0, x1 = box_pixels(box, width, height)
     unchanged = np.array(arr, dtype=np.uint8, copy=True)
     if det is None:
-        det = detect_light_in_box(arr, box, source=source)
+        det = detect_light_in_box(arr, box, source=source, sens=sens)
     if det.rejected:
         return unchanged, "rejected", det.rejected
     if not det.found:
@@ -1838,7 +1873,8 @@ def reconstruct_light(arr, box, det=None, method="auto", allow_inpaint=True,
                     "不透明徽标，已整块补图")
         return unchanged, "none", "不透明徽标，整块补已关"
     # 框内有浅色水印：先反解一次，再看残留决定
-    fixed, mask2, residual = undo_light_in_box(arr, box, tint=det.tint)
+    fixed, mask2, residual = undo_light_in_box(arr, box, tint=det.tint,
+                                               sens=sens)
     if not mask2.any():
         # 探时有、解时没了：水印已被自动抠处理掉，不硬补
         return unchanged, "none", "已由自动抠处理"
@@ -1869,7 +1905,7 @@ def _box_iou(a, b):
     return inter / max(area_a + area_b - inter, 1e-9)
 
 
-def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
+def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25, sens=0.0):
     """一键抠在照片上的分区检测：把图切成重叠网格，逐格局部投票。
 
     水印通常只占一角或一条边，整图投票会被主导色（蓝天、黄沙）带跑；
@@ -1887,7 +1923,7 @@ def _grid_light_boxes(rgb, rows=3, cols=3, overlap=0.25):
             x0 = max(0.0, c * cell_w - cell_w * overlap)
             x1 = min(1.0, (c + 1) * cell_w + cell_w * overlap)
             box = (x0, y0, x1, y1)
-            det = detect_light_in_box(rgb, box, source="grid")
+            det = detect_light_in_box(rgb, box, source="grid", sens=sens)
             count = int(det.mask.sum()) if det.found else 0
             py0, py1, px0, px1 = box_pixels(box, width, height)
             total = (py1 - py0) * (px1 - px0)
@@ -2116,7 +2152,7 @@ def moire_notch(rgb: np.ndarray) -> tuple:
     return fixed, f"屏摄水波纹已陷波（{len(peaks)} 组频率）"
 
 
-def clean_light_watermark(rgb: np.ndarray):
+def clean_light_watermark(rgb: np.ndarray, sens: float = 0.0):
     """浅色水印一键流程：屏摄水波纹陷波 → 认出色调 → 反解 → 补残影。
 
     水波纹是前置的一级，只在检出谱峰时生效（见 moire_notch）。放在反解之前
@@ -2127,7 +2163,7 @@ def clean_light_watermark(rgb: np.ndarray):
     （详见 LightStatus）。
     """
     notched, moire_detail = moire_notch(rgb)
-    fixed, status = _clean_light_core(notched)
+    fixed, status = _clean_light_core(notched, sens=sens)
     if not moire_detail:
         return fixed, status
     if status.status == "unchanged":
@@ -2136,7 +2172,7 @@ def clean_light_watermark(rgb: np.ndarray):
                               f"{status.detail}；{moire_detail}".lstrip("；"))
 
 
-def _clean_light_core(rgb: np.ndarray):
+def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     """浅色水印本体流程（不含水波纹陷波，见 clean_light_watermark）。
 
     彩色淡色水印走反解；完全没偏色的淡灰水印走“平坦区重铺背景”。
@@ -2150,13 +2186,13 @@ def _clean_light_core(rgb: np.ndarray):
     # 原样返回。
     if looks_like_photo(rgb):
         out = np.array(rgb, dtype=np.uint8, copy=True)
-        dets = _grid_light_boxes(rgb)
+        dets = _grid_light_boxes(rgb, sens=sens)
         if not dets:
             return out, LightStatus("unchanged", "未找到浅色水印")
         changed = 0
         for det in dets:
             fixed, action, _detail = reconstruct_light(
-                out, det.box, det=det, allow_inpaint=False)
+                out, det.box, det=det, allow_inpaint=False, sens=sens)
             if action in ("unblend", "fill"):
                 out = fixed
                 changed += 1
@@ -2290,7 +2326,8 @@ def _verify_light_watermark(arr):
 
 
 def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
-                     method: str = "auto", strip_gps: bool = False):
+                     method: str = "auto", strip_gps: bool = False,
+                     sens: float = 0.0):
     """处理一张图（自动抠浅色水印），不覆盖原图。
 
     返回 (目标路径, LightStatus)：先跑一键自动抠，再按用户框走统一重建
@@ -2301,7 +2338,7 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     """
     src = Path(src)
     arr, alpha, meta = _open_for_edit(src)
-    fixed, auto = clean_light_watermark(arr)
+    fixed, auto = clean_light_watermark(arr, sens=sens)
     box_notes = []
     rejected = None
     partial = None
@@ -2309,9 +2346,10 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     for one in as_box_list(boxes) if boxes else []:
         # 探：先在原图上检测（框里有什么），再在当前图上重建；重建决策
         # 集中在 reconstruct_light，这里只汇总每框的结论
-        det = detect_light_in_box(arr, one, source="box")
+        det = detect_light_in_box(arr, one, source="box", sens=sens)
         fixed, action, detail = reconstruct_light(
-            fixed, one, det=det, method=method, allow_inpaint=True)
+            fixed, one, det=det, method=method, allow_inpaint=True,
+            sens=sens)
         if action == "rejected":
             rejected = detail
             box_notes.append(f"框已拒绝：{detail}")
@@ -2380,7 +2418,8 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
 
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
-                       method: str = "auto", strip_gps: bool = False) -> dict:
+                       method: str = "auto", strip_gps: bool = False,
+                       sens: float = 0.0) -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致，再加逐张状态。
 
     results 是 [(原路径, 状态, 一句人话)]，供界面逐张报“干净 / 残留 /
@@ -2404,7 +2443,8 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
             else:
                 _, status = remove_light_file(path, target, quality,
                                               boxes=boxes, method=method,
-                                              strip_gps=strip_gps)
+                                              strip_gps=strip_gps,
+                                              sens=sens)
                 results.append((str(path), status.status, status.detail))
                 counts[status.status] += 1
                 done += 1
@@ -2419,7 +2459,8 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
 def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
                             cancel=None, on_progress=None,
                             subdir: bool = False,
-                            strip_gps: bool = False) -> dict:
+                            strip_gps: bool = False,
+                            sens: float = 0.0) -> dict:
     """批量框选去浅色水印：只在用户框里做浅色反解，不跑自动检测，不整块补图。
 
     每个框走 reconstruct_light（allow_inpaint=False）：先反解，残留小补；
@@ -2450,9 +2491,9 @@ def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
                 cleaned = False
                 rejected = None
                 for one in boxes:
-                    det = detect_light_in_box(arr, one, source="box")
+                    det = detect_light_in_box(arr, one, source="box", sens=sens)
                     fixed, action, detail = reconstruct_light(
-                        fixed, one, det=det, allow_inpaint=False)
+                        fixed, one, det=det, allow_inpaint=False, sens=sens)
                     if action == "rejected":
                         rejected = detail
                         notes.append(f"框已拒绝：{detail}")
