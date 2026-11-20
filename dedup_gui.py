@@ -5619,6 +5619,10 @@ class WatermarkPage(ToolPage):
         CanvasButton(tools_row, t, "清空区域", command=self._clear_boxes,
                      kind="ghost", height=34, size=9, padding=14,
                      bg=t.CARD).pack(side="left", padx=(s(8), 0))
+        CanvasButton(tools_row, t, "存标注框",
+                     command=self._save_boxes_label, kind="ghost",
+                     height=34, size=9, padding=14,
+                     bg=t.CARD).pack(side="left", padx=(s(8), 0))
 
         auto_card = tk.Frame(d, bg=t.CARD)
         auto_card.pack(fill="x", pady=(s(14), 0))
@@ -5718,6 +5722,42 @@ class WatermarkPage(ToolPage):
         self._remember_boxes()
         self._update_box_hint()
         self._redraw()
+
+    def _save_boxes_label(self):
+        """把当前框导成真值标注，交给 tools/wm_label.py refine 细化成掩膜。
+
+        GUI 只负责“人手点在哪”，不在这里跑检测：大图上检测要几十秒，
+        而且标注是要回到命令行跟 bench 一起跑的。导出的 JSON 是像素坐标
+        ＋原图路径，refine 读它就能把框内水印笔画自动描出来。
+        """
+        photos = self._photos_cache or []
+        if not photos:
+            self.app.toast("先选照片或文件夹", "warn")
+            return
+        if not self.boxes:
+            self.app.toast("先在右边预览上拖框选出水印区", "warn")
+            return
+        src = Path(photos[0])
+        try:
+            with Image.open(src) as im:
+                width, height = ImageOps.exif_transpose(im).size
+        except Exception as exc:
+            self.app.toast(f"这张图读不出来：{exc}", "warn")
+            return
+        boxes = [[int(round(one[0] * width)), int(round(one[1] * height)),
+                  int(round(one[2] * width)), int(round(one[3] * height))]
+                 for one in self.boxes]
+        target = src.with_name(src.stem + "_wm_boxes.json")
+        try:
+            target.write_text(json.dumps(
+                {"source": str(src), "width": width, "height": height,
+                 "boxes": boxes}, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except Exception as exc:
+            self.app.toast(f"标注写不进去：{exc}", "warn")
+            return
+        self.app.log(f"标注已存：{target}", "ok")
+        self.app.toast("框已存成标注（下一步用 wm_label refine 细化）", "ok")
 
     def _remember_boxes(self):
         """把当前区域记到设置里，下次自动套用（不联网、只存一行坐标）。"""

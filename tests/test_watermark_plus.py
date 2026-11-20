@@ -494,6 +494,61 @@ class TestLabelTool(unittest.TestCase):
                 item.unlink() if item.is_file() else item.rmdir()
             tmp.rmdir()
 
+    def test_audit_only_reports(self):
+        """审计只给结论不落盘：整批里哪些图值得处理，跑完就能看到。"""
+        lab = self._lab()
+        tmp = Path(tempfile.mkdtemp(prefix=".tmp_aud_"))
+        try:
+            src = tmp / "src"
+            src.mkdir()
+            arr, _mask = bench._stamp(bench._doc(seed=3), "2023/12/24", 0.30,
+                                      (252, 248, 196), [(120, 300)], size=58)
+            Image.fromarray(arr).save(src / "wm.png")
+            Image.fromarray(bench._doc(seed=4)).save(src / "plain.png")
+            report = tmp / "audit.json"
+            rows = lab.audit(src, out_json=report)
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(report.is_file())
+            by_name = {Path(r["file"]).name: r for r in rows}
+            self.assertEqual(by_name["wm.png"]["verdict"], "有水印")
+            self.assertEqual(by_name["plain.png"]["verdict"], "干净（未检出）")
+            # 只读：审计不改任何图（掩膜只在内存里）
+            self.assertEqual(
+                np.asarray(Image.open(src / "plain.png")).shape,
+                bench._doc(seed=4).shape)
+        finally:
+            for item in sorted(tmp.rglob("*"), reverse=True):
+                item.unlink() if item.is_file() else item.rmdir()
+            tmp.rmdir()
+
+    def test_refine_from_boxes_and_points(self):
+        """点/框标注只给位置，掩膜由检测细化——不必手工描水印笔画。"""
+        lab = self._lab()
+        tmp = Path(tempfile.mkdtemp(prefix=".tmp_ref_"))
+        try:
+            src = tmp / "src"
+            src.mkdir()
+            arr, _mask = bench._stamp(bench._doc(seed=3), "2023/12/24", 0.30,
+                                      (252, 248, 196), [(120, 300)], size=58)
+            Image.fromarray(arr).save(src / "page1.png")
+            case = lab.export(src, tmp / "cases")[0]
+            # 从全黑重来：模拟“只拖了框、还没描边”的标注
+            Image.fromarray(np.zeros(arr.shape[:2], dtype=np.uint8)).save(
+                case / "mask.png")
+            lab.refine(case, boxes=["80,260,600,380"])
+            mask = np.asarray(Image.open(case / "mask.png").convert("L")) > 127
+            self.assertGreater(int(mask.sum()), 500)
+            self.assertEqual(lab.check(tmp / "cases"), [])
+            # 点标注单独用：扩成方框后同样能细化，--replace 丢掉旧掩膜
+            lab.refine(case, points=["200,320"], replace=True)
+            again = np.asarray(Image.open(case / "mask.png").convert("L")) > 127
+            self.assertGreater(int(again.sum()), 500)
+            self.assertEqual(lab.check(tmp / "cases"), [])
+        finally:
+            for item in sorted(tmp.rglob("*"), reverse=True):
+                item.unlink() if item.is_file() else item.rmdir()
+            tmp.rmdir()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1639,29 +1639,42 @@ def detect_light_in_box(rgb, box, tint=None, source="box", sens=0.0):
     掩膜紧贴的邻域才是文字处真正的背景，第二遍的色系和背景都以它
     为准。邻域像素太少（<100）时不重投，留第一遍的结果。
     第二遍没检出时也留第一遍——新背景只影响这一格的判断，不降级。
+
+    只对「框 + 外扩一圈」这一块做浮点运算：以前是整图 astype(float32)
+    再在全图尺寸上算环掩膜、模糊、膨胀，12 MP 照片光这一句就是 144 MB
+    分配，九格网格要重复九次。框外的像素除了当背景环不参与任何判断，
+    裁出来是纯内存/时间收益，判定过程逐像素不变（返回的掩膜仍是全图尺寸）。
     """
     height, width = rgb.shape[:2]
     y0, y1, x0, x1 = box_pixels(box, width, height)
-    empty = np.zeros((height, width), dtype=bool)
     if y1 - y0 < 8 or x1 - x0 < 8:
         return LightDetection(box, source=source)
-    arr = rgb.astype(np.float32)
     pad = max(8, int(min(y1 - y0, x1 - x0) * 0.25))
-    ring = _box_ring_mask((height, width), y0, y1, x0, x1, pad)
+    cy0, cx0 = max(0, y0 - pad), max(0, x0 - pad)
+    cy1, cx1 = min(height, y1 + pad), min(width, x1 + pad)
+    arr = rgb[cy0:cy1, cx0:cx1].astype(np.float32)
+    ch, cw = arr.shape[:2]
+    by0, bx0, by1, bx1 = y0 - cy0, x0 - cx0, y1 - cy0, x1 - cx0
+    ring = _box_ring_mask((ch, cw), by0, by1, bx0, bx1, pad)
     bg = _local_background(arr, ring)
     if bg is None:
         # 框贴边、圈外没像素：退回框的最外一圈当背景
         edge = np.zeros((y1 - y0, x1 - x0), dtype=bool)
         edge[0, :] = edge[-1, :] = True
         edge[:, 0] = edge[:, -1] = True
-        bg = np.median(arr[y0:y1, x0:x1][edge], axis=0).astype(np.float32)
+        bg = np.median(arr[by0:by1, bx0:bx1][edge], axis=0).astype(np.float32)
 
     def run(bg):
-        """用给定背景投一次色系，返回 LightDetection（bg 记这次用的）。"""
-        crop = _blur3(arr[y0:y1, x0:x1])
+        """用给定背景投一次色系，返回 (色系, 裁剪区掩膜, 分数, 拒绝原因, bg)。
+
+        掩膜是裁剪区（框 + 环）尺寸的布尔图，只有框内可能为真——第二遍
+        要在框外一圈取邻域像素，所以不能只留框内的那一小块。
+        """
+        crop = _blur3(arr[by0:by1, bx0:bx1])
         radius = max(8, min(crop.shape[:2]) // 8)
         names = (tint,) if tint else tuple(BOX_TINT_REFS)
-        best_name, best_mask, best_count, best_score = "", empty, 0, 0.0
+        best_name, best_count, best_score = "", 0, 0.0
+        best_mask = np.zeros((ch, cw), dtype=bool)
         for name in names:
             ref = BOX_TINT_REFS[name]
             full, chroma = _projections(crop, bg, ref)
@@ -1682,7 +1695,7 @@ def detect_light_in_box(rgb, box, tint=None, source="box", sens=0.0):
             # 原图算：模糊会把笔画边的 α 稀释到 0.5 左右，白字轮廓就漏网了。
             local = (score > limit) & (chroma > 0.0)
             if local.any():
-                raw, _ = _projections(arr[y0:y1, x0:x1], bg, ref)
+                raw, _ = _projections(arr[by0:by1, bx0:bx1], bg, ref)
                 norm = float(np.sqrt(np.dot(
                     np.asarray(ref, dtype=np.float32) - bg,
                     np.asarray(ref, dtype=np.float32) - bg)))
@@ -1704,7 +1717,7 @@ def detect_light_in_box(rgb, box, tint=None, source="box", sens=0.0):
                 # 仅 6.4）；真水印只占其中一小撮笔画。取 score 最高的前
                 # 10%（至少 100 像素）算中位色，再判偏离与亮度。
                 sub_scores = score[local]
-                sub = arr[y0:y1, x0:x1][local]
+                sub = arr[by0:by1, bx0:bx1][local]
                 k = max(100, count // 10)
                 if count > k:
                     idx = np.argpartition(sub_scores, -k)[-k:]
@@ -1727,41 +1740,52 @@ def detect_light_in_box(rgb, box, tint=None, source="box", sens=0.0):
                 if count > (y1 - y0) * (x1 - x0) * 0.30:
                     continue
             if count > best_count:
-                full_mask = np.zeros((height, width), dtype=bool)
-                full_mask[y0:y1, x0:x1] = local
-                best_name, best_mask, best_count = name, full_mask, count
+                best_mask[:] = False
+                best_mask[by0:by1, bx0:bx1] = local
+                best_name, best_count = name, count
                 best_score = (float(np.median(score[local])) / limit
                               if local.any() else 0.0)
         # 占比太小不算水印（框内至少千分之一且 ≥100 像素）；占比超过七成
         # 多半是整块底色被当成水印（比如一整片黄沙滩），也不认、且明确拒。
         # 注：去趋势会把均匀填充吃掉，均匀色块的掩膜到不了七成，这条目前
         # 几乎触发不了，作安全网保留。
-        bg_tuple = tuple(float(v) for v in bg)
         total = (y1 - y0) * (x1 - x0)
         if best_count < max(100, total // 1000):
-            return LightDetection(box, source=source, bg=bg_tuple)
+            return "", None, 0.0, "", bg
         if best_count > total * 0.7:
-            return LightDetection(box, source=source, bg=bg_tuple,
-                                  rejected="平铺水印（占比超 70%），不处理")
-        return LightDetection(box, tint=best_name, mask=best_mask,
-                              score=best_score, source=source, bg=bg_tuple)
+            return ("", None, 0.0, "平铺水印（占比超 70%），不处理", bg)
+        return best_name, best_mask, best_score, "", bg
 
-    det1 = run(bg)
-    if not det1.found:
-        return det1
-    # 第二遍：掩膜外一圈重估背景，再投一次色系。_grow_mask 用 np.roll
-    # 膨胀，贴图边的掩膜会从对边卷进几个像素，中位数扛得住这点污染。
-    nb = _grow_mask(det1.mask, 10) & ~det1.mask
+    def wrap(name, mask, score, bg):
+        """把裁剪区掩膜嵌回全图尺寸，产出 LightDetection。"""
+        full = np.zeros((height, width), dtype=bool)
+        full[cy0:cy1, cx0:cx1] = mask
+        return LightDetection(box, tint=name, mask=full, score=score,
+                              source=source, bg=tuple(float(v) for v in bg))
+
+    name1, mask1, score1, rejected1, bg1 = run(bg)
+    if rejected1:
+        return LightDetection(box, source=source,
+                              bg=tuple(float(v) for v in bg1),
+                              rejected=rejected1)
+    if not name1:
+        return LightDetection(box, source=source,
+                              bg=tuple(float(v) for v in bg1))
+    # 第二遍：掩膜外一圈重估背景，再投一次色系。_grow_mask 是出界不卷回
+    # 的方形膨胀，中位数扛得住邻域里混进的几个离群像素。
+    nb = _grow_mask(mask1, 10) & ~mask1
     if int(nb.sum()) < 100:
-        return det1
+        return wrap(name1, mask1, score1, bg1)
     bg2 = np.median(arr[nb], axis=0).astype(np.float32)
-    if float(np.max(np.abs(bg2 - bg))) <= 5.0:
+    if float(np.max(np.abs(bg2 - bg1))) <= 5.0:
         # 背景几乎没动：环背景本来就准，换背景只会让 α 估计多一点
         # 波动（紧框在 sky 上实测差 1~2 个点），不重投，留第一遍。
         # 格子的大偏差（R 差 16）照修——阈值 5 介于两者之间。
-        return det1
-    det2 = run(bg2)
-    return det2 if det2.found else det1
+        return wrap(name1, mask1, score1, bg1)
+    name2, mask2, score2, _, bg2b = run(bg2)
+    if name2:
+        return wrap(name2, mask2, score2, bg2b)
+    return wrap(name1, mask1, score1, bg1)
 
 
 def _estimate_box_ref(arr, det, fixed_ref):
@@ -2314,7 +2338,9 @@ def moire_notch(rgb: np.ndarray) -> tuple:
 
     陷波是在频域乘一个掩膜：每个谱峰连同中心对称的共轭峰，在半径
     MOIRE_RADIUS 的圆盘上乘 (1-MOIRE_STRENGTH)。对实图来说谱必然是中心对称
-    的，只压一边会算出复数残差，所以两边都要压。
+    的，只压一边会算出复数残差，所以两边都要压。圆盘边缘是余弦软渐变，
+    不是硬边——硬切一个圆形频带相当于加了一扇矩形窗，时域会振铃：真图
+    上表现为与条纹同向的一串浅横带，比原摩尔纹更显眼。
 
     代价与分辨率成正比：12 MP 上三通道各一次 fft2，约 3~4 秒、峰值内存约
     600 MB，且只在真检出摩尔纹时才走这条路。压掉之后再用实际改动量复核一遍
@@ -2337,9 +2363,14 @@ def moire_notch(rgb: np.ndarray) -> tuple:
             x0, x1 = max(0, px - band), min(width, px + band + 1)
             gy = np.arange(y0, y1) - py
             gx = np.arange(x0, x1) - px
-            cut = (gy[:, None] ** 2 + gx[None, :] ** 2) <= band * band
+            dist = np.sqrt(gy[:, None] ** 2 + gx[None, :] ** 2)
+            # 中心保持 keep，到 band 处余弦平滑回 1（半窗）。硬圆盘的边界
+            # 突变会在时域振铃，软边把这条代价换成一点轻微的频率邻域损失。
+            profile = keep + (1.0 - keep) * (
+                0.5 - 0.5 * np.cos(np.pi * np.clip(dist / float(band),
+                                                   0.0, 1.0)))
             sub = mask[y0:y1, x0:x1]
-            sub[cut] = np.minimum(sub[cut], keep)
+            sub[:] = np.minimum(sub, profile)
     out = np.empty_like(arr)
     for channel in range(3):
         spec = np.fft.fftshift(np.fft.fft2(arr[..., channel]))
@@ -2505,6 +2536,16 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
         # 文字、表格线旁边不补：那里的“残余黄点”其实是笔画自身的抗锯齿边缘，
         # 补下去会把字吐成毛边（实测表头字母会被吞出锯齿）
         residual &= ~_near_dark(residual, stats2[0])
+    # 残影护栏（作用域 + 占比）：残影是水印笔画反解后剩下的边角，必然
+    # 紧贴掩膜。复检用的是 diff=2 的松门，在深色/彩色屏摄上会把整片底色
+    # 都算成“残留”——实测一张 12 MP 屏摄页命中 65.4%，_nearest4_fill
+    # 一铺就是半幅画面发软、出横带（真图 damage 0.50 的全部来源，掩膜
+    # 本身只有 0.8%）。只在掩膜外扩 8 像素内补；即便这样还超过掩膜 3 倍，
+    # 说明门限在这张图上根本不可信，整段不补（宁愿留一点淡痕）。
+    if residual.any():
+        residual &= _grow_mask(mask, 8)
+        if int(residual.sum()) > max(2000, int(mask.sum()) * 3):
+            residual = np.zeros_like(residual)
     if residual.any():
         residual = _grow_mask(residual, 1)
         first = _nearest4_fill(first, residual)
