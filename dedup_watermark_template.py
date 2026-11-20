@@ -178,6 +178,44 @@ def learn_template(paths, limit: int = 8, min_share: float = 0.4):
                     images=[p for _d, _s, _c, p in items])
 
 
+def save_template(template, path):
+    """把学好的模板存盘，下一批图直接读回来用（不用每批重新学一遍）。
+
+    实测同一款水印的一批图里模板覆盖 6/6、框 IoU > 0.95；换一个文件夹再
+    学一次要重新读前 8 张图并各自跑检测，大图上一分钟起步。模板本身就是
+    一个框 + 一张布尔掩膜 + 几个数字，用 npz 存最省事（不需要 pickle，
+    也不会因为改代码而读不回来）。
+    """
+    from pathlib import Path
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        mask=np.asarray(template.mask, dtype=np.uint8),
+        box=np.asarray(template.box, dtype=np.float64),
+        tint=np.asarray(template.tint or ""),
+        share=np.asarray(template.share, dtype=np.float64),
+        score=np.asarray(template.score, dtype=np.float64),
+        agreement=np.asarray(template.agreement, dtype=np.float64))
+    return path
+
+
+def load_template(path):
+    """读回 save_template 存的模板；文件缺失/损坏/字段不全时返回 None。"""
+    try:
+        with np.load(str(path), allow_pickle=False) as data:
+            return Template(
+                box=tuple(float(v) for v in data["box"]),
+                mask=np.asarray(data["mask"], dtype=bool),
+                tint=str(data["tint"]),
+                share=float(data["share"]),
+                score=float(data["score"]),
+                agreement=float(data["agreement"]))
+    except Exception:
+        return None
+
+
 def template_mask(template, shape):
     """把模板铺回整图尺寸的布尔掩膜。"""
     height, width = shape[:2]
@@ -474,6 +512,8 @@ def _tint_of(template, mask):
 __all__ = [
     "Template",
     "learn_template",
+    "load_template",
+    "save_template",
     "template_mask",
     "apply_template",
     "remove_with_template",

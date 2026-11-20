@@ -2743,6 +2743,7 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
                        method: str = "auto", strip_gps: bool = False,
                        sens: float = 0.0, template=None,
+                       template_path=None,
                        learn: bool = False, learn_limit: int = 8,
                        report=None) -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致，再加逐张状态。
@@ -2753,10 +2754,17 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
 
     跨图模板：learn=True 时先拿前 learn_limit 张学一个模板（学不出就是
     None，整批退回逐张检测），之后每张按模板反解、省掉检测；也可以直接把
-    自己学好的 template 传进来。结果里 template_share 是这个模板覆盖的
-    样本占比，0 表示没用模板。
+    自己学好的 template 传进来，或用 template_path 读回上次存盘的模板
+    （dedup_watermark_template.save_template / load_template）。结果里
+    template_share 是这个模板覆盖的样本占比，0 表示没用模板。
     """
     paths = list(paths)
+    if template is None and template_path:
+        try:
+            import dedup_watermark_template as _tpl
+            template = _tpl.load_template(template_path)
+        except Exception:
+            template = None
     if template is None and learn:
         template = _learn_template(paths[:max(1, int(learn_limit))],
                                    limit=learn_limit)

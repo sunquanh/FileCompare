@@ -396,6 +396,42 @@ class TestTemplateAgreement(unittest.TestCase):
             tmp.rmdir()
 
 
+class TestTemplatePersistence(unittest.TestCase):
+    """模板存盘：同一款水印学一次，下一批直接读回来用。"""
+
+    def test_save_load_and_batch_uses_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix=".tmp_tplfile_"))
+        try:
+            paths = []
+            for i in range(5):
+                base = bench._doc(seed=3 + i * 4, lines=14)
+                arr, _mask = bench._stamp(base, "2023/12/24", 0.30,
+                                          (252, 248, 196), [(150, 320)],
+                                          size=58)
+                p = tmp / f"p{i}.png"
+                Image.fromarray(arr).save(p)
+                paths.append(p)
+            template = T.learn_template(paths)
+            self.assertIsNotNone(template)
+            store = T.save_template(template, tmp / "tpl.npz")
+            self.assertTrue(store.is_file())
+            back = T.load_template(store)
+            self.assertIsNotNone(back)
+            self.assertEqual(back.box, template.box)
+            self.assertEqual(back.tint, template.tint)
+            self.assertTrue(np.array_equal(back.mask, template.mask))
+            self.assertAlmostEqual(back.share, template.share)
+            # 跨批复用：模板从文件读进来，batch 里不再现学
+            out = W.batch_remove_light(paths, out_dir=tmp / "out",
+                                       template_path=tmp / "tpl.npz")
+            self.assertEqual(out["clean"], 5)
+            self.assertIsNone(T.load_template(tmp / "missing.npz"))
+        finally:
+            for item in sorted(tmp.rglob("*"), reverse=True):
+                item.unlink() if item.is_file() else item.rmdir()
+            tmp.rmdir()
+
+
 class TestBatchReport(unittest.TestCase):
     """批处理报告：一张 CSV，Excel 双击不乱码。"""
 
