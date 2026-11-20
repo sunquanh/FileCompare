@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import sys
@@ -116,6 +117,15 @@ def _stamp(img_arr, text, alpha, color, positions, size=64):
     return np.asarray(out.convert("RGB")), mask > 0
 
 
+def _as_jpeg(arr, quality=55):
+    """存一次 JPEG 再读回来：模拟“转发过一次”的图（8×8 块噪声 + 色度下采样）。"""
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    with Image.open(buf) as im:
+        return np.asarray(im.convert("RGB"))
+
+
 def _tiled_positions(width, height, step_x, step_y, phase=(30, 26)):
     xs = list(range(phase[0], width, step_x))
     ys = list(range(phase[1], height, step_y))
@@ -175,10 +185,15 @@ def make_fixtures(out_dir):
          note="period=300x260")
 
     # 4. 屏摄：文档 + 摩尔纹 + 淡黄水印
-    clean = _screen_transform(_doc(seed=13, lines=12), 21)
-    arr, mask = _stamp(clean, "DY2024", 0.30, (252, 248, 196),
+    # 参考图必须是“同一次屏摄、但没印水印”的那张。早先写成未渲染的原始页
+    # 面，光渲染本身的差异就有 8 级，任何完美去水印都不可能降到 1 以下；
+    # 而且水印先印在屏摄图上、再被渲染第二遍（seed 还不一样），等于两次
+    # 拍摄叠加。现在只在页面上印一次、渲染一次，参考用同一 seed 的渲染。
+    page = _doc(seed=13, lines=12)
+    clean = _screen_transform(page, 21)
+    arr, mask = _stamp(page, "DY2024", 0.30, (252, 248, 196),
                        [(150, 420), (470, 820)], size=64)
-    arr = _screen_transform(arr, 22)
+    arr = _screen_transform(arr, 21)
     save("screen_yellow", arr, mask, clean, "screen")
 
     # 5. 照片：草地 + 淡黄水印（旧用例一直失败的那类）
@@ -193,7 +208,15 @@ def make_fixtures(out_dir):
                        [(220, 180), (400, 350)], size=70)
     save("photo_blue_sky", arr, mask, clean, "photo")
 
-    # 7~9. 干净样本（假阳性探测：改动必须是 0）
+    # 7. 文档 + 淡黄水印，但被 JPEG 压过（转发一次的图基本都是这样）：
+    # 8×8 块噪声会把“相对纸面的偏色”抬成网格，检测阈值跟着顶高
+    clean = _doc(seed=23, lines=14)
+    arr, mask = _stamp(clean, "2023/12/24", 0.30, (252, 248, 196),
+                       [(140, 380), (400, 760)], size=58)
+    save("doc_jpeg", _as_jpeg(arr), mask, _as_jpeg(clean), "doc",
+         note="JPEG q=55 二次压缩")
+
+    # 8~10. 干净样本（假阳性探测：改动必须是 0）
     clean = _doc(seed=17)
     save("clean_doc", clean, np.zeros(clean.shape[:2], bool), clean, "doc")
     clean = _photo(seed=8, palette="wall")

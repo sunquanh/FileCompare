@@ -1,13 +1,13 @@
 {
  "summary": {
-  "n": 9,
+  "n": 10,
   "fp_total": 0.0,
-  "damage_max": 0.079448,
-  "hit_mean": 0.5119,
-  "err_mean": 0.5518,
-  "err_n": 6,
+  "damage_max": 0.199211,
+  "hit_mean": 0.5536,
+  "err_mean": 0.5038,
+  "err_n": 7,
   "dishonest": 0,
-  "sec_sum": 52.0
+  "sec_sum": 35.5
  },
  "sens": 0.0,
  "cases": [
@@ -22,8 +22,8 @@
    "damage": 0.0,
    "fp": 0.0,
    "honest": true,
-   "sec": 1.28,
-   "mb": 6.8
+   "sec": 0.81,
+   "mb": 6.7
   },
   {
    "case": "clean_photo",
@@ -36,8 +36,8 @@
    "damage": 0.0,
    "fp": 0.0,
    "honest": true,
-   "sec": 4.98,
-   "mb": 1.4
+   "sec": 2.82,
+   "mb": 1.5
   },
   {
    "case": "clean_screen",
@@ -50,8 +50,8 @@
    "damage": 0.0,
    "fp": 0.0,
    "honest": true,
-   "sec": 2.12,
-   "mb": 4.0
+   "sec": 1.55,
+   "mb": 4.1
   },
   {
    "case": "doc_gray",
@@ -64,8 +64,22 @@
    "damage": 0.0,
    "fp": null,
    "honest": true,
-   "sec": 1.51,
+   "sec": 0.93,
    "mb": 3.9
+  },
+  {
+   "case": "doc_jpeg",
+   "kind": "doc",
+   "tiled": false,
+   "status": "clean",
+   "detail": "黄色水印已反解",
+   "err_ratio": 0.7154,
+   "hit": 0.8991,
+   "damage": 4.3e-05,
+   "fp": null,
+   "honest": true,
+   "sec": 2.92,
+   "mb": 4.1
   },
   {
    "case": "doc_tiled",
@@ -73,13 +87,13 @@
    "tiled": true,
    "status": "clean",
    "detail": "黄色水印已反解",
-   "err_ratio": 0.3964,
-   "hit": 0.9354,
+   "err_ratio": 0.3341,
+   "hit": 0.9438,
    "damage": 0.001985,
    "fp": null,
    "honest": true,
-   "sec": 4.62,
-   "mb": 4.0
+   "sec": 3.07,
+   "mb": 3.8
   },
   {
    "case": "doc_yellow",
@@ -87,13 +101,13 @@
    "tiled": false,
    "status": "clean",
    "detail": "黄色水印已反解",
-   "err_ratio": 0.4644,
-   "hit": 0.9101,
-   "damage": 0.001922,
+   "err_ratio": 0.4126,
+   "hit": 0.9112,
+   "damage": 0.001981,
    "fp": null,
    "honest": true,
-   "sec": 4.41,
-   "mb": 3.6
+   "sec": 3.15,
+   "mb": 3.7
   },
   {
    "case": "photo_blue_sky",
@@ -106,8 +120,8 @@
    "damage": 0.0,
    "fp": null,
    "honest": true,
-   "sec": 10.54,
-   "mb": 1.9
+   "sec": 6.71,
+   "mb": 1.1
   },
   {
    "case": "photo_yellow",
@@ -120,22 +134,22 @@
    "damage": 0.031809,
    "fp": null,
    "honest": true,
-   "sec": 15.51,
-   "mb": 0.0
+   "sec": 9.38,
+   "mb": 1.3
   },
   {
    "case": "screen_yellow",
    "kind": "screen",
    "tiled": false,
    "status": "clean",
-   "detail": "黄色水印已反解；屏摄水波纹已陷波（2 组频率）",
-   "err_ratio": 1.0296,
-   "hit": 0.9203,
-   "damage": 0.079448,
+   "detail": "黄色水印已反解",
+   "err_ratio": 0.6442,
+   "hit": 0.9404,
+   "damage": 0.199211,
    "fp": null,
    "honest": true,
-   "sec": 7.02,
-   "mb": 6.2
+   "sec": 4.17,
+   "mb": 8.0
   }
  ]
 }

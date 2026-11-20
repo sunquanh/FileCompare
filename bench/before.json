@@ -1,13 +1,13 @@
 {
  "summary": {
   "n": 9,
-  "fp_total": 0.560232,
-  "damage_max": 0.612979,
-  "hit_mean": 0.5119,
-  "err_mean": 0.5518,
+  "fp_total": 0.0,
+  "damage_max": 0.198676,
+  "hit_mean": 0.5118,
+  "err_mean": 0.5179,
   "err_n": 6,
   "dishonest": 0,
-  "sec_sum": 34.1
+  "sec_sum": 36.4
  },
  "sens": 0.0,
  "cases": [
@@ -22,8 +22,8 @@
    "damage": 0.0,
    "fp": 0.0,
    "honest": true,
-   "sec": 0.63,
-   "mb": 6.9
+   "sec": 0.96,
+   "mb": 6.3
   },
   {
    "case": "clean_photo",
@@ -36,22 +36,22 @@
    "damage": 0.0,
    "fp": 0.0,
    "honest": true,
-   "sec": 2.97,
-   "mb": 0.9
+   "sec": 3.5,
+   "mb": 1.3
   },
   {
    "case": "clean_screen",
    "kind": "screen",
    "tiled": false,
-   "status": "clean",
-   "detail": "粉色水印已反解",
+   "status": "unchanged",
+   "detail": "疑似照片纹理，未处理",
    "err_ratio": null,
    "hit": 0.0,
-   "damage": 0.560232,
-   "fp": 0.560232,
+   "damage": 0.0,
+   "fp": 0.0,
    "honest": true,
-   "sec": 4.33,
-   "mb": 4.1
+   "sec": 1.97,
+   "mb": 4.2
   },
   {
    "case": "doc_gray",
@@ -64,8 +64,8 @@
    "damage": 0.0,
    "fp": null,
    "honest": true,
-   "sec": 0.62,
-   "mb": 3.6
+   "sec": 0.9,
+   "mb": 3.9
   },
   {
    "case": "doc_tiled",
@@ -75,11 +75,11 @@
    "detail": "黄色水印已反解",
    "err_ratio": 0.3964,
    "hit": 0.9354,
-   "damage": 0.007888,
+   "damage": 0.001985,
    "fp": null,
    "honest": true,
-   "sec": 2.29,
-   "mb": 3.4
+   "sec": 3.14,
+   "mb": 4.0
   },
   {
    "case": "doc_yellow",
@@ -89,11 +89,11 @@
    "detail": "黄色水印已反解",
    "err_ratio": 0.4644,
    "hit": 0.9101,
-   "damage": 0.007242,
+   "damage": 0.001922,
    "fp": null,
    "honest": true,
-   "sec": 2.47,
-   "mb": 3.4
+   "sec": 3.1,
+   "mb": 3.6
   },
   {
    "case": "photo_blue_sky",
@@ -106,8 +106,8 @@
    "damage": 0.0,
    "fp": null,
    "honest": true,
-   "sec": 6.8,
-   "mb": 0.9
+   "sec": 7.87,
+   "mb": 1.4
   },
   {
    "case": "photo_yellow",
@@ -117,25 +117,25 @@
    "detail": "处理后仍有 7 个水印区残留（检出分数 1.09，越接近 1 越可能是轻微残留）",
    "err_ratio": 0.1975,
    "hit": 0.9745,
-   "damage": 0.033948,
+   "damage": 0.031809,
    "fp": null,
    "honest": true,
-   "sec": 9.6,
-   "mb": 0.3
+   "sec": 10.52,
+   "mb": 1.3
   },
   {
    "case": "screen_yellow",
    "kind": "screen",
    "tiled": false,
    "status": "clean",
-   "detail": "黄色水印已反解；屏摄水波纹已陷波（2 组频率）",
-   "err_ratio": 1.0296,
-   "hit": 0.9203,
-   "damage": 0.612979,
+   "detail": "黄色水印已反解",
+   "err_ratio": 0.8262,
+   "hit": 0.9191,
+   "damage": 0.198676,
    "fp": null,
    "honest": true,
-   "sec": 4.4,
-   "mb": 5.4
+   "sec": 4.48,
+   "mb": 4.8
   }
  ]
 }

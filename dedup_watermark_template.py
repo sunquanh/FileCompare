@@ -44,6 +44,7 @@ class Template:
     tint: str = ""
     share: float = 0.0             # 出现该模板的样本占比
     score: float = 0.0
+    agreement: float = 0.0         # 学过模板的样本与模板的掩膜 IoU 中位
     images: list = field(default_factory=list, repr=False)
 
 
@@ -161,9 +162,19 @@ def learn_template(paths, limit: int = 8, min_share: float = 0.4):
     for det, _sig, _crop, _path in items:
         tint_votes[det.tint] = tint_votes.get(det.tint, 0) + 1
     tint = max(tint_votes, key=tint_votes.get) if tint_votes else ""
+    # 贴合度：这几种图各自的检测掩膜与最终模板（同框裁剪）的 IoU 中位。
+    # 手里已经有这些掩膜，顺手量一次——它就是“这批图的水印是不是同一个”
+    # 的证据，不必为了报告再跑一遍检测。
+    agree = []
+    for det, _sig, _crop, _path in items:
+        crop = det.mask[y0:y1, x0:x1].astype(bool)
+        union = int((crop | mask).sum())
+        if union:
+            agree.append(int((crop & mask).sum()) / union)
     return Template(box=box, mask=mask, tint=tint,
                     share=round(share, 3),
                     score=float(np.median([d.score for d, _s, _c, _p in items])),
+                    agreement=round(float(np.median(agree)), 3) if agree else 0.0,
                     images=[p for _d, _s, _c, p in items])
 
 
@@ -193,7 +204,7 @@ def apply_template(rgb, template, strength: float = 1.0):
 
 
 def remove_with_template(src, template, dst=None, quality: int = 95,
-                         strength: float = 1.0):
+                         strength: float = 1.0, strip_gps: bool = False):
     """文件封装：读图 → 按模板反解 → 写回（沿用主模块的元数据/alpha 处理）。"""
     from pathlib import Path
 
@@ -205,8 +216,126 @@ def remove_with_template(src, template, dst=None, quality: int = 95,
     from PIL import Image
 
     wm._save_result(Image.fromarray(fixed, "RGB"), target, quality, meta,
-                    alpha=alpha)
+                    alpha=alpha, strip_gps=strip_gps)
     return target, mask
+
+
+def _batch_counts(results):
+    counts = {"clean": 0, "partial": 0, "unchanged": 0, "rejected": 0}
+    for _path, status, _detail in results:
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _batch_target(path, out_dir, subdir):
+    return wm.output_path(path, wm.target_dir(path, out_dir, subdir),
+                          unique=False)
+
+
+def batch_remove_with_template(paths, out_dir=None, quality: int = 95,
+                               learn_limit: int = 8, strip_gps: bool = False,
+                               cancel=None, on_progress=None,
+                               subdir: bool = False,
+                               report=None) -> dict:
+    """整批按同一个水印模板反解：先拿前几张学一次，再逐张套用。
+
+    学不出模板（图上没水印、或位置/形状不一致）就退回逐张自动检测，
+    批处理仍然跑得完——只是没有省掉检测那一步。返回格式与
+    dedup_watermark.batch_remove_light 一致，另加 template_share /
+    template_box / learned。
+    """
+    paths = list(paths)
+    template = learn_template(paths[:max(1, learn_limit)], limit=learn_limit)
+    done = skipped = 0
+    failed = []
+    results = []
+    total = len(paths)
+    for index, path in enumerate(paths, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        try:
+            target = _batch_target(path, out_dir, subdir)
+            if target.exists():
+                skipped += 1
+            else:
+                if template is not None:
+                    _, mask = remove_with_template(
+                        path, template, dst=target, quality=quality,
+                        strip_gps=strip_gps)
+                    px = int(mask.sum())
+                    status, detail = (("clean", f"按模板反解 {px} 像素")
+                                      if px else ("unchanged", "模板未命中"))
+                else:
+                    _, light = wm.remove_light_file(
+                        path, target, quality, strip_gps=strip_gps)
+                    status, detail = light.status, light.detail
+                results.append((str(path), status, detail))
+                done += 1
+        except Exception as exc:
+            failed.append((str(path), str(exc)))
+        if on_progress is not None:
+            on_progress(index, total, str(path))
+    result = {"done": done, "failed": failed, "skipped": skipped,
+              "total": total, "results": results,
+              "learned": template is not None,
+              "template_share": float(template.share) if template else 0.0,
+              "template_box": tuple(template.box) if template else None,
+              "template_agreement": float(template.agreement) if template else 0.0,
+              **_batch_counts(results)}
+    if report:
+        result["report"] = str(wm.write_batch_report(result, report))
+    return result
+
+
+def batch_remove_tiled(paths, out_dir=None, quality: int = 95,
+                       strip_gps: bool = False, cancel=None,
+                       on_progress=None, subdir: bool = False,
+                       report=None) -> dict:
+    """整批按周期重建平铺水印（逐张估周期，测不出就该张原样）。
+
+    和 batch_remove_light 的区别：这里不跑检测，只看“有没有周期性重复”，
+    所以适合整页印满样图水印、检测被判成“底色误判”的图。返回格式与
+    batch_remove_light 一致。
+    """
+    from PIL import Image
+
+    paths = list(paths)
+    done = skipped = 0
+    failed = []
+    results = []
+    total = len(paths)
+    for index, path in enumerate(paths, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        try:
+            target = _batch_target(path, out_dir, subdir)
+            if target.exists():
+                skipped += 1
+            else:
+                arr, alpha, meta = wm._open_for_edit(path)
+                fixed, info = remove_tiled_watermark(arr)
+                if info is None:
+                    results.append((str(path), "unchanged", "未测出平铺周期"))
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    wm._save_result(Image.fromarray(fixed, "RGB"), target,
+                                    quality, meta, alpha=alpha,
+                                    strip_gps=strip_gps)
+                    rows, cols = info["period"]
+                    results.append((str(path), "clean",
+                                    f"平铺水印已重建（{cols}×{rows}，"
+                                    f"{info['tiles']} 块）"))
+                done += 1
+        except Exception as exc:
+            failed.append((str(path), str(exc)))
+        if on_progress is not None:
+            on_progress(index, total, str(path))
+    result = {"done": done, "failed": failed, "skipped": skipped,
+              "total": total, "results": results, **_batch_counts(results)}
+    if report:
+        result["report"] = str(wm.write_batch_report(result, report))
+    return result
 
 
 # ---------------------------------------------------------------- 平铺水印
@@ -243,10 +372,20 @@ def tiled_period(rgb, min_period: int = 24, max_frac: float = 0.34):
     region[:min_period, :] = 0.0
     region[:, :min_period] = 0.0
     idx = np.unravel_index(int(np.argmax(region)), region.shape)
-    peak = float(region[idx])
+    # FFT 的峰落在整数格上，真周期常卡在两格之间；在 ±2 邻域里按自相关再挑
+    # 一次，免得周期差 1 像素时瓦片错拍（错拍的表现是模板被抹平、解完仍有影）
+    py, px = int(idx[0]), int(idx[1])
+    peak = float(region[py, px])
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            y, x = py + dy, px + dx
+            if y < min_period or x < min_period or y >= limit_y or x >= limit_x:
+                continue
+            if float(region[y, x]) > peak:
+                py, px, peak = y, x, float(region[y, x])
     if peak < 0.12:
         return None
-    return int(idx[0]), int(idx[1]), round(peak, 3)
+    return int(py), int(px), round(peak, 3)
 
 
 def remove_tiled_watermark(rgb, period=None, min_strength: float = 3.0):
@@ -264,17 +403,9 @@ def remove_tiled_watermark(rgb, period=None, min_strength: float = 3.0):
     resid = np.empty_like(arr)
     for ch in range(3):
         resid[..., ch] = arr[..., ch] - wm._blur_f(arr[..., ch], radius)
-    tiles = []
-    positions = []
-    for y in range(0, height - rows + 1, rows):
-        for x in range(0, width - cols + 1, cols):
-            tiles.append(resid[y:y + rows, x:x + cols])
-            positions.append((y, x))
-    if len(tiles) < 4:
+    template, tiles = _fold_template(resid, rows, cols)
+    if template is None:            # 瓦片不够时 _fold_template 已经返回 None
         return np.array(rgb, dtype=np.uint8, copy=True), None
-    stack = np.stack(tiles)
-    # 背景在瓦片之间不一样、水印在每个瓦片的同一处，逐像素中位把背景压掉
-    template = np.median(stack, axis=0)
     strength = np.abs(template).max(axis=2)
     mad = float(np.median(np.abs(template - np.median(template))))
     threshold = max(float(min_strength), 4.0 * 1.4826 * mad)
@@ -282,11 +413,9 @@ def remove_tiled_watermark(rgb, period=None, min_strength: float = 3.0):
     if not mask.any():
         return np.array(rgb, dtype=np.uint8, copy=True), None
     _energy_map, luma = _energy(rgb)
-    touched = np.zeros((height, width), dtype=bool)
-    for (y, x) in positions:
-        # 只动“浅色水印”的地盘：纸面够亮、且确实有可减的残差
-        ok = mask & (luma[y:y + rows, x:x + cols] > 140)
-        touched[y:y + rows, x:x + cols] |= ok
+    reps = (-(-height // rows), -(-width // cols))
+    # 只动“浅色水印”的地盘：纸面够亮、且确实有可减的残差
+    touched = np.tile(mask, reps)[:height, :width] & (luma > 140)
     if not touched.any():
         return np.array(rgb, dtype=np.uint8, copy=True), None
     # 模板只用来“圈地”，真正抹掉还是交给成熟的 α 反解：直接减中位残差
@@ -295,9 +424,38 @@ def remove_tiled_watermark(rgb, period=None, min_strength: float = 3.0):
     fixed = wm.undo_light_watermark(rgb, tint=tint or None, mask=touched)
     info = {"period": (rows, cols),
             "correlation": got[2] if len(got) > 2 else None,
-            "tiles": len(tiles), "mask_px": int(touched.sum()),
-            "tint": tint}
+            "tiles": int(tiles), "mask_px": int(touched.sum()),
+            "tint": tint,
+            # 掩膜也带出去：真值库工具拿它当人工标注的初稿（见 tools/wm_label.py）
+            "mask": touched}
     return fixed, info
+
+
+def _fold_template(resid, rows, cols):
+    """按周期折叠残差：同一相位上的样本逐像素取中位，就是水印模板。
+
+    早先按整块切瓦片，切不下的余数（图幅不是周期整数倍）整条丢掉——水印
+    印到右下边缘时就永远擦不到；相位也钉死在 (0,0) 上。改成按“余数类”
+    折叠后，每个像素都归到一个相位，余数也参与中位（只是样本少一点）。
+    背景在瓦片之间不一样、水印在每个瓦片的同一处，中位把背景压掉。
+
+    返回 (模板 rows×cols×3, 参与折叠的瓦片数)；瓦片太少返回 (None, 0)。
+    """
+    height, width = resid.shape[:2]
+    if rows < 2 or cols < 2:
+        return None, 0
+    ny, nx = -(-height // rows), -(-width // cols)
+    tiles = int(ny * nx)
+    if tiles < 4:
+        return None, 0
+    pad_h, pad_w = ny * rows - height, nx * cols - width
+    padded = resid
+    if pad_h or pad_w:
+        padded = np.pad(resid, ((0, pad_h), (0, pad_w), (0, 0)),
+                        mode="symmetric")
+    blocks = padded.reshape(ny, rows, nx, cols, 3)
+    blocks = blocks.transpose(1, 3, 0, 2, 4).reshape(rows, cols, tiles, 3)
+    return np.median(blocks, axis=2), tiles
 
 
 def _tint_of(template, mask):
@@ -319,6 +477,8 @@ __all__ = [
     "template_mask",
     "apply_template",
     "remove_with_template",
+    "batch_remove_with_template",
     "tiled_period",
     "remove_tiled_watermark",
+    "batch_remove_tiled",
 ]

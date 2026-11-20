@@ -241,3 +241,6 @@ _backup_*/
 
 # 评测基准的生成样本与结果（生成物，不入库）
 bench_cases/
+# 真实样本库（真图 + 人工掩膜 + 结果，本地素材，不入库）
+bench/real/
+bench/real_baseline.json

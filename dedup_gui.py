@@ -5548,6 +5548,32 @@ class WatermarkPage(ToolPage):
                              command=self._gps_toggled)
         self.sw_gps.pack(side="right")
 
+        # 同款水印模板：同相机/同导出一批图最常见的情况——水印位置形状一样。
+        # 打开后先拿前 8 张学一个模板，整批按模板反解（省掉逐张检测，也更稳）。
+        tpl_opt = tk.Frame(d, bg=t.CARD)
+        tpl_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(tpl_opt, text="整批是同款水印（学模板）\r\n先看前几张学一个模板，整批套用：更快、更稳",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_tpl = Switch(tpl_opt, t, bg=t.CARD,
+                             value=bool(self.settings.get("wm_template",
+                                                          False)),
+                             command=self._tpl_toggled)
+        self.sw_tpl.pack(side="right")
+
+        # 平铺水印：整页印满重复样图（图库图常见），检测会当成“底色误判”拒掉，
+        # 这里改走“估周期 + 分瓦片重建”。
+        tiled_opt = tk.Frame(d, bg=t.CARD)
+        tiled_opt.pack(fill="x", pady=(s(12), 0))
+        tk.Label(tiled_opt, text="平铺水印（整页重复样板）\r\n估出重复周期后整页重建，不管逐块检测能不能认",
+                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
+                 justify="left").pack(side="left")
+        self.sw_tiled = Switch(tiled_opt, t, bg=t.CARD,
+                               value=bool(self.settings.get("wm_tiled",
+                                                            False)),
+                               command=self._tiled_toggled)
+        self.sw_tiled.pack(side="right")
+
         # 中档：纯 numpy 纹理合成，不用模型，重复纹理比自动几何填充自然
         pm_opt = tk.Frame(d, bg=t.CARD)
         pm_opt.pack(fill="x", pady=(s(12), 0))
@@ -5609,7 +5635,9 @@ class WatermarkPage(ToolPage):
                  text="自动找浅黄/浅色水印并反解掉：白底文档整张找，照片只在框里"
                       "或找到的水印区反解，底下纹理不动；拖过的框会记住，点这里"
                       "自动套用（“AI生成”这类白字徽标框一次就够）。解不净或不透明"
-                      "的徽标，仍走上面的框选 + 高质量。"
+                      "的徽标，仍走上面的框选 + 高质量。\r\n"
+                      "一批图同一款水印 → 开“整批是同款水印”；整页印满重复样图"
+                      " → 开“平铺水印”；其余情况两条都关，走逐张自动检测。"
                  ).pack(fill="x", pady=(s(6), 0))
         self.box_hint = tk.Label(d, text="区域：0 个（在右边预览上直接拖框）",
                                  bg=t.CARD, fg=t.MUTED, font=t.font(8),
@@ -5627,10 +5655,11 @@ class WatermarkPage(ToolPage):
         self.canvas.bind("<Button-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        self.status = tk.Label(p, text="选一个文件夹或几张照片，自动预览第一张",
-                               bg=t.CARD, fg=t.MUTED, font=t.font(8),
-                               anchor="w", justify="left")
+        self._status_body = "选一个文件夹或几张照片，自动预览第一张"
+        self.status = tk.Label(p, text="", bg=t.CARD, fg=t.MUTED,
+                               font=t.font(8), anchor="w", justify="left")
         self.status.pack(fill="x", pady=(s(8), 0))
+        self._paint_status()
 
         self._update_box_hint()
 
@@ -5848,8 +5877,7 @@ class WatermarkPage(ToolPage):
         self.canvas.create_image(width // 2, height // 2,
                                  image=self._preview_img)
         self._draw_boxes()
-        self.status.configure(
-            text=f"共 {len(photos):,} 张 · 预览：{Path(first).name}")
+        self._paint_status(f"共 {len(photos):,} 张 · 预览：{Path(first).name}")
 
     def _draw_boxes(self, temp=None):
         """把已选区域（和正在拖的临时框）画到预览图上。"""
@@ -5891,6 +5919,40 @@ class WatermarkPage(ToolPage):
     def _gps_toggled(self, value):
         self.settings["wm_strip_gps"] = bool(value)
         save_settings(self.settings)
+
+    def _tpl_toggled(self, value):
+        # 模板与平铺是两条互斥的路：平铺不跑检测、模板要求水印不重复铺满
+        if value and getattr(self, "sw_tiled", None) is not None:
+            self.sw_tiled.set(False)
+            self.settings["wm_tiled"] = False
+        self.settings["wm_template"] = bool(value)
+        save_settings(self.settings)
+        # 状态栏写明“现在走哪条路”：光看开关颜色看不出下一步会跑什么
+        self._paint_status()
+
+    def _tiled_toggled(self, value):
+        if value and getattr(self, "sw_tpl", None) is not None:
+            self.sw_tpl.set(False)
+            self.settings["wm_template"] = False
+        self.settings["wm_tiled"] = bool(value)
+        save_settings(self.settings)
+        self._paint_status()
+
+    def _route_text(self):
+        """当前这批图会走哪条路（两条开关都关就是逐张自动检测）。"""
+        tpl = getattr(self, "sw_tpl", None)
+        tiled = getattr(self, "sw_tiled", None)
+        if tpl is not None and tpl.value:
+            return "整批同款模板"
+        if tiled is not None and tiled.value:
+            return "按周期重建平铺"
+        return "逐张自动检测"
+
+    def _paint_status(self, body=None):
+        """状态栏 = 当前路线 + 具体内容（预览张数 / 上一次结果）。"""
+        if body is not None:
+            self._status_body = body
+        self.status.configure(text=f"{self._route_text()} · {self._status_body}")
 
     def prewarm_model(self):
         """后台把模型会话建好：首次加载要几十秒，别让用户点“开始”后才等。"""
@@ -5947,21 +6009,45 @@ class WatermarkPage(ToolPage):
         total = len(photos)
         cancel = self._cancel
 
+        use_tiled = bool(getattr(self, "sw_tiled", None)
+                         and self.sw_tiled.value)
+        learn = bool(getattr(self, "sw_tpl", None) and self.sw_tpl.value)
+
         def work():
             def prog(index, count, _path):
                 if index % 5 == 0 or index == count:
                     self.app.post(("wm_progress",
                                    (index, count, os.path.basename(_path))))
             try:
-                # 记下的框（比如徽标位置）一并套用：白字不透明，反解救不回来，
-                # 只能反解完再把它整块补掉
-                result = wmark.batch_remove_light(
-                    photos, out_dir=out_dir, cancel=cancel, on_progress=prog,
-                    subdir=subdir, boxes=list(self.boxes) or None,
-                    method=method, strip_gps=bool(self.sw_gps.value))
+                if use_tiled:
+                    # 平铺水印：不跑检测，逐张估周期后整页重建
+                    import dedup_watermark_template as wtpl
+                    result = wtpl.batch_remove_tiled(
+                        photos, out_dir=out_dir, cancel=cancel,
+                        on_progress=prog, subdir=subdir,
+                        strip_gps=bool(self.sw_gps.value))
+                else:
+                    # 记下的框（比如徽标位置）一并套用：白字不透明，反解救不
+                    # 回来，只能反解完再把它整块补掉
+                    result = wmark.batch_remove_light(
+                        photos, out_dir=out_dir, cancel=cancel,
+                        on_progress=prog, subdir=subdir,
+                        boxes=list(self.boxes) or None, method=method,
+                        strip_gps=bool(self.sw_gps.value), learn=learn)
             except Exception as exc:
                 result = {"done": 0, "skipped": 0, "total": total,
                           "failed": [(str(exc), str(exc))]}
+            # 逐张报告：谁清了、谁没找到、谁被拒，写成一张 CSV。
+            # 批次一大（几百张）日志翻不动，报告可以直接用 Excel 过一遍。
+            # 无论存到子文件夹还是存到原图旁边都要写；零散选图时输出散在
+            # 各自目录，报告就放在第一张图的输出目录里，别静默跳过。
+            if isinstance(result, dict) and result.get("results"):
+                report_dir = out_dir or wmark.target_dir(photos[0], None, subdir)
+                try:
+                    result["report"] = str(wmark.write_batch_report(
+                        result, os.path.join(report_dir, wmark.REPORT_NAME)))
+                except Exception as exc:
+                    self.app.log(f"逐张报告没写成：{exc}", "warn")
             self.app.post(("wm_done", (result, where)))
 
         threading.Thread(target=work, daemon=True,
@@ -6114,6 +6200,12 @@ class WatermarkPage(ToolPage):
             if counts["rejected"]:
                 bits.append(f"拒绝 {counts['rejected']} 张")
             parts.append("、".join(bits))
+        share = result.get("template_share") or 0.0
+        if share:
+            # 告诉用户“这批图有 1 个水印模板、覆盖多少张”；学不出模板时
+            # 这里是 0（已自动退回逐张检测，不需要特别说明）
+            parts.append(f"同款模板覆盖 {share:.0%}")
+        if any(counts.values()):
             # 非干净的逐张记进日志（干净的不刷屏），最多 8 条
             shown = 0
             for path, status, detail in result.get("results") or []:
@@ -6126,9 +6218,11 @@ class WatermarkPage(ToolPage):
                              "warn")
                 shown += 1
         text = " · ".join(parts)
-        self.status.configure(text=f"{text} → {where}")
+        self._paint_status(f"{text} → {where}")
         self.app.log(f"去水印{text}，输出：{where}",
                      "warn" if failed else "ok")
+        if result.get("report"):
+            self.app.log(f"逐张报告：{result['report']}", "ok")
         self.app.toast(text, "warn" if failed else "ok")
         if done and self._last_mode == "light":
             self._show_light_preview(where, done)

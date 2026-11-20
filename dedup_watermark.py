@@ -942,13 +942,26 @@ def _stroke_density(mask: np.ndarray, min_neighbours: int = 3) -> float:
     return float((acc[crop] >= min_neighbours).mean())
 
 
-def detect_tint(rgb: np.ndarray, gmin: int = 120,
-                luma_gate: float = 140.0, stats=None) -> str:
+# 浅色水印的三道门（够亮、不饱和、绿通道不低）。检测、掩膜召回、大图
+# 降采样都按同一套数值，改的时候只改这里。
+_PALE_LUMA = 140.0
+_PALE_CHROMA = 45.0
+_PALE_GREEN = 120
+# 照片路径的整图护栏。网格检测逐格只占自己的一小块（格内 25% 上限），但九格
+# 加起来可以是很大一片：真实干净照片（毕业典礼、宿舍合影，1600×1200）实测
+# 并集 15%~18%，而且九格各投各的色系（蓝/绿/黄/深黄各来一份）；合成水印
+# 照片只有 1.5%~4.7%。逐格阈值分不开这两类（干净照片每格都过线），整图
+# 占比能。超过 8% 一律当照片纹理，一个像素不动。
+_PHOTO_MASK_MAX = 0.08
+
+
+def detect_tint(rgb: np.ndarray, gmin: int = _PALE_GREEN,
+                luma_gate: float = _PALE_LUMA, stats=None) -> str:
     """判断这张图上的浅色水印偏哪种颜色（黄/蓝/粉/绿），全没就返回空串。"""
     arr = rgb.astype(np.float32)
     g = arr[..., 1]
     luma, chroma = stats if stats is not None else _luma_chroma(rgb)
-    pale = (luma > luma_gate) & (chroma < 45) & (g >= gmin)
+    pale = (luma > luma_gate) & (chroma < _PALE_CHROMA) & (g >= gmin)
     if not pale.any():
         return ""
     best, best_count = "", 0
@@ -971,8 +984,26 @@ def detect_tint(rgb: np.ndarray, gmin: int = 120,
     return best if best_count >= max(200, luma.size // 1000) else ""
 
 
-def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
-                           luma_gate: float = 140.0,
+def _tint_residual(rgb: np.ndarray, tint: str, stats=None):
+    """检测用的那把尺子：偏色分数、去趋势残差、够亮门、自定阈值。
+
+    detect_light_watermark 只吃“过没过线”，而大图降采样和掩膜召回要中间量
+    自己下软门；抽出来共用，省得三处各写一遍同样的门限与阈值（改一处漏两处
+    是这类检测代码最常见的坑）。没有任何“够亮”像素时返回 None。
+    """
+    luma, chroma = stats if stats is not None else _luma_chroma(rgb)
+    pale = ((luma > _PALE_LUMA) & (chroma < _PALE_CHROMA)
+            & (rgb[..., 1] >= _PALE_GREEN))
+    if not pale.any():
+        return None
+    score = _tint_score(rgb.astype(np.float32), tint)
+    resid = score - _local_trend(score, pale)
+    limit = _robust_threshold(resid[pale], floor=2.0, cap=8.0)
+    return score, resid, pale, limit
+
+
+def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = _PALE_GREEN,
+                           luma_gate: float = _PALE_LUMA,
                            tint=None, stats=None) -> np.ndarray:
     """找浅色（淡黄/淡蓝/淡粉/淡绿）半透明水印的像素。
 
@@ -983,7 +1014,7 @@ def detect_light_watermark(rgb: np.ndarray, diff=None, gmin: int = 120,
     """
     g = rgb[..., 1]
     luma, chroma = stats if stats is not None else _luma_chroma(rgb)
-    pale = (luma > luma_gate) & (chroma < 45) & (g >= gmin)
+    pale = (luma > luma_gate) & (chroma < _PALE_CHROMA) & (g >= gmin)
     name = tint if tint is not None else detect_tint(rgb, gmin, luma_gate,
                                                     stats=(luma, chroma))
     if not name:
@@ -1309,6 +1340,23 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
         # 必然估不准，放开就是边界两侧互相“纠正”、把好像素洗出色偏。
         # 掩膜外的像素本来就该一个都不动。
         alpha[~unknown] = 0.0
+        # α 是水印本身的属性（半透明度），不是像素的属性：同一枚水印处处
+        # 相同。逐像素投影却被纹理/摩尔纹噪声主导——实测屏摄样本的“逐像素
+        # 最优 α”中位数竟是 -0.23，现公式在它上面反解反而把误差从 6.39 推到
+        # 6.09。拿掩膜内的稳健中位当区域值，只保留逐像素的“哪块算水印”
+        # 支持（α=0 的像素仍然一个不动）。三个带真值样本上一致变好：
+        # 屏摄 6.09→3.92、黄印文档 2.47→1.83、平铺文档 1.25→0.86。
+        support = alpha > 0.0
+        if int(support.sum()) >= 200:
+            region = float(np.median(alpha[support]))
+            # 光晕门：_undo_exclude 会把笔画外一圈“几乎干净”的像素也圈进来，
+            # 它们自身的偏离远小于区域 α，给它们上恒定 α 会把好像素纠过头。
+            # 实测屏摄样本笔画外 1px 的抗锯齿环误差从 0.46 涨到 3.90，整张
+            # 误差就卡在 1.03 下不来；只认自身偏离 ≥0.35·区域α 的像素后，
+            # 外环回到 0.47，三个带真值样本一起变好（屏摄 4.57→4.05、
+            # 黄印文档 2.18→2.06、平铺文档 0.99→0.85）。
+            support &= alpha >= 0.35 * region
+            alpha = np.where(support, region, 0.0)
     denom = np.clip(1.0 - alpha, 0.05, 1.0)
     # 逐通道就地在 arr 上算：(arr - α·W) / (1-α)。原来走的是
     # (arr - alpha[...,None]*W)/denom[...,None]，要多开两个 12 MP×3 通道的
@@ -1986,6 +2034,163 @@ def _thin_strokes(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def blockiness(rgb: np.ndarray) -> float:
+    """8×8 块边界强度比：明显大于 1 说明这张图被 JPEG 压过、块噪声突出。
+
+    二次压缩（转发过一次的图几乎都是）会在每个 8×8 块边界留一圈台阶，
+    在“相对局部纸面的偏色”上就抬成网格：检测阈值被它顶高，笔画只剩断续
+    的方块。这里量块边界与块内部的平均梯度之比，>1.35 就认为块噪声已经
+    影响到检测了（实测 JPEG q=45 的文档页 1.6~2.4，无损合成页 0.95~1.05）。
+    """
+    luma = np.tensordot(rgb.astype(np.float32), _LUMA_WEIGHTS,
+                        axes=([2], [0]))
+    height, width = luma.shape
+    if height < 24 or width < 24:
+        return 0.0
+    dy = np.abs(np.diff(luma, axis=0))
+    dx = np.abs(np.diff(luma, axis=1))
+    edge = (dy[7::8].mean() + dx[:, 7::8].mean()) * 0.5
+    inner = (dy[3::8].mean() + dx[:, 3::8].mean()) * 0.5
+    return float(edge / max(inner, 1e-3))
+
+
+def _recall_mask(rgb: np.ndarray, mask: np.ndarray, tint: str,
+                 stats=None) -> np.ndarray:
+    """种子区域生长：把阈值切掉的半截笔画补回来。
+
+    检测按“相对局部纸面的偏色 > 自噪声门限”一刀切，切在抗锯齿边缘上：
+    笔画中段远超门限，两端只有三四成，掩膜于是比真水印细一圈。反解按区域
+    α 处理，细了的那一圈没被解，水印就像描了个边留着。
+
+    所以拿检测到的掩膜当种子，逐圈吃进“确实朝水印色偏、只是不够强”的邻接
+    像素（软门 = 0.35×硬门）。只认与种子连通的像素，散落的淡色噪点吃不
+    进来；干净图上种子为空，这一步什么都不做。
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask
+    got = _tint_residual(rgb, tint, stats)
+    if got is None:
+        return mask
+    score, resid, pale, limit = got
+    soft = (resid > 0.35 * limit) & pale & (score > 0.5)
+    grow = mask
+    for _ in range(8):
+        grown = _grow_mask(grow, 1)
+        add = grown & soft
+        if int(add.sum()) <= int(grow.sum()):
+            break
+        grow = add
+    # 护栏：种子只占几个像素时，生长可能顺着一层淡色纹理爬很远。扩张超过
+    # 1.6 倍（另加 400 像素余量）说明软门在这张图上分不出水印和纸面纹理，
+    # 退回未扩张的检测结果——宁可少擦，不可乱擦。
+    if int(grow.sum()) > int(1.6 * int(mask.sum())) + 400:
+        return mask
+    return grow
+
+
+def _detect_mask(rgb: np.ndarray, tint: str, stats=None) -> np.ndarray:
+    """认出文档水印掩膜：小图按原分辨率检，大图先降采样再放大。
+
+    12 MP 扫描页按原分辨率算偏色分数、局部趋势、游程要两秒多，而“水印在
+    哪”本来就是粗粒度的位置信息：降采样到长边 1600 再认，放大后膨胀半格
+    补边，再用原分辨率的亮度/色度门裁一遍，位置误差在 1~2 像素级。
+    """
+    height, width = rgb.shape[:2]
+    step = -(-max(height, width) // 1600)
+    if step <= 1:
+        return _thin_strokes(detect_light_watermark(rgb, tint=tint,
+                                                    stats=stats))
+    small = np.ascontiguousarray(rgb[::step, ::step])
+    got = _tint_residual(small, tint)
+    if got is None:
+        return np.zeros((height, width), dtype=bool)
+    score_s, resid_s, pale_s, limit_s = got
+    mask = _thin_strokes((resid_s > limit_s) & pale_s & (score_s > 0.5))
+    if not mask.any():
+        return np.zeros((height, width), dtype=bool)
+    # 放大只决定“哪些像素算水印”，边界不至于肥成一片：局部趋势（贵的那一步）
+    # 只在缩图上算，但“够亮、不饱和、确实偏这个色”三道门仍按原分辨率走——
+    # 它们才是决定边缘的，而且都是逐像素运算，便宜。早先放大后又膨胀一格，
+    # 掩膜面积涨到原来的 2.8 倍，反解时白动一圈纸面。
+    mask = np.repeat(np.repeat(mask, step, axis=0), step, axis=1)
+    mask = mask[:height, :width]
+    luma, chroma = stats if stats is not None else _luma_chroma(rgb)
+    pale = ((luma > _PALE_LUMA) & (chroma < _PALE_CHROMA)
+            & (rgb[..., 1] >= _PALE_GREEN))
+    score = _tint_score(rgb.astype(np.float32), tint)
+    return mask & pale & (score > 0.5)
+
+
+def _self_check(before: np.ndarray, after: np.ndarray, mask: np.ndarray,
+                tint: str) -> tuple:
+    """像素级自检：解完回头量一遍残留，比输入还差就整张退回原像素。
+
+    参考色/α 估错时反解会把纸面往水印色上推，结果是“越擦越花”——这类
+    失败在文件里看不出来（状态还是 clean），只能量：拿同一把尺子量输入和
+    输出在掩膜内的偏色量，输出反而更高就说明这次动手亏了，原样返回并如实
+    说明。基准上四个带真值样本的残留都降了 6~9 成，这条护栏不会误触发。
+
+    先试过另一条路：“残留超过一成二就换 1.3 / 0.8 倍强度再解一次，挑残留
+    少的”。实测四个样本的残留量几乎不动（换强度只把偏色挪到别的像素上），
+    doc_yellow 的真值误差反而从 0.41 涨到 0.49，所以改成只做“更差就退回”。
+
+    返回 (图像, 是否通过, 一句说明)；通过时说明为空串。
+    """
+    keep = np.asarray(mask, dtype=bool)
+    got = _tint_residual(before, tint)
+    if got is None or not keep.any():
+        return after, True, ""
+    _score, resid_before, pale, limit = got
+    # 同一把尺子（同一批“够亮”像素、同一个自噪声门限）量两次，才比得出
+    # “这次动手是不是亏了”；各自重估门限会把差异算进噪声里。
+    score_after = _tint_score(after.astype(np.float32), tint)
+    resid_after = score_after - _local_trend(score_after, pale)
+    share_before = float((resid_before[keep] > limit).mean())
+    share_after = float((resid_after[keep] > limit).mean())
+    if share_after <= share_before + 0.05:
+        return after, True, ""
+    note = (f"掩膜内偏色像素 {share_before:.0%} -> {share_after:.0%}，"
+            "反解没有变好")
+    return np.array(before, dtype=np.uint8, copy=True), False, note
+
+
+def _csv_cell(text) -> str:
+    text = str(text)
+    if any(c in text for c in ',"\n'):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+REPORT_NAME = "_去水印报告.csv"
+
+
+def write_batch_report(result: dict, path) -> Path:
+    """把批量结果写成一张 CSV（带 BOM，Excel 双击不乱码），返回路径。
+
+    批次一大（几百张），界面日志翻不动：哪张清了、哪张没找到、哪张被拒，
+    摊成表格才看得完。文件列是原图的完整路径，报告放在输出目录里，不覆盖
+    任何图片。调用方给路径就写（要不要写由调用方决定，这里不做例外）。
+    """
+    rows = result.get("results") or []
+    failed = result.get("failed") or []
+    counts = {k: result.get(k, 0)
+              for k in ("clean", "partial", "unchanged", "rejected")}
+    lines = ["文件,状态,说明"]
+    for src, status, detail in rows:
+        lines.append(f"{_csv_cell(src)},{status},{_csv_cell(detail)}")
+    for src, err in failed:
+        lines.append(f"{_csv_cell(src)},failed,{_csv_cell(err)}")
+    summary = (f"合计 {result.get('done', 0)} 张：干净 {counts['clean']} · "
+               f"解不彻底 {counts['partial']} · 未找到 {counts['unchanged']} · "
+               f"拒绝 {counts['rejected']} · 失败 {len(failed)}")
+    lines.append(f"{_csv_cell(summary)},,")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    return target
+
+
 def _negligible_change(before: np.ndarray, after: np.ndarray) -> bool:
     """改完几乎没动过（只有零星几个像素差一两级）就别声称清理成功。
 
@@ -2189,6 +2394,19 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
         dets = _grid_light_boxes(rgb, sens=sens)
         if not dets:
             return out, LightStatus("unchanged", "未找到浅色水印")
+        # 真实照片上几乎每一格都能“检出”点什么（树影、花束、皮肤的反光都
+        # 比局部背景亮），九格拼起来能到两成画面。这种“遍布全图的淡色”不是
+        # 水印，是纹理：按并集占比拒掉，别拿反解把整张照片洗一遍。
+        union = np.zeros(rgb.shape[:2], dtype=bool)
+        for det in dets:
+            if det.mask is not None:
+                union |= det.mask
+        share = float(union.mean())
+        if share > _PHOTO_MASK_MAX:
+            return out, LightStatus(
+                "unchanged",
+                f"照片里有 {len(dets)} 处疑似水印、共占 {share:.0%}，"
+                "疑似纹理，未处理")
         changed = 0
         for det in dets:
             fixed, action, _detail = reconstruct_light(
@@ -2205,6 +2423,11 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
         if verify is not None:
             return out, verify
         return out, LightStatus("clean", f"{changed} 个水印区已反解")
+    # 重编码（JPEG 二次压缩）只做诊断，不换输入图：试过“检测前先去 8×8
+    # 块台阶”，实测掩膜覆盖真值从 0.84 掉到 0.80（去块顺手抹平了笔画的
+    # 边缘），收益为负，撤回；结论写进 detail，让用户知道为什么这张图
+    # 的英雄笔画偏细。
+    recompress = blockiness(rgb) > 1.35
     luma, chroma = _luma_chroma(rgb)
     stats = (luma, chroma)
 
@@ -2240,7 +2463,10 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
         return (np.clip(out, 0, 255).astype(np.uint8),
                 LightStatus("clean", "淡灰水印已重铺背景"))
 
-    mask = _thin_strokes(detect_light_watermark(rgb, tint=tint, stats=stats))
+    mask = _detect_mask(rgb, tint, stats)
+    if mask.any():
+        # 掩膜召回：阈值切在抗锯齿边中间，连通但不够强的半截笔画补回来
+        mask = _recall_mask(rgb, mask, tint, stats=stats)
     if not mask.any():
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
@@ -2249,6 +2475,14 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     # 掩膜 51.8%），再往下反解+铺平会把整片背景重铺，铺平用的模糊背景一旦
     # 沾到附近深色文字就整片打黑出横杠。直接原样返回，不处理。
     if float(mask.mean()) > 0.30:
+        # 这一条以前一律拒。整页平铺的水印确实会被判成“底色误判”，但它有
+        # 周期：先试一次按周期重建（切瓦片取中位），测不出周期或改动太小时
+        # 照旧原样返回，不会把“整片黄沙滩被当成水印”的图改花。
+        rebuilt, info = _tiled_rebuild(rgb)
+        if info is not None:
+            return rebuilt, LightStatus(
+                "clean", f"平铺水印已按周期重建（{info['period'][1]}×"
+                          f"{info['period'][0]}，{info['tiles']} 块）")
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "水印占比过大（疑似底色误判），未处理"))
     ref = _choose_tint_ref(rgb, mask, tint)
@@ -2256,6 +2490,11 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     # B̂ 拉向水印、α 系统性偏小
     first = undo_light_watermark(rgb, tint=tint, ref=ref, mask=mask)
     first = _flatten_background(first, mask)
+    # 像素级自检：同一把尺子量输入和输出的残留，解完更差就整张退回原像素
+    first, passed, checked = _self_check(rgb, first, mask, tint)
+    if not passed:
+        return (np.array(rgb, dtype=np.uint8, copy=True),
+                LightStatus("unchanged", f"{tint}色水印检出但{checked}，已回退"))
     # 反解后的亮度/色度算一次就够：残影检测与紧跟的“附近有没有深色内容”
     # 都要用同一张图，不传下去就是同一次归约算两遍（12 MP 约 0.5 秒）。
     stats2 = _luma_chroma(first)
@@ -2272,7 +2511,40 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     if _negligible_change(rgb, first):
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
-    return first, LightStatus("clean", f"{tint}色水印已反解")
+    if recompress:
+        checked += "（输入有二次压缩痕迹，边缘笔画可能偏细）"
+    return first, LightStatus("clean", f"{tint}色水印已反解{checked}")
+
+
+def _tiled_rebuild(rgb):
+    """平铺水印兜底：返回 (结果, 信息)；测不出周期或没改动就是 (原文, None)。
+
+    实现在 dedup_watermark_template（有周期估计与瓦片中位模板）；这里只是
+    一个延迟导入的接线口，避免两个模块循环导入。
+    """
+    try:
+        import dedup_watermark_template as tpl
+    except Exception:
+        return np.array(rgb, dtype=np.uint8, copy=True), None
+    rebuilt, info = tpl.remove_tiled_watermark(rgb)
+    if info is None or _negligible_change(rgb, rebuilt):
+        return np.array(rgb, dtype=np.uint8, copy=True), None
+    return rebuilt, info
+
+
+def _apply_template(arr, template):
+    """按已有模板反解（模板学习与平铺重建在 dedup_watermark_template）。"""
+    import dedup_watermark_template as tpl
+    return tpl.apply_template(arr, template)
+
+
+def _learn_template(paths, limit: int = 8):
+    """从一批图里学一个水印模板；学不出返回 None。"""
+    try:
+        import dedup_watermark_template as tpl
+    except Exception:
+        return None
+    return tpl.learn_template(paths, limit=limit)
 
 
 def _shift_or(mask: np.ndarray, radius: int, axis: int) -> np.ndarray:
@@ -2327,7 +2599,7 @@ def _verify_light_watermark(arr):
 
 def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
                      method: str = "auto", strip_gps: bool = False,
-                     sens: float = 0.0):
+                     sens: float = 0.0, template=None):
     """处理一张图（自动抠浅色水印），不覆盖原图。
 
     返回 (目标路径, LightStatus)：先跑一键自动抠，再按用户框走统一重建
@@ -2335,10 +2607,20 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
     平铺水印明确拒绝）。boxes 给了就先反解淡色水印，再把这些框（比如
     记下来的徽标位置）整块补掉：徽标上的白字是不透明的，反解救不回来，
     只能靠补。strip_gps=True 时不再走原文件拷贝，重存一份并抹掉 GPS。
+    template 是跨图模板（dedup_watermark_template.learn_template 学的）：
+    给了就按模板反解，省掉逐张检测（同批同款水印的常见场景）。
     """
     src = Path(src)
     arr, alpha, meta = _open_for_edit(src)
-    fixed, auto = clean_light_watermark(arr, sens=sens)
+    if template is not None:
+        fixed, tmask = _apply_template(arr, template)
+        if tmask.any():
+            auto = LightStatus(
+                "clean", f"按模板反解（覆盖 {template.share:.0%} 样本）")
+        else:
+            fixed, auto = clean_light_watermark(arr, sens=sens)
+    else:
+        fixed, auto = clean_light_watermark(arr, sens=sens)
     box_notes = []
     rejected = None
     partial = None
@@ -2419,14 +2701,24 @@ def remove_light_file(src, dst=None, quality: int = 95, boxes=None,
 def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                        on_progress=None, subdir: bool = False, boxes=None,
                        method: str = "auto", strip_gps: bool = False,
-                       sens: float = 0.0) -> dict:
+                       sens: float = 0.0, template=None,
+                       learn: bool = False, learn_limit: int = 8,
+                       report=None) -> dict:
     """批量自动抠浅色水印；返回格式与 batch_remove 一致，再加逐张状态。
 
     results 是 [(原路径, 状态, 一句人话)]，供界面逐张报“干净 / 残留 /
     未找到 / 拒绝”；clean/partial/unchanged/rejected 是各状态的张数。
     strip_gps 透传给 remove_light_file。
+
+    跨图模板：learn=True 时先拿前 learn_limit 张学一个模板（学不出就是
+    None，整批退回逐张检测），之后每张按模板反解、省掉检测；也可以直接把
+    自己学好的 template 传进来。结果里 template_share 是这个模板覆盖的
+    样本占比，0 表示没用模板。
     """
     paths = list(paths)
+    if template is None and learn:
+        template = _learn_template(paths[:max(1, int(learn_limit))],
+                                   limit=learn_limit)
     done = skipped = 0
     failed = []
     results = []
@@ -2444,7 +2736,7 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
                 _, status = remove_light_file(path, target, quality,
                                               boxes=boxes, method=method,
                                               strip_gps=strip_gps,
-                                              sens=sens)
+                                              sens=sens, template=template)
                 results.append((str(path), status.status, status.detail))
                 counts[status.status] += 1
                 done += 1
@@ -2452,8 +2744,13 @@ def batch_remove_light(paths, out_dir=None, quality: int = 95, cancel=None,
             failed.append((str(path), str(exc)))
         if on_progress is not None:
             on_progress(index, total, str(path))
-    return {"done": done, "failed": failed, "skipped": skipped,
-            "total": total, "results": results, **counts}
+    result = {"done": done, "failed": failed, "skipped": skipped,
+              "total": total, "results": results, **counts,
+              "template_share": float(template.share) if template else 0.0,
+              "template_box": tuple(template.box) if template else None}
+    if report:
+        result["report"] = str(write_batch_report(result, report))
+    return result
 
 
 def batch_remove_light_boxes(paths, boxes, out_dir=None, quality: int = 95,
