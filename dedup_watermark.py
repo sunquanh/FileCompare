@@ -1365,14 +1365,13 @@ def undo_light_watermark(rgb: np.ndarray, strength: float = 1.0,
         support = alpha > 0.0
         if int(support.sum()) >= 200:
             region = float(np.median(alpha[support]))
-            # 光晕门：_undo_exclude 会把笔画外一圈“几乎干净”的像素也圈进来，
-            # 它们自身的偏离远小于区域 α，给它们上恒定 α 会把好像素纠过头。
-            # 实测屏摄样本笔画外 1px 的抗锯齿环误差从 0.46 涨到 3.90，整张
-            # 误差就卡在 1.03 下不来；只认自身偏离 ≥0.35·区域α 的像素后，
-            # 外环回到 0.47，三个带真值样本一起变好（屏摄 4.57→4.05、
-            # 黄印文档 2.18→2.06、平铺文档 0.99→0.85）。
-            support &= alpha >= 0.35 * region
-            alpha = np.where(support, region, 0.0)
+            # 逐像素 α 只给外沿用：笔画外沿是部分覆盖，像素自己的投影本来就
+            # 比芯子小，按区域值套上去会矫正过头（实测屏摄笔画外 1px 的环
+            # 误差 0.46→3.90），按 0 又留着那圈淡影。芯子仍用区域值——它是
+            # 纹理/摩尔纹噪声最小的稳健量，换成逐像素投影会让细笔画解不净
+            # （实测黄印文档 hit 0.88→0.84）。分界沿用原来的 0.35·区域α：
+            # 过线的是芯子，没过线的是外沿，各用各的 α。
+            alpha = np.where(alpha >= 0.35 * region, region, alpha)
     denom = np.clip(1.0 - alpha, 0.05, 1.0)
     # 逐通道就地在 arr 上算：(arr - α·W) / (1-α)。原来走的是
     # (arr - alpha[...,None]*W)/denom[...,None]，要多开两个 12 MP×3 通道的
