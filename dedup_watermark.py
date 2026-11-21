@@ -953,18 +953,12 @@ _PALE_GREEN = 120
 # 照片只有 1.5%~4.7%。逐格阈值分不开这两类（干净照片每格都过线），整图
 # 占比能。超过 8% 一律当照片纹理，一个像素不动。
 _PHOTO_MASK_MAX = 0.08
-# 纸面本身已经偏某个色时（中位偏色 > 这个值），那个色系不再当水印候选：
-# 拍屏幕的蓝调页面整页偏蓝（实测纸面中位 +13.5），整页“比周围更蓝”只是
-# 传感器噪声和摩尔纹，19 万像素压过真正的黄色笔画（6 万像素），于是整页
-# 被当成蓝水印反解。底色与被判色系一致时，两者的色差本来就分不开，宁可
-# 报“未找到”，也不要把整页洗一遍。白纸/中性底的中位偏色只有 0~4。
-_TINT_CAST_MAX = 6.0
 # 投票按“多强”而不是“多少”：整页偏色（蓝调屏摄页、光照渐变）会给出十几万个
 # 但只比门限高两三级的像素，真水印笔画是少量、却比门限高好几倍的高频结构。
-# 取残差最大的这些像素的中位强度当票数（实测同一张屏摄图：黄 44 级 / 蓝 25 级，
-# 而像素数是蓝 19 万 > 黄 6 万，按数量投票必输）。
+# 票数 = 过线像素里残差最强那批的中位残差 ÷ 该色系的自噪声门限（同一张屏摄
+# 图上黄 9.96 / 蓝 5.61，而像素数是蓝 19 万 > 黄 6 万，按数量投票必输）。
 _TINT_TOP_PIXELS = 2000
-_TINT_MIN_STRENGTH = 1.5       # 最强像素的中位强度至少要是自噪声门限的 1.5 倍
+_TINT_MIN_STRENGTH = 1.5       # 票数（残差 / 门限）至少 1.5 才算找到水印
 
 
 def detect_tint(rgb: np.ndarray, gmin: int = _PALE_GREEN,
@@ -980,10 +974,6 @@ def detect_tint(rgb: np.ndarray, gmin: int = _PALE_GREEN,
     min_count = max(200, luma.size // 1000)
     scores = _tint_scores(arr)
     for name, score in scores.items():
-        # 纸面自己就是这个色，就不竞选：否则整页的噪声/摩尔纹会把“整页偏蓝”
-        # 投成蓝水印（见 _TINT_CAST_MAX）。剩下的色系照旧投票。
-        if float(np.median(score[pale])) > _TINT_CAST_MAX:
-            continue
         # 减掉局部纸面趋势：整片彩色抬高不了门限，极淡的水印也能进投票
         resid = score - _local_trend(score, pale)
         limit = _robust_threshold(resid[pale], floor=2.0, cap=8.0)
@@ -1003,7 +993,7 @@ def detect_tint(rgb: np.ndarray, gmin: int = _PALE_GREEN,
         # 前 2000 名会把大半名额让给零残差的纸面，强度被稀释成 0。
         hit_resid = resid[hit]
         k = min(_TINT_TOP_PIXELS, int(hit_resid.size))
-        top = np.partition(hit_resid, hit_resid.size - k)[-k:]
+        top = np.partition(hit_resid, -k)[-k:]
         strength = float(np.median(top)) / limit if limit else 0.0
         if strength > best_strength:
             best, best_strength = name, strength
