@@ -43,9 +43,12 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_TOOLS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS))
+sys.path.insert(0, str(_TOOLS.parent))
 
 import numpy as np  # noqa: E402
+from wm_truth import load_mask, manifest_drift  # noqa: E402
 from PIL import Image, ImageDraw, ImageFilter, ImageFont  # noqa: E402
 
 import dedup_watermark as wm  # noqa: E402
@@ -236,11 +239,6 @@ def _load(path):
         return np.asarray(im.convert("RGB"))
 
 
-def _load_mask(path):
-    with Image.open(path) as im:
-        return np.asarray(im.convert("L")) > 127
-
-
 def _peak_mb():
     try:
         import os
@@ -257,7 +255,7 @@ def evaluate(case_dir, sens=0.0):
     if (case_dir / "meta.json").is_file():
         meta = json.loads((case_dir / "meta.json").read_text(encoding="utf-8"))
     rgb = _load(case_dir / "input.png")
-    mask = (_load_mask(case_dir / "mask.png")
+    mask = (load_mask(case_dir / "mask.png")
             if (case_dir / "mask.png").is_file()
             else np.zeros(rgb.shape[:2], bool))
     clean = None
@@ -314,24 +312,19 @@ def evaluate(case_dir, sens=0.0):
     }
 
 
-def check_truth_manifest(cases_dir):
+def warn_truth_drift(cases_dir):
     """真实样本目录若带 manifest.json，先核对本地素材有没有被动过。
 
     真值被改过时 hit / damage 与旧基线不可比，所以只提示、不拦下评测：
-    合成样本目录本来就没有清单，缺清单不该让评测跑不起来。
+    合成样本目录本来就没有清单，manifest_drift 给空列表。
     """
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from wm_truth import manifest_drift
-    except Exception:
-        return []
     drift = manifest_drift(cases_dir)
-    if drift:
-        print("真值素材与清单不一致，本次 hit / damage 与旧基线不可比：")
-        for msg in drift:
-            print(f"  [!] {msg}")
-        print("  确认是有意改动后运行 python tools/wm_truth.py --update 重写清单")
-    return drift
+    if not drift:
+        return
+    print("真值素材与清单不一致，本次 hit / damage 与旧基线不可比：")
+    for msg in drift:
+        print(f"  [!] {msg}")
+    print("  确认是有意改动后运行 python tools/wm_truth.py --update 重写清单")
 
 
 def run(cases_dir, sens=0.0):
@@ -434,7 +427,7 @@ def main(argv=None):
     if not args.cases:
         parser.print_help()
         return 2
-    check_truth_manifest(args.cases)
+    warn_truth_drift(args.cases)
     rows = run(args.cases, sens=args.sens)
     if not rows:
         print(f"{args.cases} 里没有找到用例（需要 <case>/input.png）")

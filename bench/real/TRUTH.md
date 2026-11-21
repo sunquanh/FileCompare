@@ -3,8 +3,9 @@
 `bench/real/` 里是真图和人工/人工修订过的真值掩膜，体积大且属于用户素材，
 所以不入库（见根目录 `.gitignore`）。入库的只有两样文本：
 
-- `manifest.json`：每个用例的尺寸、掩膜像素数、掩膜包围盒、两份文件的
-  sha256，由 `python tools/wm_truth.py --update` 生成。
+- `manifest.json`：每个用例的掩膜像素数与两份文件的 sha256，由
+  `python tools/wm_truth.py --update` 生成。只记告警要用的最小事实：尺寸、
+  包围盒这类能从文件派生的信息不重复存。
 - 本文件：真值从哪来、画到哪算。
 
 真值只在本机时，基准里的 `hit` / `damage` 一旦变化，无法区分是算法改了还是
