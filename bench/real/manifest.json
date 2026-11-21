@@ -1,0 +1,76 @@
+{
+ "version": 1,
+ "note": "bench/real 本地素材指纹清单，只存哈希与统计，不存像素；由 tools/wm_truth.py --update 生成，真值口径见 TRUTH.md",
+ "cases": {
+  "clean_photo_01": {
+   "kind": "photo",
+   "truth": "empty",
+   "size": [
+    1600,
+    1200
+   ],
+   "mask_pixels": 0,
+   "mask_bbox": null,
+   "input_sha256": "add6baf5f844032815b12406c5e8651d0d0aac04f9188ed6ca913ae84ecf45d3",
+   "mask_sha256": "d3dd13f98a545dae656d529af9a19f142ad3f72c80a3aadcf184dbbe21b8851a"
+  },
+  "clean_photo_02": {
+   "kind": "photo",
+   "truth": "empty",
+   "size": [
+    1600,
+    1200
+   ],
+   "mask_pixels": 0,
+   "mask_bbox": null,
+   "input_sha256": "35e45af4754bcc25189ee5b6ed64cb5f2e6c02bb7ab166d847b8a26c5c351afd",
+   "mask_sha256": "d3dd13f98a545dae656d529af9a19f142ad3f72c80a3aadcf184dbbe21b8851a"
+  },
+  "clean_photo_03": {
+   "kind": "photo",
+   "truth": "empty",
+   "size": [
+    1600,
+    1200
+   ],
+   "mask_pixels": 0,
+   "mask_bbox": null,
+   "input_sha256": "af1efa096a70cc3bc009275842a09e34c482d85555d48537a545776099e81afd",
+   "mask_sha256": "d3dd13f98a545dae656d529af9a19f142ad3f72c80a3aadcf184dbbe21b8851a"
+  },
+  "real_doc_xlsx": {
+   "kind": "doc",
+   "truth": "manual-mask",
+   "size": [
+    1152,
+    2048
+   ],
+   "mask_pixels": 196159,
+   "mask_bbox": [
+    0,
+    160,
+    1152,
+    2032
+   ],
+   "input_sha256": "11da3afea37345af9c4396e0befa4efaf49bcafeeff070450dcc394f34566a93",
+   "mask_sha256": "2a883ad58a24dd47bbb6f6e8131689d643005113472fcff4ca59f5406421590a"
+  },
+  "real_screen_ide": {
+   "kind": "screen",
+   "truth": "manual-band",
+   "size": [
+    4096,
+    3072
+   ],
+   "mask_pixels": 46330,
+   "mask_bbox": [
+    1171,
+    0,
+    1710,
+    481
+   ],
+   "input_sha256": "fe0677774b261e65085fe67236345895bf060437449671d84fdfdd50fdb7d630",
+   "mask_sha256": "1a7e7f93c413dde319e62c1a2574595419b93b795a000f28a5cbd587dc44db55"
+  }
+ }
+}
