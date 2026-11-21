@@ -2125,8 +2125,13 @@ def _recall_mask(rgb: np.ndarray, mask: np.ndarray, tint: str,
     # 1.6 倍（另加 400 像素余量）说明软门在这张图上分不出水印和纸面纹理，
     # 退回未扩张的检测结果——宁可少擦，不可乱擦。
     if int(grow.sum()) > int(1.6 * int(mask.sum())) + 400:
-        return mask
-    return grow
+        grow = mask
+    # 再补两圈外沿：反解按区域 α 处理，笔画的半透明边（实测真值里笔画外有
+    # 三到五圈淡色）不在这场“够不够强”的争夺里，进不了掩膜就整圈留在图上，
+    # 看上去正是描了一道淡影。外沿只吃“比局部纸面淡”的像素（软门），纯纸面
+    # 不进掩膜，免得把区域 α 估小、反过来削弱笔画芯子。
+    rim = _grow_mask(grow, 2) & (resid > 0.35 * limit)
+    return grow | rim
 
 
 def _detect_mask(rgb: np.ndarray, tint: str, stats=None) -> np.ndarray:
