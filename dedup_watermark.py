@@ -859,6 +859,31 @@ def looks_like_photo(rgb: np.ndarray, limit: int = 25) -> bool:
     return float(np.median(high - low)) > limit
 
 
+# 整张纸面判据（照片护栏的放行条件）。整页铺满淡色水印的截图裁块，九格
+# 并集必然超过 _PHOTO_MASK_MAX，但它其实是一张纸：实测手机拍屏的代码页
+# 亮面(luma>170) 0.85、其中色度<35 的 0.58，文档页 0.97/0.97；三张干净
+# 照片是 0.18/0.09、0.02/0.00、0.00/0.00。两条同时过线才当纸面。
+_PAPER_BRIGHT = 0.55
+_PAPER_PALE = 0.25
+
+
+def _paper_page(rgb: np.ndarray, limit_bright: float = _PAPER_BRIGHT,
+                limit_pale: float = _PAPER_PALE) -> bool:
+    """这张图的主体是不是纸面/浅色屏幕，而不是照片纹理。
+
+    只有照片护栏用它：九格并集超上限时，纸面图该改走文档路径（整图一次
+    检测 + 反解 + 自检），照片才退回一个像素不动。抽样 1/4 就够——亮面
+    占比、色度占比这类量对抽样不敏感，12 MP 上也只要几十毫秒。
+    """
+    luma, chroma = _luma_chroma(np.ascontiguousarray(rgb[::4, ::4]))
+    if luma.size == 0:
+        return False
+    bright = luma > 170.0
+    if float(bright.mean()) < limit_bright:
+        return False
+    return float((bright & (chroma < 35)).mean()) >= limit_pale
+
+
 _LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
@@ -2453,27 +2478,32 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
             if det.mask is not None:
                 union |= det.mask
         share = float(union.mean())
-        if share > _PHOTO_MASK_MAX:
+        page = share > _PHOTO_MASK_MAX and _paper_page(rgb)
+        if share > _PHOTO_MASK_MAX and not page:
             return out, LightStatus(
                 "unchanged",
                 f"照片里有 {len(dets)} 处疑似水印、共占 {share:.0%}，"
                 "疑似纹理，未处理")
-        changed = 0
-        for det in dets:
-            fixed, action, _detail = reconstruct_light(
-                out, det.box, det=det, allow_inpaint=False, sens=sens)
-            if action in ("unblend", "fill"):
-                out = fixed
-                changed += 1
-        if not changed:
-            return out, LightStatus("unchanged", "水印区已处理过")
-        # 处理后复检：反解没解净的，报 partial 不报 clean，跟文件流的
-        # 校验（_verify_light_watermark）对齐；直接调这个函数的调用方
-        # 拿到的也是诚实的状态。
-        verify = _verify_light_watermark(out)
-        if verify is not None:
-            return out, verify
-        return out, LightStatus("clean", f"{changed} 个水印区已反解")
+        # 整张都是纸面（拍屏的代码页、文档截图裁块）时，网格不过是把一整页
+        # 淡色水印拆成了几块，并集才超线。这类图不逐格重建，落下去走文档
+        # 路径：整图一次检测，掩膜占比、自检、残影护栏都在那条路上。
+        if not page:
+            changed = 0
+            for det in dets:
+                fixed, action, _detail = reconstruct_light(
+                    out, det.box, det=det, allow_inpaint=False, sens=sens)
+                if action in ("unblend", "fill"):
+                    out = fixed
+                    changed += 1
+            if not changed:
+                return out, LightStatus("unchanged", "水印区已处理过")
+            # 处理后复检：反解没解净的，报 partial 不报 clean，跟文件流的
+            # 校验（_verify_light_watermark）对齐；直接调这个函数的调用方
+            # 拿到的也是诚实的状态。
+            verify = _verify_light_watermark(out)
+            if verify is not None:
+                return out, verify
+            return out, LightStatus("clean", f"{changed} 个水印区已反解")
     # 重编码（JPEG 二次压缩）只做诊断，不换输入图：试过“检测前先去 8×8
     # 块台阶”，实测掩膜覆盖真值从 0.84 掉到 0.80（去块顺手抹平了笔画的
     # 边缘），收益为负，撤回；结论写进 detail，让用户知道为什么这张图
