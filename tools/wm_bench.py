@@ -249,6 +249,86 @@ def _peak_mb():
         return None
 
 
+def _spread(region):
+    """4 邻域膨胀一圈（不跨边界卷绕）。"""
+    out = region.copy()
+    out[1:] |= region[:-1]
+    out[:-1] |= region[1:]
+    out[:, 1:] |= region[:, :-1]
+    out[:, :-1] |= region[:, 1:]
+    return out
+
+
+def _blob_areas(mask, min_area=50, max_blobs=200, max_steps=600):
+    """4 邻域连通块：返回 (块数, 最大面积, 总面积)，只统计 >= min_area 的块。
+
+    只在包围盒里做，块内用逐圈膨胀扩散（纯 numpy，不需要 scipy）；带步数
+    上限是为了掩膜里全是碎点时不会把评测拖住——掩膜本身只有画面几个百分点。
+    """
+    if not mask.any():
+        return 0, 0, 0
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    crop = mask[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    todo = crop.copy()
+    count = big = total = 0
+    while todo.any() and count < max_blobs:
+        seed = np.argwhere(todo)[0]
+        region = np.zeros_like(crop)
+        region[seed[0], seed[1]] = True
+        for _ in range(max_steps):
+            nxt = _spread(region) & crop
+            if np.array_equal(nxt, region):
+                break
+            region = nxt
+        todo &= ~region
+        area = int(region.sum())
+        if area >= min_area:
+            count += 1
+            big = max(big, area)
+            total += area
+    return count, big, total
+
+
+def _residual_stats(rgb, out, mask):
+    """可见残留：还剩几处、每处多强，以及“解过头”的反向偏差。
+
+    均值口径有两个死穴：大片已经解干净的区域会把残留稀释掉；解过头（发冷/
+    淡粉）的像素又会和残留的正黄抵消。用户的判据是“一眼还看得见几处黄”，
+    所以按连通块报，并把“满覆盖芯 / 半覆盖边”分开（同一份掩膜几何上拆开，
+    不新增真值文件）：芯 = 4 邻域全在掩膜里，边 = 掩膜减芯。
+    """
+    if not mask.any():
+        return {}
+    a = rgb.astype(np.int16)
+    b = out.astype(np.int16)
+    def y(img):
+        return (img[..., 0] + img[..., 1] - 2 * img[..., 2]).astype(np.float32)
+    ring = wm._grow_mask(mask, 12) & ~wm._grow_mask(mask, 8)
+    ybg = float(np.median(y(a)[ring])) if ring.any() else float(np.median(y(a)))
+    resid = y(b) - ybg
+    core = mask & ~wm._grow_mask(~mask, 1)
+    edge = mask & ~core
+    strong = mask & (resid > 10.0)
+    n, big, total = _blob_areas(strong)
+    share = total / max(int(mask.sum()), 1)
+    def part(sel):
+        if not sel.any():
+            return None
+        return round(float((resid[sel] > 15.0).mean()), 4)
+    return {
+        "vis_n": n,
+        "vis_max": big,
+        "vis_area": round(share, 4),
+        "left15": round(float((resid[mask] > 15.0).mean()), 4),
+        "cold": round(float((resid[mask] < -6.0).mean()), 4),
+        "core15": part(core),
+        "edge15": part(edge),
+        "core_n": int(core.sum()),
+        "edge_n": int(edge.sum()),
+    }
+
+
 def evaluate(case_dir, sens=0.0):
     case_dir = Path(case_dir)
     meta = {}
@@ -296,6 +376,7 @@ def evaluate(case_dir, sens=0.0):
     honest = True
     if status.status == "unchanged":
         honest = bool(np.array_equal(out, rgb))
+    vis = _residual_stats(rgb, out, mask)
     return {
         "case": case_dir.name,
         "kind": meta.get("kind", "?"),
@@ -307,6 +388,7 @@ def evaluate(case_dir, sens=0.0):
         "damage": round(outside, 6),
         "fp": round(float(changed.mean()), 6) if not mask.any() else None,
         "honest": honest,
+        **vis,
         "sec": round(seconds, 2),
         "mb": None if after_mb is None else round(after_mb - (before_mb or 0), 1),
     }
@@ -340,8 +422,13 @@ def run(cases_dir, sens=0.0):
 def summarize(rows):
     out = {"n": len(rows), "fp_total": 0.0, "damage_max": 0.0,
            "hit_mean": 0.0, "err_mean": 0.0, "err_n": 0, "dishonest": 0,
-           "sec_sum": 0.0}
+           "sec_sum": 0.0, "left15_sum": 0.0, "left15_n": 0,
+           "cold_sum": 0.0}
     for r in rows:
+        if r.get("left15") is not None:
+            out["left15_sum"] += r["left15"]
+            out["cold_sum"] += r["cold"]
+            out["left15_n"] += 1
         if r["fp"]:
             out["fp_total"] += r["fp"]
         out["damage_max"] = max(out["damage_max"], r["damage"])
@@ -358,23 +445,38 @@ def summarize(rows):
     out["damage_max"] = round(out["damage_max"], 6)
     out["fp_total"] = round(out["fp_total"], 6)
     out["sec_sum"] = round(out["sec_sum"], 1)
+    if out["left15_n"]:
+        out["left15_mean"] = round(out["left15_sum"] / out["left15_n"], 4)
+        out["cold_mean"] = round(out["cold_sum"] / out["left15_n"], 4)
+    out.pop("left15_sum")
+    out.pop("cold_sum")
     return out
 
 
 def print_table(rows, summary):
     print(f"{'用例':<18}{'类':<8}{'状态':<10}{'err':>7}{'hit':>7}"
-          f"{'damage':>9}{'fp':>9}{'秒':>6}  detail")
+          f"{'damage':>9}{'fp':>9}{'残留块':>7}{'残留面':>8}{'黄>15':>7}"
+          f"{'解冷':>7}{'芯/边':>11}{'秒':>6}  detail")
     for r in rows:
         err = "-" if r["err_ratio"] is None else f"{r['err_ratio']:.2f}"
         fp = "-" if r["fp"] is None else f"{r['fp']:.4f}"
         flag = "" if r["honest"] else "  <-- 状态与像素不符"
+        if r.get("left15") is None:
+            vis = f"{'-':>7}{'-':>8}{'-':>7}{'-':>7}{'-':>11}"
+        else:
+            ce = f"{r['core15'] if r['core15'] is not None else '-'}/" \
+                 f"{r['edge15'] if r['edge15'] is not None else '-'}"
+            vis = (f"{r['vis_n']:>7}{r['vis_area']:>8.2f}{r['left15']:>7.2f}"
+                   f"{r['cold']:>7.2f}{ce:>11}")
         print(f"{r['case']:<18}{r['kind']:<8}{r['status']:<10}{err:>7}"
-              f"{r['hit']:>7.2f}{r['damage']:>9.4f}{fp:>9}{r['sec']:>6.1f}"
+              f"{r['hit']:>7.2f}{r['damage']:>9.4f}{fp:>9}{vis}{r['sec']:>6.1f}"
               f"  {r['detail'][:34]}{flag}")
     print(f"\n合计 {summary['n']} 例：err 均值 {summary['err_mean']}"
           f"（{summary['err_n']} 例有真值）· hit 均值 {summary['hit_mean']}"
           f" · 最大误伤 {summary['damage_max']:.4f}"
           f" · 干净样本假阳性 {summary['fp_total']:.6f}"
+          f" · 明显黄残留 {summary.get('left15_mean', '-')}"
+          f" · 解冷 {summary.get('cold_mean', '-')}"
           f" · 状态不实 {summary['dishonest']} · 总耗时 {summary['sec_sum']}s")
 
 
@@ -400,6 +502,19 @@ def compare(rows, summary, baseline_path):
                 problems.append(f"{r['case']}: 干净样本出现假阳性 {r['fp']:.4f}")
         if r["honest"] is False:
             problems.append(f"{r['case']}: 报 unchanged 却改了像素")
+        # 可见残留：块面积变大（多出新的黄斑）或“解冷/发粉”变多都算回归
+        if old.get("vis_area") is not None and r.get("vis_area") is not None:
+            if r["vis_area"] > old["vis_area"] * 1.25 + 0.02:
+                problems.append(f"{r['case']}: 可见残留面积 {old['vis_area']:.2f}"
+                                f" -> {r['vis_area']:.2f}")
+        if old.get("left15") is not None and r.get("left15") is not None:
+            if r["left15"] > old["left15"] + 0.03:
+                problems.append(f"{r['case']}: 明显黄残留 {old['left15']:.2f}"
+                                f" -> {r['left15']:.2f}")
+        if old.get("cold") is not None and r.get("cold") is not None:
+            if r["cold"] > old["cold"] + 0.02:
+                problems.append(f"{r['case']}: 解冷/发粉 {old['cold']:.2f}"
+                                f" -> {r['cold']:.2f}")
     if problems:
         print("\n相对基线变差：")
         for p in problems:

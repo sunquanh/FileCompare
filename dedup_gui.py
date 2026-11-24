@@ -4313,7 +4313,8 @@ class ToolPage(tk.Frame):
             sync()
         return field
 
-    def _path_card(self, parent, title, var, command, hint):
+    def _path_card(self, parent, title, var, command, hint,
+                   label="选择文件夹", icon="folder"):
         t = self.theme
         s = t.s
         card = Card(parent, t, padding=16)
@@ -4324,7 +4325,7 @@ class ToolPage(tk.Frame):
         bubble.pack(side="left")
         round_rect(bubble, 0, 0, s(42), s(42), s(11), fill=t.BUBBLE_BG,
                    outline="")
-        put_icon(bubble, t, "folder", s(21), s(21) + 1, 19, t.ACCENT)
+        put_icon(bubble, t, icon, s(21), s(21) + 1, 19, t.ACCENT)
         box = tk.Frame(body, bg=t.CARD)
         box.pack(side="left", fill="x", expand=True, padx=(s(13), s(14)))
         tk.Label(box, text=title, bg=t.CARD, fg=t.MUTED, font=t.font(8),
@@ -4333,8 +4334,8 @@ class ToolPage(tk.Frame):
         field.pack(fill="x", pady=(s(5), 0))
         tk.Label(box, text="可直接输入或粘贴路径", bg=t.CARD, fg=t.FAINT,
                  font=t.font(8), anchor="w").pack(fill="x", pady=(s(4), 0))
-        CanvasButton(body, t, "选择文件夹", command=command, kind="secondary",
-                     icon="folder", height=38, size=9, padding=14,
+        CanvasButton(body, t, label, command=command, kind="secondary",
+                     icon=icon, height=38, size=9, padding=14,
                      bg=t.CARD).pack(side="right")
         return field.entry
 
@@ -5421,7 +5422,7 @@ class LightPreviewDialog(tk.Toplevel):
 
 # ---------------------------------------------------------------- 去水印页
 class WatermarkPage(ToolPage):
-    """照片去水印：框出水印位置，批量用四周内容补上，另存不覆盖原图。"""
+    """照片去水印：选一张照片，框出水印位置用四周内容补上，另存不覆盖原图。"""
 
     PRESET_VALUES = {
         "rb": (70.0, 86.0, 28.5, 12.5),
@@ -5434,12 +5435,9 @@ class WatermarkPage(ToolPage):
         self.busy = False
         self._cancel = None
         self._preview_img = None
-        # 照片列表只在真正需要时扫（页面首次显示 / 手动刷新），
-        # 不在构建界面时去 rglob 用户目录
+        # 当前这张照片（0 或 1 张）：只在真正需要时算，
+        # 不在构建界面时去读用户目录
         self._photos_cache = None
-        # 直接用文件对话框选来的几张（None = 跟鲏文件夹）；
-        # 零散选的照片可以来自不同文件夹，输出也按张算
-        self._files = None
         # 要补的区域（归一化坐标），在预览上拖框就能加，一张图可以有多个
         # 上一次框的位置存着，下次打开（哪怕换了一组照片）直接套用：
         # 自己加的徽标位置基本固定，只该框一次
@@ -5464,26 +5462,11 @@ class WatermarkPage(ToolPage):
                                     bg=t.BG)
         self.btn_run.pack()
 
-        self.path_var = tk.StringVar(value=self.settings.get("wm_dir")
-                                     or self.settings.get("last_dir", ""))
-        entry = self._path_card(self.page, "照片文件夹（或直接选照片）",
-                                self.path_var, self._browse,
-                                "处理结果默认存到「_去水印」子文件夹")
+        self.path_var = tk.StringVar(value=self.settings.get("wm_photo", ""))
+        entry = self._path_card(self.page, "要处理的照片", self.path_var,
+                                self._browse, "选一张照片，结果存在它旁边",
+                                label="选择照片", icon="image")
         entry.bind("<Return>", lambda e: self.refresh_preview())
-
-        # 不想跟文件夹打交道时，直接挑几张照片（可以跨文件夹、多选）
-        pick = tk.Frame(self.page, bg=t.BG)
-        pick.pack(fill="x", pady=(s(10), 0))
-        CanvasButton(pick, t, "选择照片…", command=self._browse_files,
-                     kind="secondary", icon="image", height=34, size=9,
-                     padding=14, bg=t.BG).pack(side="left")
-        self.files_hint = tk.Label(pick, text="可以只选一两张，不必整个文件夹",
-                                   bg=t.BG, fg=t.MUTED, font=t.font(8),
-                                   anchor="w")
-        self.files_hint.pack(side="left", padx=(s(12), 0))
-        self.btn_clear_files = CanvasButton(
-            pick, t, "改用整个文件夹", command=self._clear_files, kind="ghost",
-            height=34, size=9, padding=12, bg=t.BG)
 
         body = tk.Frame(self.page, bg=t.BG)
         body.pack(fill="x", pady=(s(16), 0))
@@ -5547,19 +5530,6 @@ class WatermarkPage(ToolPage):
                                                           False)),
                              command=self._gps_toggled)
         self.sw_gps.pack(side="right")
-
-        # 同款水印模板：同相机/同导出一批图最常见的情况——水印位置形状一样。
-        # 打开后先拿前 8 张学一个模板，整批按模板反解（省掉逐张检测，也更稳）。
-        tpl_opt = tk.Frame(d, bg=t.CARD)
-        tpl_opt.pack(fill="x", pady=(s(12), 0))
-        tk.Label(tpl_opt, text="整批是同款水印（学模板）\r\n先看前几张学一个模板，整批套用：更快、更稳",
-                 bg=t.CARD, fg=t.TEXT, font=t.font(9), anchor="w",
-                 justify="left").pack(side="left")
-        self.sw_tpl = Switch(tpl_opt, t, bg=t.CARD,
-                             value=bool(self.settings.get("wm_template",
-                                                          False)),
-                             command=self._tpl_toggled)
-        self.sw_tpl.pack(side="right")
 
         # 平铺水印：整页印满重复样图（图库图常见），检测会当成“底色误判”拒掉，
         # 这里改走“估周期 + 分瓦片重建”。
@@ -5640,8 +5610,7 @@ class WatermarkPage(ToolPage):
                       "或找到的水印区反解，底下纹理不动；拖过的框会记住，点这里"
                       "自动套用（“AI生成”这类白字徽标框一次就够）。解不净或不透明"
                       "的徽标，仍走上面的框选 + 高质量。\r\n"
-                      "一批图同一款水印 → 开“整批是同款水印”；整页印满重复样图"
-                      " → 开“平铺水印”；其余情况两条都关，走逐张自动检测。"
+                      "整页印满重复样图时开“平铺水印”，其余情况关掉，走自动检测。"
                  ).pack(fill="x", pady=(s(6), 0))
         self.box_hint = tk.Label(d, text="区域：0 个（在右边预览上直接拖框）",
                                  bg=t.CARD, fg=t.MUTED, font=t.font(8),
@@ -5659,7 +5628,7 @@ class WatermarkPage(ToolPage):
         self.canvas.bind("<Button-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        self._status_body = "选一个文件夹或几张照片，自动预览第一张"
+        self._status_body = "选一张照片，自动预览"
         self.status = tk.Label(p, text="", bg=t.CARD, fg=t.MUTED,
                                font=t.font(8), anchor="w", justify="left")
         self.status.pack(fill="x", pady=(s(8), 0))
@@ -5732,7 +5701,7 @@ class WatermarkPage(ToolPage):
         """
         photos = self._photos_cache or []
         if not photos:
-            self.app.toast("先选照片或文件夹", "warn")
+            self.app.toast("先选一张照片", "warn")
             return
         if not self.boxes:
             self.app.toast("先在右边预览上拖框选出水印区", "warn")
@@ -5806,63 +5775,36 @@ class WatermarkPage(ToolPage):
         self._redraw()
 
     def _browse(self):
-        self._browse_into(self.path_var, "选择照片文件夹")
-        self._files = None            # 回到文件夹模式
-        self.refresh_preview()
-
-    def _browse_files(self):
-        """直接选照片（可多选、可跨文件夹）。"""
-        folder = self.path_var.get().strip().strip('"')
-        initial = (folder if folder and os.path.isdir(folder)
-                   else self.settings.get("wm_dir") or str(Path.home()))
+        """选照片：水印台一次只处理一张，不跟文件夹打交道。"""
+        hinted = self.path_var.get().strip().strip('"')
+        start = Path(hinted) if hinted else Path(
+            self.settings.get("wm_photo") or self.settings.get("last_dir")
+            or str(Path.home()))
+        initial = str(start if start.is_dir() else start.parent)
         if not os.path.isdir(initial):
             initial = str(Path.home())
-        chosen = filedialog.askopenfilenames(
+        chosen = filedialog.askopenfilename(
             parent=self, title="选择要处理的照片", initialdir=initial,
             filetypes=[("照片", " ".join("*" + e
                                     for e in sorted(models.PHOTO_EXT))),
                        ("所有文件", "*.*")])
-        files = [Path(p) for p in chosen if Path(p).is_file()]
-        if not files:
+        if not chosen:
             return
-        self._files = files
+        self.path_var.set(os.path.normpath(chosen))
+        self.settings["wm_photo"] = self.path_var.get()
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
         self.refresh_preview()
-
-    def _clear_files(self):
-        self._files = None
-        self.refresh_preview()
-
-    def _sync_files_hint(self):
-        """小提示跟着模式变，让用户一眼看出现在处理的是哪一批。"""
-        if not hasattr(self, "files_hint"):
-            return
-        total = len(self._photos_cache or [])
-        if self._files is not None:
-            self.files_hint.configure(
-                text=f"已选 {total:,} 张照片（可跨文件夹）", fg=self.theme.GREEN)
-            self.btn_clear_files.pack(side="left", padx=(self.theme.s(10), 0))
-        else:
-            self.files_hint.configure(text="可以只选一两张，不必整个文件夹",
-                                      fg=self.theme.MUTED)
-            self.btn_clear_files.pack_forget()
-
-    def _refresh_dir(self):
-        if self._files is not None:
-            return                    # 零散选的照片不该改写文件夹记忆
-        folder = self.path_var.get().strip().strip('"')
-        if folder and os.path.isdir(folder):
-            self.settings["wm_dir"] = folder
 
     def _photos(self):
-        if self._files is not None:
-            return [p for p in self._files if Path(p).is_file()]
-        folder = self.path_var.get().strip().strip('"')
-        if not folder or not os.path.isdir(folder):
+        """当前这张照片（路径没填或不是文件时为空）。"""
+        raw = self.path_var.get().strip().strip('"')
+        if not raw:
             return []
-        try:
-            return list(wmark.iter_photos(folder))
-        except Exception:
-            return []
+        path = Path(raw)
+        return [path] if path.is_file() else []
 
     def _placeholder(self, text):
         self.canvas.delete("all")
@@ -5882,13 +5824,12 @@ class WatermarkPage(ToolPage):
 
     def refresh_preview(self):
         self._photos_cache = self._photos()
-        self._sync_files_hint()
         self._redraw()
 
     def _redraw(self):
         """只用已缓存的文件列表重画（窗口缩放时会被反复触发）。"""
         if self._photos_cache is None:
-            self._placeholder("选一个文件夹或几张照片，自动预览第一张")
+            self._placeholder("选一张照片，自动预览")
             return
         self.render_preview()
 
@@ -5897,7 +5838,7 @@ class WatermarkPage(ToolPage):
             return
         photos = self._photos_cache or []
         if not photos:
-            self._placeholder("选一个文件夹或几张照片，自动预览第一张")
+            self._placeholder("选一张照片，自动预览")
             return
         first = photos[0]
         width = max(int(self.canvas.winfo_width()), 200)
@@ -5960,33 +5901,17 @@ class WatermarkPage(ToolPage):
         self.settings["wm_strip_gps"] = bool(value)
         save_settings(self.settings)
 
-    def _tpl_toggled(self, value):
-        # 模板与平铺是两条互斥的路：平铺不跑检测、模板要求水印不重复铺满
-        if value and getattr(self, "sw_tiled", None) is not None:
-            self.sw_tiled.set(False)
-            self.settings["wm_tiled"] = False
-        self.settings["wm_template"] = bool(value)
-        save_settings(self.settings)
-        # 状态栏写明“现在走哪条路”：光看开关颜色看不出下一步会跑什么
-        self._paint_status()
-
     def _tiled_toggled(self, value):
-        if value and getattr(self, "sw_tpl", None) is not None:
-            self.sw_tpl.set(False)
-            self.settings["wm_template"] = False
         self.settings["wm_tiled"] = bool(value)
         save_settings(self.settings)
         self._paint_status()
 
     def _route_text(self):
-        """当前这批图会走哪条路（两条开关都关就是逐张自动检测）。"""
-        tpl = getattr(self, "sw_tpl", None)
+        """这张图会走哪条路（平铺开关关着就是自动检测）。"""
         tiled = getattr(self, "sw_tiled", None)
-        if tpl is not None and tpl.value:
-            return "整批同款模板"
         if tiled is not None and tiled.value:
             return "按周期重建平铺"
-        return "逐张自动检测"
+        return "自动检测"
 
     def _paint_status(self, body=None):
         """状态栏 = 当前路线 + 具体内容（预览张数 / 上一次结果）。"""
@@ -6029,9 +5954,8 @@ class WatermarkPage(ToolPage):
         if photos is None:
             photos = self._photos()
         if not photos:
-            self.app.toast("先选照片或文件夹", "warn")
+            self.app.toast("先选一张照片", "warn")
             return
-        self._refresh_dir()
         out_dir, where, subdir = self._output_plan(photos)
         if out_dir is False:
             return
@@ -6051,7 +5975,8 @@ class WatermarkPage(ToolPage):
 
         use_tiled = bool(getattr(self, "sw_tiled", None)
                          and self.sw_tiled.value)
-        learn = bool(getattr(self, "sw_tpl", None) and self.sw_tpl.value)
+        # 模板学习要一批同款图才有意义，水印台现在一次只处理一张
+        learn = False
 
         def work():
             def prog(index, count, _path):
@@ -6104,9 +6029,8 @@ class WatermarkPage(ToolPage):
         if photos is None:
             photos = self._photos()
         if not photos:
-            self.app.toast("先选照片或文件夹", "warn")
+            self.app.toast("先选一张照片", "warn")
             return
-        self._refresh_dir()
         out_dir, where, subdir = self._output_plan(photos)
         if out_dir is False:
             return
@@ -6147,9 +6071,8 @@ class WatermarkPage(ToolPage):
         if photos is None:
             photos = self._photos()
         if not photos:
-            self.app.toast("先选照片或文件夹", "warn")
+            self.app.toast("先选一张照片", "warn")
             return
-        self._refresh_dir()
         box = list(self.boxes) or [self._box()]
         out_dir, where, subdir = self._output_plan(photos)
         if out_dir is False:
@@ -6268,24 +6191,15 @@ class WatermarkPage(ToolPage):
             self._show_light_preview(where, done)
 
     def _output_plan(self, photos):
-        """算输出目录，返回 (out_dir, 说明文字, subdir)；出错时 out_dir 为 False。
+        """输出位置：只有一张照片，就存在它旁边（可选「_去水印」子文件夹）。
 
-        文件夹模式统一放一处（子目录里的照片不会散得到处都是）；
-        零散选来的几张则按各自的目录算。
+        返回 (out_dir, 说明文字, subdir)；out_dir 为 None 表示“每张图各自
+        的目录由 wmark.target_dir 算”。
         """
         subdir = bool(self.sw_subdir.value)
-        if self._files is not None:
-            self._last_out = (None, subdir)
-            where = "各照片旁边（_去水印）" if subdir else "各照片旁边"
-            return None, where, subdir
-        out_dir = wmark.target_dir(photos[0], None, subdir)
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            self.app.toast(f"建不了输出目录：{exc}", "err")
-            return False, "", False
-        self._last_out = (out_dir, False)
-        return out_dir, str(out_dir), False
+        self._last_out = (None, subdir)
+        where = "照片旁边（_去水印）" if subdir else "照片旁边"
+        return None, where, subdir
 
     def _show_light_preview(self, where, done):
         """处理完直接弹出前后对照，省得自己去文件夹里翻。"""

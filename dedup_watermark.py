@@ -1507,6 +1507,41 @@ def _flatten_background(fixed: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out.astype(np.uint8)
 
 
+def _restore_paper(fixed: np.ndarray, source: np.ndarray, mask: np.ndarray,
+                   radius: int = 12) -> np.ndarray:
+    """水印底下就是纸的像素，铺回局部纸色。
+
+    反解只按颜色解，笔画的“半透明叠层”还带着一层亮度差：拍屏代码页上
+    黄字被解成一道灰影，字没了、印子还在，用户看到的就是“没弄干净”。
+    判据是“水印底下本来是什么”：拿水印外一圈估出局部纸色 B̂，原图亮度
+    与 B̂ 相差 24 级以内，说明笔画底下本来就只有纸（或淡色底），铺回 B̂
+    就是正确答案；比纸暗 24 级以上的（正文、表格线、深色图）保留反解
+    结果，一个像素都不重铺。
+
+    铺纸色会把纸纹一起抹平，所以只在“本来就没解干净”时调用（见
+    _clean_light_core 里的残留门）：已经解干净的图一个像素都不动。
+    """
+    if mask is None or not mask.any():
+        return fixed
+    keep = np.asarray(mask, dtype=bool)
+    src = source.astype(np.float32)
+    src_paper = _local_paper(src, _grow_mask(keep, 2), radius)
+    if src_paper is None:
+        return fixed
+    paper, count = src_paper
+    src_luma = np.tensordot(src, _LUMA_WEIGHTS, axes=([2], [0]))
+    bg_luma = np.tensordot(paper, _LUMA_WEIGHTS, axes=([2], [0]))
+    out = fixed.astype(np.float32)
+    fill = (keep & (count > 0)
+            & (np.abs(src_luma - bg_luma) <= 24.0)
+            & (np.abs(out - paper).max(axis=2) > 2.0))
+    if not fill.any():
+        return fixed
+    out[fill] = paper[fill]
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
+
+
 # ---------------------------------------------------------------- 框内反解（照片水印）
 # 半透明浅色水印压在照片上时，全图反解有两个死结：一是背景不再是白纸，
 # 全局门限（亮度>140、色度<45）抓不到压在深色草地/肤色上的黄字；二是照片
@@ -2158,6 +2193,50 @@ def _recall_mask(rgb: np.ndarray, mask: np.ndarray, tint: str,
     return grow | rim
 
 
+def _tighten_scope(rgb: np.ndarray, mask: np.ndarray, tint: str,
+                   ref=None) -> np.ndarray:
+    """把检测掩膜收紧到“投影 α 够强”的像素，再外扩一圈回去。
+
+    拍屏样本的掩膜有 2.5 倍过覆盖（并集 113,902 px 对真值 46,330 px，
+    precision 0.149）：多出来的弱像素被当成水印解一遍，正是发冷/淡粉的来源；
+    收紧后又多出了 recall（0.367→0.404）——外扩一圈把真笔画边补回来了。
+
+    只在“强像素不到掩膜一半”时才动手：文档样本 69% 的掩膜像素本来就强，
+    收紧会把笔画边削掉（recall 1.00→0.88、解冷 0.138→0.229，实测），所以
+    按比例判断，而不是一律收紧。
+    """
+    if not mask.any():
+        return mask
+    if ref is None:
+        # 这里只要一个“往哪个色偏”的粗参考：_choose_tint_ref 内部会跑好几
+        # 轮反解试色，在一键抠的热路径上重复调用等于检测时间翻倍。
+        ref = estimate_tint_ref(rgb, mask, tint=tint)
+    arr = rgb.astype(np.float32)
+    wref = np.asarray(ref, dtype=np.float32)
+    luma = np.tensordot(arr, _LUMA_WEIGHTS, axes=([2], [0]))
+    unknown = _undo_exclude(arr, wref, luma, mask)
+    paper = _local_paper(arr, unknown, 12)
+    if paper is None:
+        return mask
+    background, _count = paper
+    w = wref - background
+    den = np.einsum("ijk,ijk->ij", w, w)
+    dot = np.einsum("ijk,ijk->ij", arr - background, w)
+    alpha = np.clip(dot / np.maximum(den, 64.0), 0.0, 0.6)
+    alpha[(luma < 150.0) | (alpha < 0.015)] = 0.0
+    alpha[~unknown] = 0.0
+    strong_px = alpha > 0.0
+    if int(strong_px.sum()) < 200:
+        return mask
+    region = float(np.median(alpha[strong_px]))
+    tight = mask & (alpha >= 0.5 * region)
+    if not tight.any():
+        return mask
+    if int(tight.sum()) * 2 >= int(mask.sum()):
+        return mask          # 强像素占大半：掩膜本来就准，别动
+    return _grow_mask(tight, 1)
+
+
 def _detect_mask(rgb: np.ndarray, tint: str, stats=None) -> np.ndarray:
     """认出文档水印掩膜：小图按原分辨率检，大图先降采样再放大。
 
@@ -2548,6 +2627,10 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     if mask.any():
         # 掩膜召回：阈值切在抗锯齿边中间，连通但不够强的半截笔画补回来
         mask = _recall_mask(rgb, mask, tint, stats=stats)
+        # 再收紧作用域：掩膜肥一圈时，多出来的弱像素会被解成淡粉/发冷。
+        # 收紧只能拿粗参考（estimate_tint_ref）：_choose_tint_ref 内部要跑
+        # 好几轮反解试色，放在这里会让小图每次一键抠多花一倍检测时间。
+        mask = _tighten_scope(rgb, mask, tint)
     if not mask.any():
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
@@ -2566,11 +2649,17 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
                           f"{info['period'][0]}，{info['tiles']} 块）")
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "水印占比过大（疑似底色误判），未处理"))
+    # 掩膜一起传下去：局部背景 B̂ 只从水印外的像素估，混进水印色会把
+    # B̂ 拉向水印、α 系统性偏小。ref 按收紧后的掩膜估——拿肥掩膜估会把
+    # 一片弱像素算进“最亮那撮”，水印色被洗淡、解不干净。
     ref = _choose_tint_ref(rgb, mask, tint)
-    # 把掩膜一起传下去：局部背景 B̂ 只从水印外的像素估，混进水印色会把
-    # B̂ 拉向水印、α 系统性偏小
     first = undo_light_watermark(rgb, tint=tint, ref=ref, mask=mask)
     first = _flatten_background(first, mask)
+    # 反解只解颜色，拍屏这类图上还会留一层看得见的灰印子：只有“笔画
+    # 像素仍明显偏黄”超过四分之一时才铺纸色。已经解干净的图不进这条路
+    # （铺纸色会把纸纹一起抹平，合成样本上误差反而上升）。
+    if (_left_residual_share(rgb, first, mask) or 0.0) > 0.25:
+        first = _restore_paper(first, rgb, mask)
     # 像素级自检：同一把尺子量输入和输出的残留，解完更差就整张退回原像素
     first, passed, checked = _self_check(rgb, first, mask, tint)
     if not passed:
@@ -2602,9 +2691,45 @@ def _clean_light_core(rgb: np.ndarray, sens: float = 0.0):
     if _negligible_change(rgb, first):
         return (np.array(rgb, dtype=np.uint8, copy=True),
                 LightStatus("unchanged", "未找到浅色水印"))
+    # 状态诚实：解完还留着“一眼看得见”的黄就报 partial，别报 clean。
+    # 均值看不出来（大片解干净的区域会把残留稀释，解过头的反向偏差又能
+    # 抵消），所以统一按“掩膜内黄度残留 >15 的像素占比”——拍屏代码页
+    # 实测 0.75 时旧代码照样报 clean，用户看到的就是“点了没效果”。
+    left = _left_residual_share(rgb, first, mask)
+    if left is not None and left > 0.45:
+        return first, LightStatus(
+            "partial",
+            f"{tint}色水印已反解，但 {left:.0%} 的笔画像素仍明显偏黄"
+            "（可试框选去浅色/高质量）")
     if recompress:
         checked += "（输入有二次压缩痕迹，边缘笔画可能偏细）"
     return first, LightStatus("clean", f"{tint}色水印已反解{checked}")
+
+
+def _left_residual_share(before: np.ndarray, after: np.ndarray,
+                         mask: np.ndarray):
+    """处理完还“一眼看得见”的黄，占“原本确实有水印的笔画”多少（0~1）。
+
+    两个口径坑：拿掩膜全部像素当分母会被一大片弱像素（掩膜肥出来的背景）
+    稀释；拿整张图的平均黄度又会被已经解干净的大片区域稀释。所以分母只留
+    “处理前就明显偏黄”的像素（相对环带 >20），跟人眼“本来能看见字”的那批
+    像素对得上：拍屏样本实测 0.75，文档样本 0.33（后者 LLC 上已经看不出）。
+    纸面基准取掩膜外 8~12 px 那圈的中位黄度，渐变纸/暖色纸不受影响。
+    """
+    if mask is None or not mask.any():
+        return None
+    ring = _grow_mask(mask, 12) & ~_grow_mask(mask, 8)
+    if not ring.any():
+        return None
+    def yellow(img):
+        a = img.astype(np.int16)
+        return (a[..., 0] + a[..., 1] - 2 * a[..., 2]).astype(np.float32)
+    y0 = yellow(before)
+    base = float(np.median(y0[ring]))
+    ink = mask & (y0 - base > 20.0)
+    if int(ink.sum()) < 200:
+        ink = mask
+    return float((yellow(after)[ink] - base > 15.0).mean())
 
 
 def _tiled_rebuild(rgb):
